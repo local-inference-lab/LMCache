@@ -462,6 +462,11 @@ class L1Manager:
         Errors:
             KEY_NOT_WRITABLE: The key exists but is not writable.
             OUT_OF_MEMORY: Not enough memory to allocate for the object.
+
+        Note:
+            When the full batch does not fit, the longest prefix of the
+            to-be-allocated keys that fits is allocated and the remaining
+            keys report OUT_OF_MEMORY.
         """
         need_to_allocate: list[tuple[ObjectKey, bool]] = []
         ret: dict[ObjectKey, L1OperationResult] = {}
@@ -499,6 +504,31 @@ class L1Manager:
             layout_desc, len(need_to_allocate)
         )
 
+        # A full-batch allocation failure would fail every key even when
+        # most of the batch fits, collapsing large L2->L1 restores to zero
+        # prefix hits and forcing full re-prefills upstream. Fall back to
+        # allocating the longest prefix that fits; callers already handle
+        # per-key OOM (prefetch trims to the contiguous prefix, the store
+        # path skips failed keys).
+        if err != L1Error.SUCCESS and len(need_to_allocate) > 1:
+            if allocated_objs:
+                self._memory_manager.free(allocated_objs)
+                allocated_objs = []
+            fit = self._estimate_alloc_fit(layout_desc, len(need_to_allocate))
+            while fit > 0:
+                err, allocated_objs = self._memory_manager.allocate(layout_desc, fit)
+                if err == L1Error.SUCCESS:
+                    logger.warning(
+                        "Partial L1 allocation: %d/%d objects (prefix) allocated",
+                        len(allocated_objs),
+                        len(need_to_allocate),
+                    )
+                    break
+                if allocated_objs:
+                    self._memory_manager.free(allocated_objs)
+                    allocated_objs = []
+                fit //= 2
+
         if err != L1Error.SUCCESS:
             for key, _ in need_to_allocate:
                 ret[key] = (L1Error.OUT_OF_MEMORY, None)
@@ -508,6 +538,10 @@ class L1Manager:
                 self._memory_manager.free(allocated_objs)
 
         else:
+            # Mark any unallocated tail as OOM so every requested key keeps
+            # an explicit per-key result.
+            for key, _ in need_to_allocate[len(allocated_objs) :]:
+                ret[key] = (L1Error.OUT_OF_MEMORY, None)
             for (key, is_temp), mem_obj in zip(
                 need_to_allocate, allocated_objs, strict=False
             ):
@@ -530,6 +564,32 @@ class L1Manager:
             )
         )
         return ret
+
+    def _estimate_alloc_fit(self, layout_desc: MemoryLayoutDesc, want: int) -> int:
+        """Conservatively estimate how many ``layout_desc``-sized objects
+        fit in the allocator's current free space.
+
+        Args:
+            layout_desc: The memory layout of one object.
+            want: Upper bound on the number of objects wanted.
+
+        Returns:
+            An object count between 0 and ``want``.
+        """
+        per_obj = 0
+        for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=False):
+            numel = 1
+            for dim in shape:
+                numel *= int(dim)
+            per_obj += numel * dtype.itemsize
+        if per_obj <= 0:
+            return want // 2
+        # Headroom for alignment and allocator bookkeeping.
+        per_obj += 8192
+        used, total = self._memory_manager.get_memory_usage()
+        free = max(0, total - used)
+        fit = int(free * 0.98) // per_obj
+        return max(0, min(want, fit))
 
     @l1_mgr_synchronized
     def finish_write(

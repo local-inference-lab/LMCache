@@ -1182,6 +1182,68 @@ class TestDeleteInterface:
     def test_delete_empty_keys(self, adapter):
         adapter.delete([])  # should not raise
 
+    def test_delete_skips_lookup_locked_keys(self, adapter):
+        """Keys lookup-locked by an in-flight prefetch survive delete();
+        unlocked keys in the same batch are still deleted, and the locked
+        key becomes deletable again after unlock."""
+        keys = [create_object_key(i) for i in range(2)]
+        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+        store_fd = adapter.get_store_event_fd()
+        lookup_fd = adapter.get_lookup_and_lock_event_fd()
+
+        adapter.submit_store_task(keys, objs)
+        wait_for_event_fd(store_fd, timeout=5.0)
+        adapter.pop_completed_store_tasks()
+
+        # An in-flight prefetch holds a lookup lock on keys[0].
+        task_id = adapter.submit_lookup_and_lock_task([keys[0]], _EMPTY_LAYOUT)
+        wait_for_event_fd(lookup_fd, timeout=5.0)
+        bitmap = adapter.query_lookup_and_lock_result(task_id)
+        assert bitmap.test(0) is True
+
+        adapter.delete(keys)
+
+        # keys[0] survived, keys[1] is gone. This lookup takes another
+        # lock on keys[0].
+        task_id = adapter.submit_lookup_and_lock_task(keys, _EMPTY_LAYOUT)
+        wait_for_event_fd(lookup_fd, timeout=5.0)
+        bitmap = adapter.query_lookup_and_lock_result(task_id)
+        assert bitmap.test(0) is True
+        assert bitmap.test(1) is False
+
+        # Release both locks; the key is deletable again.
+        adapter.submit_unlock([keys[0]])
+        adapter.submit_unlock([keys[0]])
+        adapter.delete([keys[0]])
+
+        task_id = adapter.submit_lookup_and_lock_task([keys[0]], _EMPTY_LAYOUT)
+        wait_for_event_fd(lookup_fd, timeout=5.0)
+        bitmap = adapter.query_lookup_and_lock_result(task_id)
+        assert bitmap.test(0) is False
+
+    def test_delete_all_keys_locked_is_noop(self, adapter):
+        """delete() returns without submitting when every key is locked."""
+        key = create_object_key(1)
+        obj = create_memory_obj()
+        store_fd = adapter.get_store_event_fd()
+        lookup_fd = adapter.get_lookup_and_lock_event_fd()
+
+        adapter.submit_store_task([key], [obj])
+        wait_for_event_fd(store_fd, timeout=5.0)
+        adapter.pop_completed_store_tasks()
+
+        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+        wait_for_event_fd(lookup_fd, timeout=5.0)
+        assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
+
+        adapter.delete([key])
+
+        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+        wait_for_event_fd(lookup_fd, timeout=5.0)
+        assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
+        adapter.submit_unlock([key])
+        adapter.submit_unlock([key])
+
     def test_delete_batch(self, adapter):
         keys = [create_object_key(i) for i in range(5)]
         objs = [create_memory_obj(fill_value=float(i)) for i in range(5)]

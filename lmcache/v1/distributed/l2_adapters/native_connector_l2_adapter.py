@@ -297,10 +297,26 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         tracking stays in sync.
 
         No-op if the connector does not expose ``submit_batch_delete``
-        or if the key list is empty.
+        or if the key list is empty. Keys currently lookup-locked by an
+        in-flight prefetch are skipped: the load task would race the
+        unlink and fail with a phantom not_found.
         """
         if not keys or not self._has_delete:
             return
+
+        with self._lock:
+            skipped = [k for k in keys if k in self._locked_keys]
+        if skipped:
+            skipped_set = set(skipped)
+            keys = [k for k in keys if k not in skipped_set]
+            logger.info(
+                "delete(): skipping %d lookup-locked keys (in-flight "
+                "prefetch); %d remain",
+                len(skipped),
+                len(keys),
+            )
+            if not keys:
+                return
 
         key_strings = [_object_key_to_string(k) for k in keys]
         done_event = threading.Event()

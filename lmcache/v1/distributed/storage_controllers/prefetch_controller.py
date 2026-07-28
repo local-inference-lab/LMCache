@@ -1181,6 +1181,17 @@ class PrefetchController(StorageControllerInterface):
         # added once the serde PR lands and adapters can distinguish
         # deserialization errors from missing objects.
         if failed_keys:
+            # These keys were reported present by the L2 lookup but the load
+            # returned no data. Sample a few so the on-disk state can be
+            # inspected post hoc.
+            logger.warning(
+                "Prefetch request %d: %d/%d plan keys failed to load from "
+                "L2 (lookup hit, load empty); sample: %s",
+                request.request_id,
+                len(failed_keys),
+                len(request.write_reserved_keys),
+                [str(k)[:160] for k in failed_keys[:3]],
+            )
             self._event_bus.publish(
                 Event(
                     event_type=EventType.L2_PREFETCH_FAILED,
