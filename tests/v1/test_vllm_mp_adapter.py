@@ -782,3 +782,82 @@ def test_recover_callback_rebuilds_transfer_ctx_without_closing_previous(
     assert len(contexts) == 3
     assert adapter.transfer_ctx is contexts[2]
     contexts[1].close.assert_not_called()
+
+
+def _finished_retrieve_future(result: object) -> MagicMock:
+    """Build a completed retrieve future; an Exception *result* makes
+    ``result()`` raise it."""
+    future = MagicMock(name="retrieve_future")
+    future.query.return_value = True
+    if isinstance(result, Exception):
+        future.result.side_effect = result
+    else:
+        future.result.return_value = result
+    return future
+
+
+def test_failed_retrieve_marks_blocks_invalid(fake_adapter) -> None:
+    """A retrieve the healthy server answers with ``result=False`` is
+    reported finished AND its block ids are surfaced through
+    ``get_block_ids_with_load_errors`` so the scheduler recomputes them
+    instead of decoding over never-written blocks."""
+    adapter, _send_mock, _ = fake_adapter
+    adapter.retrieve_futures["req-1"] = (
+        _finished_retrieve_future(False),
+        [3, 4, 5],
+    )
+
+    ret_stores, finished_retrieves = adapter.get_finished(set())
+
+    assert ret_stores == set()
+    assert finished_retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == {3, 4, 5}
+    # The error set is consumed on read.
+    assert adapter.get_block_ids_with_load_errors() == set()
+    assert adapter.retrieve_failure_count == 1
+
+
+def test_raising_retrieve_future_contained_as_failure(fake_adapter) -> None:
+    """A retrieve future whose ``result()`` raises must not propagate out
+    of ``get_finished`` (that would kill the engine step); it lands on the
+    same failure path as ``result=False``."""
+    adapter, _send_mock, _ = fake_adapter
+    adapter.retrieve_futures["req-1"] = (
+        _finished_retrieve_future(RuntimeError("ipc receive failed")),
+        [7, 8],
+    )
+
+    _ret_stores, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == {7, 8}
+    assert adapter.retrieve_failure_count == 1
+
+
+def test_successful_retrieve_marks_no_blocks_invalid(fake_adapter) -> None:
+    """With the fault-inject env unset, a successful retrieve reports no
+    load errors (also pins the hook's default-off behavior)."""
+    adapter, _send_mock, _ = fake_adapter
+    adapter.retrieve_futures["req-1"] = (_finished_retrieve_future(True), [1, 2])
+
+    _ret_stores, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == set()
+    assert adapter.retrieve_failure_count == 0
+
+
+def test_fault_inject_retrieve_flips_healthy_result(fake_adapter, monkeypatch) -> None:
+    """``LMCACHE_FAULT_INJECT_RETRIEVE=1.0`` deterministically turns a
+    healthy retrieve into a failure: the test hook for exercising the
+    KV-load-failure recompute path end to end."""
+    _adapter, _send_mock, _ = fake_adapter
+    monkeypatch.setenv("LMCACHE_FAULT_INJECT_RETRIEVE", "1.0")
+    adapter = _make_worker_adapter()
+    adapter.retrieve_futures["req-1"] = (_finished_retrieve_future(True), [9])
+
+    _ret_stores, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == {9}
+    assert adapter.retrieve_failure_count == 1
