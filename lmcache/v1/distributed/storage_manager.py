@@ -154,6 +154,35 @@ class StorageManager:
         )
         self._prefetch_controller.start()
 
+        # Opt-in L1 write-back tier: wire L2 adapters into the L1 eviction
+        # controller so evicted or periodically backed-up chunks are flushed
+        # to L2, and optionally let the prefetch controller trigger
+        # emergency eviction to make room for large restores.
+        eviction_config = config.eviction_config
+        wants_l1_write_back = (
+            eviction_config.write_back_on_evict
+            or eviction_config.periodic_flush_interval > 0
+        )
+        if wants_l1_write_back:
+            if self._l2_adapters:
+                self._eviction_controller.set_l2_adapters(self._l2_adapters)
+            else:
+                logger.warning(
+                    "write_back_on_evict / periodic_flush_interval is set "
+                    "but no L2 adapter is configured; L1 eviction keeps "
+                    "discarding."
+                )
+        if eviction_config.emergency_evict_for_prefetch:
+            if eviction_config.write_back_on_evict and self._l2_adapters:
+                self._prefetch_controller.set_l1_eviction_controller(
+                    self._eviction_controller
+                )
+            else:
+                logger.warning(
+                    "emergency_evict_for_prefetch requires "
+                    "write_back_on_evict and an L2 adapter; disabled."
+                )
+
         # L2 usage gauge — one observation per adapter, tagged by
         # ``l2_name``.  Parallel to L1Manager's ``l1_memory_usage_bytes``.
         register_gauge(
