@@ -21,7 +21,9 @@ static constexpr const char* FILE_EXT = ".data";
 static constexpr const char* TMP_EXT = ".tmp";
 
 // Per-worker connection state for the FS connector.
-// Each worker maintains its own I/O buffer for O_DIRECT.
+// O_DIRECT engages per request only when both the transfer length and the
+// caller's buffer address are multiples of the disk block size; anything
+// else falls back to buffered I/O.
 struct WorkerFSConn {
   std::filesystem::path base_path;
   std::filesystem::path tmp_dir;  // empty if not configured

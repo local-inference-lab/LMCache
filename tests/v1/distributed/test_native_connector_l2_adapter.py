@@ -56,6 +56,12 @@ class MockNativeConnector:
         self._completions: list[tuple[int, bool, str, list[bool] | None]] = []
         self._lock = threading.Lock()
         self._closed = False
+        # Mirrors the C++ connector: SET completions carry per-key results
+        # and batch ok=False when any key failed. Tests can inject per-key
+        # failures via fail_set_keys, or disable per-key reporting to model
+        # connectors that only return batch-level results.
+        self.report_set_per_key_results = True
+        self.fail_set_keys: set[str] = set()
 
     def event_fd(self) -> int:
         return self._efd.fileno()
@@ -66,9 +72,20 @@ class MockNativeConnector:
             self._next_id += 1
 
         try:
+            results = []
             for key, mv in zip(keys, memoryviews, strict=False):
+                if key in self.fail_set_keys:
+                    results.append(False)
+                    continue
                 self._store[key] = bytes(mv)
-            self._push_completion(fid, True, "", None)
+                results.append(True)
+            ok = all(results)
+            self._push_completion(
+                fid,
+                ok,
+                "" if ok else "injected set failure",
+                results if self.report_set_per_key_results else None,
+            )
         except Exception as e:
             self._push_completion(fid, False, str(e), None)
 
@@ -200,6 +217,15 @@ def adapter():
     mock_client = MockNativeConnector()
     adp = NativeConnectorL2Adapter(mock_client)
     yield adp
+    adp.close()
+
+
+@pytest.fixture
+def adapter_and_mock():
+    """Adapter plus its mock client, for tests that inject backend faults."""
+    mock_client = MockNativeConnector()
+    adp = NativeConnectorL2Adapter(mock_client)
+    yield adp, mock_client
     adp.close()
 
 
@@ -1358,3 +1384,191 @@ class TestUsageTracking:
         usage = adp.get_usage()
         assert usage.usage_fraction == pytest.approx(0.2)
         assert usage.total_bytes_used == 400
+
+
+# =============================================================================
+# Synchronous Store Tests
+# =============================================================================
+
+
+class TestStoreObjectsSync:
+    def test_sync_store_success(self, adapter):
+        """All keys persisted: success with full count, usage updated."""
+        keys = [create_object_key(i) for i in range(2)]
+        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+
+        ok, persisted, bytes_written = adapter.store_objects_sync(keys, objs)
+
+        assert ok is True
+        assert persisted == 2
+        assert bytes_written == objs[0].get_size() + objs[1].get_size()
+        assert adapter.get_usage().total_bytes_used == bytes_written
+
+    def test_sync_store_partial_failure(self, adapter_and_mock):
+        """A partial persist reports failure but accounts the stored keys."""
+        adapter, mock_client = adapter_and_mock
+        keys = [create_object_key(i) for i in range(2)]
+        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+        mock_client.fail_set_keys = {_object_key_to_string(keys[1])}
+
+        ok, persisted, bytes_written = adapter.store_objects_sync(keys, objs)
+
+        assert ok is False
+        assert persisted == 1
+        assert bytes_written == objs[0].get_size()
+        assert adapter.get_usage().total_bytes_used == objs[0].get_size()
+
+    def test_sync_store_empty_keys(self, adapter):
+        assert adapter.store_objects_sync([], []) == (True, 0, 0)
+
+    def test_sync_store_does_not_feed_async_queue(self, adapter):
+        """Sync completions must never appear in the shared store queue."""
+        keys = [create_object_key(1)]
+        objs = [create_memory_obj()]
+
+        ok, _persisted, _bytes = adapter.store_objects_sync(keys, objs)
+
+        assert ok is True
+        assert adapter.pop_completed_store_tasks() == {}
+
+
+# =============================================================================
+# Per-Key Store Result Tests
+# =============================================================================
+
+
+class TestPerKeyStoreResults:
+    def test_async_partial_failure_reports_not_ok(self, adapter_and_mock):
+        """A store batch with one failed key completes unsuccessfully, and
+        only the persisted key is accounted."""
+        adapter, mock_client = adapter_and_mock
+        keys = [create_object_key(i) for i in range(2)]
+        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+        mock_client.fail_set_keys = {_object_key_to_string(keys[1])}
+        store_fd = adapter.get_store_event_fd()
+
+        task_id = adapter.submit_store_task(keys, objs)
+        assert wait_for_event_fd(store_fd, timeout=5.0)
+
+        completed = adapter.pop_completed_store_tasks()
+        assert not completed[task_id].is_successful()
+        assert adapter.get_usage().total_bytes_used == objs[0].get_size()
+
+    def test_batch_semantics_without_per_key_results(self, adapter_and_mock):
+        """Connectors reporting no per-key results keep batch semantics."""
+        adapter, mock_client = adapter_and_mock
+        mock_client.report_set_per_key_results = False
+        keys = [create_object_key(i) for i in range(2)]
+        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+        store_fd = adapter.get_store_event_fd()
+
+        task_id = adapter.submit_store_task(keys, objs)
+        assert wait_for_event_fd(store_fd, timeout=5.0)
+
+        completed = adapter.pop_completed_store_tasks()
+        assert completed[task_id].is_successful()
+        expected = objs[0].get_size() + objs[1].get_size()
+        assert adapter.get_usage().total_bytes_used == expected
+
+
+# =============================================================================
+# Startup Scan Priming Tests
+# =============================================================================
+
+
+class _RecordingListener:
+    def __init__(self):
+        self.stored: list[tuple[list[ObjectKey], list[int]]] = []
+
+    def on_l2_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        self.stored.append((keys, sizes))
+
+
+class TestPrimeExistingKeys:
+    def test_priming_accounts_usage(self, adapter):
+        keys = [create_object_key(i) for i in range(3)]
+        sizes = [100, 200, 300]
+
+        adapter.prime_existing_keys(keys, sizes)
+
+        assert adapter.get_usage().total_bytes_used == 600
+        assert adapter.report_status()["accounted_key_count"] == 3
+
+    def test_listener_replay_happens_once(self, adapter):
+        keys = [create_object_key(i) for i in range(2)]
+        adapter.prime_existing_keys(keys, [100, 200])
+
+        first = _RecordingListener()
+        adapter.register_listener(first)
+        assert first.stored == [(keys, [100, 200])]
+
+        second = _RecordingListener()
+        adapter.register_listener(second)
+        assert second.stored == []
+
+    def test_duplicate_keys_keep_first_size(self, adapter):
+        key = create_object_key(1)
+        adapter.prime_existing_keys([key, key], [100, 999])
+
+        assert adapter.get_usage().total_bytes_used == 100
+
+    def test_length_mismatch_raises(self, adapter):
+        with pytest.raises(ValueError, match="length mismatch"):
+            adapter.prime_existing_keys([create_object_key(1)], [1, 2])
+
+
+# =============================================================================
+# Backend Health Tests
+# =============================================================================
+
+
+class TestBackendHealth:
+    def test_healthy_initially(self, adapter):
+        status = adapter.report_status()
+        assert status["is_healthy"] is True
+        assert status["backend_healthy"] is True
+        assert status["consecutive_backend_failures"] == 0
+
+    def test_repeated_store_failures_flip_backend_health(self, adapter_and_mock):
+        adapter, mock_client = adapter_and_mock
+        key = create_object_key(1)
+        obj = create_memory_obj()
+        mock_client.fail_set_keys = {_object_key_to_string(key)}
+
+        for _ in range(3):
+            ok, _persisted, _bytes = adapter.store_objects_sync([key], [obj])
+            assert ok is False
+
+        status = adapter.report_status()
+        assert status["backend_healthy"] is False
+        assert status["is_healthy"] is False
+        assert status["consecutive_backend_failures"] == 3
+        assert status["backend_failures"] == 3
+
+        # One success resets the consecutive counter.
+        mock_client.fail_set_keys = set()
+        ok, _persisted, _bytes = adapter.store_objects_sync([key], [obj])
+        assert ok is True
+        status = adapter.report_status()
+        assert status["backend_healthy"] is True
+        assert status["consecutive_backend_failures"] == 0
+
+    def test_disk_accounting_mismatch_detected(self, tmp_path):
+        """Accounted keys with an empty backend directory flag a mismatch."""
+        mock_client = MockNativeConnector()
+        adp = NativeConnectorL2Adapter(
+            mock_client, extra_status={"base_path": str(tmp_path)}
+        )
+        try:
+            adp.prime_existing_keys([create_object_key(1)], [100])
+
+            status = adp.report_status()
+            assert status["disk_accounting_mismatch"] is True
+            assert status["is_healthy"] is False
+
+            (tmp_path / "some.data").write_bytes(b"x")
+            status = adp.report_status()
+            assert status["disk_accounting_mismatch"] is False
+            assert status["is_healthy"] is True
+        finally:
+            adp.close()

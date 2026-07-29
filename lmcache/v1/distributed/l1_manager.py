@@ -793,6 +793,21 @@ class L1Manager:
             locked_count,
         )
 
+    @l1_mgr_synchronized
+    def get_evictable_keys(self) -> list[ObjectKey]:
+        """Return a snapshot of the keys currently eligible for eviction.
+
+        Returns:
+            The keys that exist and are neither read- nor write-locked, in
+            insertion order.
+        """
+        return [key for key in self._objects if self.is_key_evictable(key)]
+
+    @l1_mgr_synchronized
+    def num_objects(self) -> int:
+        """Return the number of objects currently tracked in L1."""
+        return len(self._objects)
+
     def is_key_evictable(self, key: ObjectKey) -> bool:
         """Check if a key is eligible for eviction (not locked).
 

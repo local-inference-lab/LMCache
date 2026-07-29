@@ -2,9 +2,21 @@
 
 #include "connector.h"
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+
+namespace {
+// O_DIRECT requires the buffer ADDRESS to be block-aligned as well as the
+// length; a misaligned address fails the read/write with EINVAL. Buffers
+// come from Python and carry no alignment guarantee, so fall back to
+// buffered I/O whenever either constraint is unmet.
+bool odirect_eligible(const void* buf, size_t len, size_t disk_block_size) {
+  return disk_block_size > 0 && len % disk_block_size == 0 &&
+         reinterpret_cast<uintptr_t>(buf) % disk_block_size == 0;
+}
+}  // namespace
 
 namespace lmcache {
 namespace connector {
@@ -174,8 +186,7 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
   int flags = O_RDONLY;
   bool do_odirect = conn.use_odirect;
   if (do_odirect) {
-    bool aligned = conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
-    if (aligned) {
+    if (odirect_eligible(buf, len, conn.disk_block_size)) {
 #ifdef O_DIRECT
       flags |= O_DIRECT;
 #endif
@@ -243,8 +254,7 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
   int flags = O_CREAT | O_WRONLY | O_TRUNC;
   bool do_odirect = conn.use_odirect;
   if (do_odirect) {
-    bool aligned = conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
-    if (aligned) {
+    if (odirect_eligible(buf, len, conn.disk_block_size)) {
 #ifdef O_DIRECT
       flags |= O_DIRECT;
 #endif
