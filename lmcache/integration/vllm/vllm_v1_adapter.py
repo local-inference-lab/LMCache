@@ -30,6 +30,11 @@ import torch
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
 from lmcache.banner import print_banner_once
+from lmcache.integration.vllm.dcp_gather import (
+    dcp_local_token_count,
+    maybe_dcp_load,
+    maybe_dcp_save,
+)
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
@@ -303,6 +308,7 @@ class ReqMeta:
         load_spec: Optional[LoadSpec] = None,
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
+        dcp_world_size: int = 1,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -384,7 +390,10 @@ class ReqMeta:
 
         num_blocks = len(tracker.allocated_block_ids)
 
-        if len(token_ids) > num_blocks * block_size:
+        if (
+            dcp_local_token_count(len(token_ids), dcp_world_size)
+            > num_blocks * block_size
+        ):
             logger.error(
                 "The number of tokens is more than the number of blocks"
                 " for request %s. "
@@ -793,6 +802,11 @@ class LMCacheConnectorV1Impl:
         if self.lmcache_engine is None:
             return
 
+        # Decode-context-parallel: fetch + scatter each rank's KV shard (see
+        # dcp_gather.py). No-op / returns False when DCP is inactive.
+        if maybe_dcp_load(self, metadata):
+            return
+
         self.layerwise_retrievers = []
 
         for idx, request in enumerate(metadata.requests):
@@ -1131,6 +1145,12 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_storer)
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
+            return
+
+        # Decode-context-parallel: the latent KV is sharded across DCP ranks, so
+        # gather each rank's shard before storing (see dcp_gather.py). No-op /
+        # returns False when DCP is inactive.
+        if maybe_dcp_save(self, connector_metadata):
             return
 
         assert len(self.kv_caches) > 0
@@ -1675,6 +1695,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                dcp_world_size=self._vllm_config.parallel_config.decode_context_parallel_size,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -1721,6 +1742,7 @@ class LMCacheConnectorV1Impl:
                     load_spec=load_spec,
                     discard_partial_chunks=self._discard_partial_chunks,
                     save_decode_cache=self.config.save_decode_cache,
+                    dcp_world_size=self._vllm_config.parallel_config.decode_context_parallel_size,
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
@@ -1844,6 +1866,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                dcp_world_size=self._vllm_config.parallel_config.decode_context_parallel_size,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
