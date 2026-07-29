@@ -22,15 +22,17 @@ from __future__ import annotations
 
 # Standard
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 import select
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.internal_api import L2StoreResult
+from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
@@ -98,6 +100,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
     # Operation type tags for the pending-ops map
     _OP_STORE = "store"
+    _OP_SYNC_STORE = "sync_store"
     _OP_LOOKUP = "lookup"
     _OP_LOAD = "load"
     _OP_DELETE = "delete"
@@ -144,6 +147,13 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # Pending delete events for synchronous delete() calls
         self._pending_delete_events: dict[L2TaskId, threading.Event] = {}
 
+        # Pending sync-store events for store_objects_sync() callers. Kept
+        # separate from _completed_stores so StoreController cannot consume
+        # another thread's synchronous completions.
+        self._pending_sync_store_events: dict[
+            L2TaskId, tuple[threading.Event, dict[str, Any]]
+        ] = {}
+
         # Per-key size tracking. ``_key_sizes`` lets us look up byte sizes
         # at delete time (the native completion only carries booleans, not
         # sizes) so we can pass them to ``_notify_keys_deleted``. Aggregate
@@ -153,6 +163,21 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # Bridges the async store submit → demux completion gap so the
         # demux thread can fire ``_notify_keys_stored(keys, sizes)``.
         self._pending_store_sizes: dict[int, tuple[list[ObjectKey], list[int]]] = {}
+
+        # Startup scan state for filesystem-native backends; populated by
+        # prime_existing_keys() after the factory scans existing files.
+        self._scanned_keys: list[ObjectKey] = []
+        self._scanned_sizes: list[int] = []
+        self._scan_done: bool = False
+
+        # Backend health is completion-based: a live demux thread in front
+        # of a backend that fails every store must still report unhealthy.
+        self._backend_successes: int = 0
+        self._backend_failures: int = 0
+        self._consecutive_backend_failures: int = 0
+        self._last_backend_success_ts: float = 0.0
+        self._last_backend_failure_ts: float = 0.0
+        self._last_backend_error: str = ""
 
         # Task ID counter
         self._next_task_id: L2TaskId = 0
@@ -218,6 +243,76 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             completed = self._completed_stores
             self._completed_stores = {}
         return completed
+
+    def store_objects_sync(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+    ) -> tuple[bool, int, int]:
+        """Synchronously persist objects to the native backend.
+
+        Intended for callers like L1 eviction that must know the store is
+        durable before acting on it. The completion is routed to a private
+        per-call event instead of the shared
+        ``pop_completed_store_tasks()`` queue, so StoreController cannot
+        race this caller for completions.
+
+        Args:
+            keys: The object keys to persist.
+            objects: The memory objects, in the same order as ``keys``.
+
+        Returns:
+            A tuple ``(success, persisted_count, bytes_written)``.
+            ``success`` is True only when every key was persisted;
+            ``persisted_count`` counts backend-accepted keys;
+            ``bytes_written`` counts bytes newly accounted in this adapter.
+        """
+        if not keys:
+            return True, 0, 0
+
+        key_strings = [_object_key_to_string(k) for k in keys]
+        memviews = [_obj_to_memoryview(obj) for obj in objects]
+        per_key_sizes = [obj.get_size() for obj in objects]
+        done_event = threading.Event()
+        result: dict[str, Any] = {
+            "ok": False,
+            "persisted_count": 0,
+            "bytes_written": 0,
+        }
+
+        with self._lock:
+            task_id = self._get_next_task_id()
+            future_id = int(self._client.submit_batch_set(key_strings, memviews))
+            self._pending_ops[future_id] = (
+                self._OP_SYNC_STORE,
+                task_id,
+                len(keys),
+                None,
+            )
+            self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
+            self._pending_sync_store_events[task_id] = (done_event, result)
+
+        timeout = max(30.0, min(300.0, len(keys) * 5.0))
+        if not done_event.wait(timeout=timeout):
+            with self._lock:
+                self._pending_sync_store_events.pop(task_id, None)
+                for fid, entry in list(self._pending_ops.items()):
+                    if entry[1] == task_id:
+                        self._pending_ops.pop(fid, None)
+                        self._pending_store_sizes.pop(fid, None)
+                        break
+            logger.warning(
+                "store_objects_sync() timed out after %.1fs for %d keys",
+                timeout,
+                len(keys),
+            )
+            return False, 0, 0
+
+        return (
+            bool(result["ok"]),
+            int(result["persisted_count"]),
+            int(result["bytes_written"]),
+        )
 
     # ---------------------------------------------------------------
     # Lookup and Lock Interface
@@ -341,6 +436,78 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
     # class tracks aggregate + per-user totals via ``_notify_keys_*``;
     # we feed it the byte sizes from each store/delete completion.
 
+    def prime_existing_keys(
+        self,
+        keys: list[ObjectKey],
+        sizes: list[int],
+    ) -> None:
+        """Prime byte and LRU accounting for objects that already exist in
+        the backend.
+
+        Called by a factory after scanning pre-existing storage (e.g. the
+        fs_native base path after a restart). Byte counters are updated
+        immediately; the scanned keys are replayed once to each listener
+        registered later, so eviction policies see pre-existing usage.
+
+        Args:
+            keys: The pre-existing object keys.
+            sizes: Byte size of each key, in the same order.
+
+        Raises:
+            ValueError: If ``keys`` and ``sizes`` differ in length.
+        """
+        if len(keys) != len(sizes):
+            raise ValueError("keys and sizes length mismatch")
+
+        # De-duplicate while preserving order; keep the first size seen.
+        unique_keys: list[ObjectKey] = []
+        unique_sizes: list[int] = []
+        seen: set[ObjectKey] = set()
+        for key, size in zip(keys, sizes, strict=True):
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_keys.append(key)
+            unique_sizes.append(int(size))
+
+        with self._lock:
+            self._key_sizes = dict(zip(unique_keys, unique_sizes, strict=True))
+            self._scanned_keys = unique_keys
+            self._scanned_sizes = unique_sizes
+            self._scan_done = True
+
+        by_salt: dict[str, int] = {}
+        total = 0
+        for key, size in zip(unique_keys, unique_sizes, strict=True):
+            by_salt[key.cache_salt] = by_salt.get(key.cache_salt, 0) + size
+            total += size
+        with self._usage_lock:
+            self._total_bytes_used = total
+            self._bytes_by_cache_salt = by_salt
+
+        if unique_keys:
+            logger.info(
+                "Startup scan primed %.2f GB in %d existing objects",
+                total / 1e9,
+                len(unique_keys),
+            )
+
+    def register_listener(self, listener: L2AdapterListener) -> None:
+        """Register a listener, replaying startup-scanned keys once.
+
+        The scanned key/size lists are dropped after the first replay:
+        ``_key_sizes`` and the listener retain the durable index, and
+        keeping extra copies wastes substantial RAM for large caches.
+        """
+        super().register_listener(listener)
+        with self._lock:
+            scanned = self._scanned_keys if self._scan_done else []
+            sizes = self._scanned_sizes if self._scan_done else []
+            self._scanned_keys = []
+            self._scanned_sizes = []
+        if scanned:
+            listener.on_l2_keys_stored(scanned, sizes)
+
     # ---------------------------------------------------------------
     # Status Interface
     # ---------------------------------------------------------------
@@ -351,14 +518,52 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         Returns:
             A dict with at minimum:
               * ``is_healthy`` (bool): ``True`` while the background demux
-                thread is alive and not stopping.
+                thread is alive AND store completions are not failing
+                repeatedly AND accounting does not contradict the backend.
+              * ``thread_healthy`` / ``backend_healthy`` (bool): The two
+                components of ``is_healthy``.
+              * Backend completion counters and last-error details.
               * ``type`` (str): Stable adapter type label, supplied by the
                 factory or derived from the native client class name.
             Plus any caller-supplied ``extra_status`` fields (e.g. backend
             configuration like ``base_path``, ``num_workers``).
         """
+        thread_healthy = self._demux_thread.is_alive() and not self._stop.is_set()
+        with self._lock:
+            consecutive_failures = self._consecutive_backend_failures
+            backend_successes = self._backend_successes
+            backend_failures = self._backend_failures
+            last_success = self._last_backend_success_ts
+            last_failure = self._last_backend_failure_ts
+            last_error = self._last_backend_error
+            accounted_keys = len(self._key_sizes)
+
+        # Detect the catastrophic live-delete case cheaply: accounting says
+        # data exists while the backend's directory has no data file at all.
+        disk_accounting_mismatch = False
+        disk_has_data = None
+        base_path = self._extra_status.get("base_path")
+        if base_path and accounted_keys > 0:
+            try:
+                disk_has_data = next(Path(base_path).glob("*.data"), None) is not None
+                disk_accounting_mismatch = not disk_has_data
+            except OSError:
+                disk_accounting_mismatch = True
+
+        backend_healthy = consecutive_failures < 3 and not disk_accounting_mismatch
         status: dict[str, Any] = {
-            "is_healthy": (self._demux_thread.is_alive() and not self._stop.is_set()),
+            "is_healthy": bool(thread_healthy and backend_healthy),
+            "thread_healthy": bool(thread_healthy),
+            "backend_healthy": bool(backend_healthy),
+            "backend_successes": backend_successes,
+            "backend_failures": backend_failures,
+            "consecutive_backend_failures": consecutive_failures,
+            "last_backend_success_ts": last_success,
+            "last_backend_failure_ts": last_failure,
+            "last_backend_error": last_error,
+            "accounted_key_count": accounted_keys,
+            "disk_has_data": disk_has_data,
+            "disk_accounting_mismatch": disk_accounting_mismatch,
             "type": self._type_name,
         }
         status.update(self._extra_status)
@@ -425,6 +630,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             # the caller unblocks and calls ``get_usage()``, the base
             # class's byte counters already reflect the deletion.
             delete_done_events: list[threading.Event] = []
+            sync_store_done_events: list[threading.Event] = []
 
             with self._lock:
                 for (
@@ -449,12 +655,37 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         lookup_keys,
                     ) = entry
 
-                    if op_type == self._OP_STORE:
+                    if op_type in (self._OP_STORE, self._OP_SYNC_STORE):
                         store_info = self._pending_store_sizes.pop(fid, None)
                         task_bytes = 0
-                        if ok and store_info is not None:
+                        persisted_count = 0
+                        completion_ok = False
+                        if store_info is not None:
                             store_keys, sizes = store_info
-                            for key, size in zip(store_keys, sizes, strict=True):
+                            # Honor per-key native results, even on a failed
+                            # batch: a batch-level success does not prove
+                            # every object was persisted, and keys that DID
+                            # persist within a failed batch must still be
+                            # accounted or eviction stays blind to them.
+                            # Connectors that report no per-key results keep
+                            # batch semantics.
+                            if result_bools is None:
+                                stored_flags = [bool(ok)] * len(store_keys)
+                            else:
+                                stored_flags = [bool(v) for v in result_bools]
+                                if len(stored_flags) < len(store_keys):
+                                    stored_flags.extend(
+                                        [False] * (len(store_keys) - len(stored_flags))
+                                    )
+                                elif len(stored_flags) > len(store_keys):
+                                    stored_flags = stored_flags[: len(store_keys)]
+                            completion_ok = bool(ok) and all(stored_flags)
+                            for key, size, stored in zip(
+                                store_keys, sizes, stored_flags, strict=True
+                            ):
+                                if not stored:
+                                    continue
+                                persisted_count += 1
                                 # First-store wins for byte accounting:
                                 # a re-store of an existing key adds 0
                                 # bytes (the backend already holds it).
@@ -470,8 +701,34 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                 else:
                                     keys_stored.append(key)
                                     sizes_stored.append(0)
-                        self._completed_stores[task_id] = L2StoreResult(ok, task_bytes)
-                        self._store_efd.notify()
+
+                        if op_type == self._OP_STORE:
+                            self._completed_stores[task_id] = L2StoreResult(
+                                completion_ok, task_bytes
+                            )
+                            self._store_efd.notify()
+                        else:
+                            sync_entry = self._pending_sync_store_events.pop(
+                                task_id, None
+                            )
+                            if sync_entry is not None:
+                                sync_event, sync_result = sync_entry
+                                sync_result["ok"] = completion_ok
+                                sync_result["persisted_count"] = persisted_count
+                                sync_result["bytes_written"] = task_bytes
+                                sync_store_done_events.append(sync_event)
+
+                        if completion_ok:
+                            self._backend_successes += 1
+                            self._consecutive_backend_failures = 0
+                            self._last_backend_success_ts = time.time()
+                        else:
+                            self._backend_failures += 1
+                            self._consecutive_backend_failures += 1
+                            self._last_backend_failure_ts = time.time()
+                            self._last_backend_error = str(
+                                error or "partial store failure"
+                            )[:500]
 
                     elif op_type == self._OP_LOOKUP:
                         bitmap = Bitmap(num_keys)
@@ -527,10 +784,12 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 self._notify_keys_accessed(keys_accessed)
             if keys_deleted:
                 self._notify_keys_deleted(keys_deleted, sizes_deleted)
-            # Unblock any synchronous ``delete()`` callers only AFTER
-            # ``_notify_keys_deleted`` has updated the base class byte
-            # accounting, so ``get_usage()`` never briefly reports stale
-            # (too-high) usage in the window between ``delete()``
-            # returning and the notify running.
+            # Unblock synchronous callers only AFTER the notifications
+            # above have updated the base class byte accounting, so
+            # ``get_usage()`` never briefly reports stale usage in the
+            # window between the synchronous call returning and the
+            # notify running.
+            for evt in sync_store_done_events:
+                evt.set()
             for evt in delete_done_events:
                 evt.set()

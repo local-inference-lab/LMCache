@@ -10,9 +10,11 @@ Backed by the native C++ filesystem connector wrapped with
 from __future__ import annotations
 
 # Standard
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
+    from lmcache.v1.distributed.api import ObjectKey
     from lmcache.v1.distributed.internal_api import (
         L1MemoryDesc,
     )
@@ -158,7 +160,7 @@ def _create_fs_native_l2_adapter(
         config.use_odirect,
         config.read_ahead_size,
     )
-    return NativeConnectorL2Adapter(
+    adapter = NativeConnectorL2Adapter(
         native_client,
         max_capacity_gb=config.max_capacity_gb,
         type_name="FSNativeL2Adapter",
@@ -169,6 +171,54 @@ def _create_fs_native_l2_adapter(
             "read_ahead_size": config.read_ahead_size,
         },
     )
+    try:
+        keys, sizes = _scan_existing_fs_native_files(config.base_path)
+        adapter.prime_existing_keys(keys, sizes)
+    except Exception:
+        logger.exception("FS native startup scan failed")
+    return adapter
+
+
+def _scan_existing_fs_native_files(
+    base_path: str,
+) -> tuple[list["ObjectKey"], list[int]]:
+    """Return ``(keys, sizes)`` for existing cache files under ``base_path``.
+
+    After a restart the backend still holds every previously stored file,
+    but the adapter's byte accounting starts at zero, leaving L2 eviction
+    blind to pre-existing disk usage. The Python fs adapter already scans
+    at startup; this is the fs_native equivalent.
+
+    Unparseable or empty files are skipped.
+    """
+    # Lazy import to avoid circular dependency
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
+        _filename_to_object_key,
+    )
+
+    keys: list[ObjectKey] = []
+    sizes: list[int] = []
+    root = Path(base_path)
+    if not root.is_dir():
+        return keys, sizes
+
+    for path in root.glob("*.data"):
+        try:
+            if not path.is_file():
+                continue
+            key = _filename_to_object_key(path.name)
+            if key is None:
+                continue
+            size = path.stat().st_size
+            if size <= 0:
+                continue
+            keys.append(key)
+            sizes.append(size)
+        except OSError:
+            continue
+
+    return keys, sizes
 
 
 register_l2_adapter_type("fs_native", FSNativeL2AdapterConfig)
