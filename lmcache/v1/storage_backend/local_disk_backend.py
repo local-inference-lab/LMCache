@@ -23,6 +23,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+from lmcache.v1.storage_backend.disk_index_rebuild import rebuild_disk_index
 from lmcache.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQThreadPoolExecutor,
 )
@@ -187,6 +188,9 @@ class LocalDiskBackend(StorageBackendInterface):
         # Batched message sender for controller communication
         self.batched_msg_sender: Optional[BatchedMessageSender] = None
 
+        # Adopt chunks left on disk by previous server lifetimes.
+        rebuild_disk_index(self, config, metadata)
+
         # Initialize batched message sender
         if lmcache_worker and metadata is not None:
             self.batched_msg_sender = BatchedMessageSender(
@@ -271,7 +275,13 @@ class LocalDiskBackend(StorageBackendInterface):
             # )
             # res.result()
 
-            os.remove(path)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                logger.debug(
+                    "Disk chunk %s was already gone; dropped its index entry",
+                    path,
+                )
 
             if force:
                 self.cache_policy.update_on_force_evict(key)
@@ -343,7 +353,10 @@ class LocalDiskBackend(StorageBackendInterface):
         all_evict_keys = []
         evict_success = True
         with self.disk_lock:
-            while self.current_cache_size + required_size > self.max_cache_size:
+            overwrite = key in self.dict
+            while not overwrite and (
+                self.current_cache_size + required_size > self.max_cache_size
+            ):
                 evict_keys = self.cache_policy.get_evict_candidates(
                     self.dict, num_candidates=1
                 )
@@ -360,7 +373,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.batched_remove(evict_keys, force=False)
 
                 all_evict_keys.extend(evict_keys)
-            if evict_success:
+            if evict_success and not overwrite:
                 self.current_cache_size += required_size
                 self.cache_policy.update_on_put(key)
 
@@ -636,7 +649,8 @@ class LocalDiskBackend(StorageBackendInterface):
         path = self._key_to_path(key)
 
         size = len(buffer)
-        self.usage += size
+        if key not in self.dict:
+            self.usage += size
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         # TODO(Jiayi): need to add ref count in disk memory object
@@ -682,7 +696,11 @@ class LocalDiskBackend(StorageBackendInterface):
         # TODO (Jiayi): handle the case where loading fails.
         for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
             buffer = mem_obj.byte_array
-            self.read_file(key, buffer, path)
+            if not self.read_file(key, buffer, path):
+                # Upstream raised KeyError here; fail loudly rather than hand a
+                # partially filled buffer back as a hit.
+                mem_obj.ref_count_down()
+                raise RuntimeError(f"LMCache disk chunk vanished: {path}")
 
             # TODO(Jiayi): Please recover the metadata in a more
             # elegant way in the future.
@@ -710,12 +728,19 @@ class LocalDiskBackend(StorageBackendInterface):
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
-        self.read_file(key, buffer, path)
+        if not self.read_file(key, buffer, path):
+            # The buffer is uninitialized, so returning it would feed garbage KV
+            # to the model. Report a miss and let the request recompute.
+            memory_obj.ref_count_down()
+            return None
 
         # TODO(Jiayi): Please recover the metadata in a more
         # elegant way in the future.
-        cached_positions = self.dict[key].cached_positions
-        memory_obj.metadata.cached_positions = cached_positions
+        disk_meta = self.dict.get(key)
+        if disk_meta is None:
+            memory_obj.ref_count_down()
+            return None
+        memory_obj.metadata.cached_positions = disk_meta.cached_positions
 
         return memory_obj
 
@@ -762,7 +787,7 @@ class LocalDiskBackend(StorageBackendInterface):
             logger.warning("File not found on disk: %s", path)
             if self.dict.get(key, None):
                 self.dict.pop(key)
-            return
+            return False
 
         disk_read_time = time.time() - start_time
         if disk_read_time > 0:
@@ -773,6 +798,8 @@ class LocalDiskBackend(StorageBackendInterface):
             )
         else:
             logger.debug("Disk read size: %s bytes", size)
+
+        return True
 
     def get_allocator_backend(self) -> LocalCPUBackend:
         return self.local_cpu_backend
