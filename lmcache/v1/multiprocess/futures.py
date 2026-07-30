@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Any, Generic, Optional, TypeVar
+from typing import Any, Callable, Generic, Optional, TypeVar
 import threading
 
 # First Party
@@ -11,10 +11,12 @@ T = TypeVar("T")
 
 
 class MessagingFuture(Generic[T]):
-    def __init__(self):
+    def __init__(self, on_timeout: Callable[[], None] | None = None):
         self.is_done_ = threading.Event()
         self.result_ = None
         self.exception_: BaseException | None = None
+        self._completion_lock = threading.Lock()
+        self._on_timeout = on_timeout
 
     def query(self) -> bool:
         """
@@ -54,7 +56,13 @@ class MessagingFuture(Generic[T]):
         """
         flag = self.wait(timeout)
         if not flag:
-            raise LMCacheTimeoutError("Future result not available within timeout")
+            timeout_error = LMCacheTimeoutError(
+                "Future result not available within timeout"
+            )
+            if self._expire(timeout_error):
+                raise timeout_error
+            # Completion won the deadline race while wait() was returning.
+            # Fall through and consume that terminal state.
         if self.exception_ is not None:
             raise self.exception_
         return self.result_
@@ -68,15 +76,32 @@ class MessagingFuture(Generic[T]):
         Args:
             result (T): The result to set.
         """
-        self.result_ = result
-        self.is_done_.set()
+        with self._completion_lock:
+            if self.is_done_.is_set():
+                return
+            self.result_ = result
+            self.is_done_.set()
 
     def set_exception(self, exception: BaseException) -> None:
         """Complete the future with an exception from the messaging system."""
         if not isinstance(exception, BaseException):
             raise TypeError("exception must derive from BaseException")
-        self.exception_ = exception
-        self.is_done_.set()
+        with self._completion_lock:
+            if self.is_done_.is_set():
+                return
+            self.exception_ = exception
+            self.is_done_.set()
+
+    def _expire(self, exception: BaseException) -> bool:
+        """Atomically expire an unanswered future and notify its transport."""
+        with self._completion_lock:
+            if self.is_done_.is_set():
+                return False
+            self.exception_ = exception
+            self.is_done_.set()
+        if self._on_timeout is not None:
+            self._on_timeout()
+        return True
 
     def to_cuda_future(
         self,
@@ -176,9 +201,13 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         """
         flag = self.wait(timeout)
         if not flag:
-            raise LMCacheTimeoutError(
+            timeout_error = LMCacheTimeoutError(
                 "CUDAMessagingFuture result not available within timeout"
             )
+            if self.raw_future_._expire(timeout_error):
+                raise timeout_error
+            # The raw response won the timeout race; consume it normally.
+            return self.result()
 
         assert self.result_ is not None
         return self.result_
