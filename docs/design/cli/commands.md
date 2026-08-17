@@ -377,7 +377,12 @@ lmcache/cli/
 
 ### Other notes
 
-- **Entry point:** `lmcache = "lmcache.cli.main:main"` in `pyproject.toml`.
+- **Entry point:** the full package uses
+  `lmcache = "lmcache_cli_bootstrap:main"` in `pyproject.toml`. The bootstrap
+  hides CUDA before importing `lmcache` only for `server --cpu-only`, then
+  delegates to `lmcache.cli.main:main`. The lightweight `lmcache-cli` package
+  keeps the direct main entry point because it does not include the full
+  standalone server.
 - **Auto-discovery mechanism:** Powered by `discover_subclasses()` in
   `lmcache/v1/utils/subclass_discovery.py`. Uses `pkgutil.iter_modules` to
   scan direct submodules, then `inspect.getmembers` to find concrete

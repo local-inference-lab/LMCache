@@ -106,6 +106,8 @@ That's it — `lmcache describe --url http://localhost:8000` is now available.
 ### File layout
 
 ```
+lmcache_cli_bootstrap/
+└── __init__.py          # full-package pre-import CPU-only gate
 lmcache/cli/
 ├── __init__.py          # empty
 ├── main.py              # main() entry point
@@ -126,8 +128,16 @@ lmcache/cli/
 
 ```toml
 [project.scripts]
-lmcache = "lmcache.cli.main:main"
+lmcache = "lmcache_cli_bootstrap:main"
 ```
+
+The full package uses a dependency-free bootstrap so `lmcache server
+--cpu-only` can hide CUDA before importing `lmcache`; the package initializer
+performs accelerator detection. All other invocations, and the CPU-only
+process after its single re-exec, delegate to `lmcache.cli.main:main` without
+changing command behavior. The lightweight `lmcache-cli` distribution keeps
+the direct entry point because it does not ship the full standalone server;
+attempting to launch `server` there reports that the full package is required.
 
 ---
 

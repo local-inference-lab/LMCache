@@ -3,6 +3,8 @@
 
 # Standard
 import argparse
+import os
+import sys
 
 # First Party
 from lmcache.cli.commands.base import BaseCommand
@@ -42,6 +44,14 @@ class ServerCommand(BaseCommand):
         Args:
             parser: The ``ArgumentParser`` for this subcommand.
         """
+        parser.add_argument(
+            "--cpu-only",
+            action="store_true",
+            help=(
+                "Restart the standalone server with CUDA devices hidden. "
+                "Requires --supported-transfer-mode=engine_driven."
+            ),
+        )
         try:
             # First Party
             from lmcache.v1.distributed.config import add_storage_manager_args
@@ -75,10 +85,9 @@ class ServerCommand(BaseCommand):
 
         Raises:
             SystemExit: When server dependencies are not installed.
+            ValueError: When CPU-only mode is requested for a transfer mode
+                that requires server-side accelerator access.
         """
-        # Standard
-        import sys
-
         try:
             # First Party
             from lmcache.v1.distributed.config import parse_args_to_config
@@ -99,6 +108,20 @@ class ServerCommand(BaseCommand):
                 file=sys.stderr,
             )
             sys.exit(1)
+
+        if args.cpu_only and args.supported_transfer_mode != "engine_driven":
+            raise ValueError(
+                "--cpu-only requires --supported-transfer-mode=engine_driven"
+            )
+        if args.cpu_only and os.environ.get("CUDA_VISIBLE_DEVICES") != "":
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            os.execvpe(
+                sys.executable,
+                [sys.executable, *sys.argv],
+                env,
+            )
+            raise RuntimeError("CPU-only server re-exec returned unexpectedly")
 
         run_http_server(
             http_config=parse_args_to_http_frontend_config(args),
