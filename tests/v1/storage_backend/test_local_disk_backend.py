@@ -81,6 +81,25 @@ def create_test_key(key_id: int = 0) -> CacheEngineKey:
     )
 
 
+def register_chunk(
+    backend: LocalDiskBackend,
+    key: CacheEngineKey,
+    shape: torch.Size,
+    dtype: torch.dtype,
+    fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+) -> bytes:
+    """Write a random chunk for *key* to disk and register it in the index.
+
+    Returns the raw bytes that were written so callers can verify reads.
+    """
+    nbytes = shape.numel() * dtype.itemsize
+    data = os.urandom(nbytes)
+    with open(backend._key_to_path(key), "wb") as f:
+        f.write(data)
+    backend.insert_key(key, size=nbytes, shape=shape, dtype=dtype, fmt=fmt)
+    return data
+
+
 @pytest.fixture
 def temp_disk_path():
     """Create a temporary directory for disk storage tests."""
@@ -484,22 +503,7 @@ class TestBatchedGetBlocking:
 
         Returns the raw bytes that were written so callers can verify reads.
         """
-        path = backend._key_to_path(key)
-        nbytes = 1
-        for s in self._SHAPE:
-            nbytes *= s
-        nbytes *= self._DTYPE.itemsize
-        data = os.urandom(nbytes)
-        with open(path, "wb") as f:
-            f.write(data)
-        backend.insert_key(
-            key,
-            size=nbytes,
-            shape=self._SHAPE,
-            dtype=self._DTYPE,
-            fmt=MemoryFormat.KV_2LTD,
-        )
-        return data
+        return register_chunk(backend, key, self._SHAPE, self._DTYPE)
 
     def test_all_keys_missing(self, local_disk_backend: LocalDiskBackend) -> None:
         """batched_get_blocking returns [None, …] when no keys are cached."""
@@ -609,3 +613,80 @@ class TestBatchedGetBlocking:
         results = local_disk_backend.batched_get_blocking([])
         assert results == []
         local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+
+class TestVanishedChunkFile:
+    """A chunk file can disappear between ``insert_key`` and the read.
+
+    Another server lifetime, an eviction racing an in-flight put, or an operator
+    clearing the directory all leave the index pointing at a path that no longer
+    exists. The read must degrade to a miss: the staging buffer is allocated but
+    never written, so returning it would feed uninitialized bytes to the model as
+    though they were cached KV, and the pre-existing ``self.dict[key]`` lookup
+    raised ``KeyError`` right after ``read_file`` had dropped that very entry.
+    """
+
+    _SHAPE = torch.Size([2, 4, 256, 8])
+    _DTYPE = torch.bfloat16
+
+    def test_get_blocking_returns_the_written_chunk(
+        self, local_disk_backend: LocalDiskBackend
+    ) -> None:
+        """Positive control: a present chunk still loads with its bytes intact."""
+        key = create_test_key(300)
+        data = register_chunk(local_disk_backend, key, self._SHAPE, self._DTYPE)
+
+        memory_obj = local_disk_backend.get_blocking(key)
+
+        assert memory_obj is not None
+        assert bytes(memory_obj.byte_array) == data
+        memory_obj.ref_count_down()
+        local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+    def test_get_blocking_of_a_vanished_chunk_is_a_miss(
+        self, local_disk_backend: LocalDiskBackend
+    ) -> None:
+        """A vanished chunk is a miss, not a hit backed by an unwritten buffer."""
+        key = create_test_key(301)
+        data = register_chunk(local_disk_backend, key, self._SHAPE, self._DTYPE)
+        os.remove(local_disk_backend._key_to_path(key))
+
+        cpu_backend = local_disk_backend.local_cpu_backend
+        staged = cpu_backend.allocate(self._SHAPE, self._DTYPE, MemoryFormat.KV_2LTD)
+        assert staged is not None
+        with patch.object(cpu_backend, "allocate", return_value=staged):
+            assert local_disk_backend.get_blocking(key) is None
+
+        assert bytes(staged.byte_array) != data, (
+            "the staging buffer must not contain the chunk; if it did the read "
+            "succeeded and this test no longer covers the vanished-file path"
+        )
+        # The staging buffer was handed back rather than leaked ...
+        assert staged.get_ref_count() == 0
+        # ... and the stale index entry is gone, so the retry is a plain miss
+        # instead of a KeyError.
+        assert not local_disk_backend.contains(key)
+        assert local_disk_backend.get_blocking(key) is None
+        cpu_backend.memory_allocator.close()
+
+    def test_batched_async_load_names_the_vanished_chunk(
+        self, local_disk_backend: LocalDiskBackend
+    ) -> None:
+        """The async prefetch path reports the path instead of a bare KeyError."""
+        key = create_test_key(302)
+        register_chunk(local_disk_backend, key, self._SHAPE, self._DTYPE)
+        path = local_disk_backend._key_to_path(key)
+        os.remove(path)
+
+        cpu_backend = local_disk_backend.local_cpu_backend
+        staged = cpu_backend.allocate(self._SHAPE, self._DTYPE, MemoryFormat.KV_2LTD)
+        assert staged is not None
+
+        with pytest.raises(RuntimeError, match="vanished"):
+            local_disk_backend.batched_async_load_bytes_from_disk(
+                [path], [key], [staged]
+            )
+
+        assert staged.get_ref_count() == 0
+        assert not local_disk_backend.contains(key)
+        cpu_backend.memory_allocator.close()
