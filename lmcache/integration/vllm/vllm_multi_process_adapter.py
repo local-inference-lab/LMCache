@@ -1244,16 +1244,26 @@ class LMCacheMPWorkerAdapter:
                 "register_kv_caches within "
                 f"{self._mq_timeout}s. Is the server running?"
             ) from None
+        # Start the per-instance heartbeat with the registration instead of
+        # on the first store/retrieve: the server reaps a registered worker
+        # that never pinged after worker_registration_grace_seconds, and an
+        # engine that stays idle past that window (e.g. serving only
+        # sub-chunk-sized requests) would otherwise have its live
+        # registrations reaped and crash on the next PREPARE_STORE. Starting
+        # here also covers the re-registration path, which shares this
+        # function; the call is a no-op when the heartbeat already runs.
+        self._ensure_heartbeat_started()
 
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat thread on first store/retrieve.
+        """Start the per-instance heartbeat thread if it is not running.
 
-        The heartbeat starts healthy (the event was set at construction). A
-        live worker pings every interval, refreshing its server-side
-        ``last_seen``, so it is never reaped while alive -- no re-registration
-        is needed at startup, and the first store/retrieve is not gated. The
-        recover callback still re-registers on a genuine unhealthy->healthy
-        edge (server restart).
+        Called right after KV-cache registration and again on the first
+        store/retrieve; re-entry is a no-op. The heartbeat starts healthy
+        (the event was set at construction). A live worker pings every
+        interval, refreshing its server-side ``last_seen``, so it is never
+        reaped while alive -- no re-registration is needed at startup, and
+        the first store/retrieve is not gated. The recover callback still
+        re-registers on a genuine unhealthy->healthy edge (server restart).
         """
         if self._heartbeat is not None:
             return
