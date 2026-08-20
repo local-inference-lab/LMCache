@@ -210,6 +210,10 @@ def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
         fake_tensor.device.type = "cuda"
         adapter.register_kv_caches({"layer.0": fake_tensor})
 
+    # A failed registration must not leave a heartbeat pinging a context
+    # the server never registered.
+    assert FakeHeartbeatThread.instances == []
+
 
 def test_register_kv_caches_cpu_submits_engine_driven_context_registration(
     fake_adapter, monkeypatch
@@ -230,6 +234,27 @@ def test_register_kv_caches_cpu_submits_engine_driven_context_registration(
     args, _kwargs = send_mock.call_args
     assert args[1] == RequestType.REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT
     assert len(args[2]) == 1
+
+
+def test_register_kv_caches_starts_heartbeat(fake_adapter) -> None:
+    """Successful registration starts the per-instance heartbeat immediately.
+
+    The server reaps a registered worker that never pings after
+    ``worker_registration_grace_seconds``; a heartbeat that only starts on
+    the first store/retrieve leaves an engine that serves no chunk-sized
+    request within that window exposed to the reaper.
+    """
+    adapter, _send_mock, _ = fake_adapter
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    assert len(FakeHeartbeatThread.instances) == 1
+    heartbeat = FakeHeartbeatThread.instances[0]
+    assert heartbeat.instance_id == adapter.instance_id
+    assert heartbeat.calls == ["register_recover_callback", "start"]
+    assert adapter.is_healthy
 
 
 def test_submit_store_request_tracks_returned_future(fake_adapter, monkeypatch):
