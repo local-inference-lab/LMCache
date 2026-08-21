@@ -47,6 +47,7 @@ class FakeHeartbeatThread:
         health_event: threading.Event | None = None,
         interval: float = 0.0,
         instance_id: int | None = None,
+        timeout: float = 0.0,
     ) -> None:
         self.mq_client = mq_client
         self.health_event = (
@@ -54,6 +55,7 @@ class FakeHeartbeatThread:
         )
         self.interval = interval
         self.instance_id = instance_id
+        self.timeout = timeout
         # Snapshot of the health event at construction time: lets tests
         # assert the adapter starts the heartbeat healthy (event still set).
         self.health_event_set_at_init = self.health_event.is_set()
@@ -844,3 +846,26 @@ def test_successful_retrieve_marks_no_blocks_invalid(fake_adapter) -> None:
     assert finished_retrieves == {"req-1"}
     assert adapter.get_block_ids_with_load_errors() == set()
     assert adapter.retrieve_failure_count == 0
+def test_heartbeat_timeout_reaches_heartbeat_thread(fake_adapter) -> None:
+    """``lmcache.mp.heartbeat_timeout`` propagates to ``HeartbeatThread`` while
+    the cadence stays at ``heartbeat_interval``; the default 0.0 preserves the
+    legacy interval-coupled PING timeout (heartbeat-timeout-decouple)."""
+    default_adapter, _send_mock, _ = fake_adapter
+    default_adapter.transfer_ctx = MagicMock()
+    default_adapter.submit_store_request("req-default", _op([[0]]), MagicMock())
+    assert FakeHeartbeatThread.instances[-1].timeout == 0.0
+    assert (
+        FakeHeartbeatThread.instances[-1].interval
+        == default_adapter._heartbeat_interval
+    )
+
+    custom_adapter = _make_worker_adapter(
+        extra_config={
+            "lmcache.mp.heartbeat_interval": 5,
+            "lmcache.mp.heartbeat_timeout": 30,
+        }
+    )
+    custom_adapter.transfer_ctx = MagicMock()
+    custom_adapter.submit_store_request("req-custom", _op([[1]]), MagicMock())
+    assert FakeHeartbeatThread.instances[-1].timeout == 30.0
+    assert FakeHeartbeatThread.instances[-1].interval == 5.0
