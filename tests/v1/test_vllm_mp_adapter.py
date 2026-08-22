@@ -229,6 +229,52 @@ def test_register_kv_caches_accepts_finer_external_chunk_for_dcp_group(
     send_register.assert_called_once_with(kv_caches)
 
 
+def test_engine_driven_multigroup_registration_uses_group_geometry(
+    fake_adapter, monkeypatch
+):
+    """Heterogeneous Mamba and MLA tensors bypass homogeneous detection.
+
+    The recurrent group already matches the 1,536-token object boundary;
+    only the attention group is finer than its 12,288-token DCP manager block.
+    Per-group worker registration validates both layouts independently.
+    """
+    adapter, _send_mock, _ = fake_adapter
+    adapter.lmcache_tokens_per_chunk = 1_536
+    adapter.blocks_in_chunk = 1
+    adapter._mp_transfer_mode = "engine_driven"
+
+    transfer_ctx = MagicMock(spec=adapter_mod.EngineDrivenTransferContext)
+    monkeypatch.setattr(
+        adapter_mod,
+        "create_transfer_context",
+        lambda _kv_caches, mode: transfer_ctx,
+    )
+    # Use the source-matched vLLM layout hints: the production failure occurs
+    # only when the heterogeneous dict is normalized with those real hints.
+
+    # Production ordering presents a rank-4 fused attention tensor first, so
+    # the legacy detector selects that layout and then incorrectly applies its
+    # reshape to the following rank-3 Mamba state tensor.
+    kv_caches = {
+        "mla": torch.empty(1, 192, 1, 576, dtype=torch.bfloat16),
+        "recurrent": torch.empty(75, 1_536, 576, dtype=torch.bfloat16),
+    }
+    groups = [
+        EngineGroupInfo(
+            0,
+            (1,),
+            tokens_per_block=1_536,
+            sw_size_tokens=1_536,
+        ),
+        EngineGroupInfo(1, (0,), tokens_per_block=12_288),
+    ]
+
+    adapter.register_kv_caches(kv_caches, engine_group_infos=groups)
+
+    assert transfer_ctx.register.call_args.args[4] == 1
+    assert transfer_ctx.register.call_args.kwargs["engine_group_infos"] == groups
+
+
 def test_engine_driven_transfer_uses_physical_cache_block_count(
     fake_adapter, monkeypatch
 ):

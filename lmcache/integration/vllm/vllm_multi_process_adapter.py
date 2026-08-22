@@ -1338,7 +1338,16 @@ class LMCacheMPWorkerAdapter:
         transfer_ctx = create_transfer_context(kv_caches, mode=self._mp_transfer_mode)
         layout_hints = vllm_layout_hints()
         transfer_blocks_in_chunk = self.blocks_in_chunk
-        if isinstance(transfer_ctx, EngineDrivenTransferContext):
+        # Whole-dict layout detection is valid only for homogeneous/single-group
+        # caches. Hybrid vLLM registration may place a rank-4 fused attention
+        # tensor before rank-3 Mamba state tensors; applying the first tensor's
+        # reshape to the whole dict corrupts discovery. Multigroup contexts are
+        # validated independently by EngineDrivenTransferContext.register(),
+        # including the fail-closed sliding-window/recurrent fine-split guard.
+        if (
+            isinstance(transfer_ctx, EngineDrivenTransferContext)
+            and len(self.engine_group_infos) <= 1
+        ):
             physical_block_size, *_ = compute_kv_layout(
                 kv_caches, layout_hints=layout_hints
             )
