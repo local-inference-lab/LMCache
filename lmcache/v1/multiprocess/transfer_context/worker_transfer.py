@@ -289,6 +289,7 @@ class TransferContext(ABC):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        tokens_per_chunk: int | None = None,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -303,6 +304,9 @@ class TransferContext(ABC):
             send_request: Request sender callable used to issue MQ requests.
             layout_hints: Optional inference-engine-provided layout hints.
             engine_group_infos: LMCache-owned engine KV cache group metadata.
+            tokens_per_chunk: Explicit logical token span of one LMCache chunk.
+                When omitted, legacy callers derive it from ``blocks_in_chunk``
+                and the detected cache block size.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -405,13 +409,15 @@ class LMCacheDrivenTransferContext(TransferContext):
         kv_caches: dict[str, torch.Tensor],
         model_name: str,
         world_size: int,
-        _blocks_in_chunk: int,
+        blocks_in_chunk: int,
         mq_client: MessageQueueClient,
         mq_timeout: float,
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        tokens_per_chunk: int | None = None,
     ) -> None:
+        del blocks_in_chunk, tokens_per_chunk
         # First Party
         from lmcache.integration.vllm.vllm_multi_process_adapter import wrap_kv_caches
 
@@ -522,6 +528,7 @@ class EngineDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        tokens_per_chunk: int | None = None,
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
@@ -569,7 +576,11 @@ class EngineDrivenTransferContext(TransferContext):
         # The wire field is named use_mla but only drives the object plane
         # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
         use_mla_flag = kv_size == 1
-        chunk_tokens = blocks_in_chunk * block_size
+        chunk_tokens = (
+            tokens_per_chunk
+            if tokens_per_chunk is not None
+            else blocks_in_chunk * block_size
+        )
 
         group_layouts: list[GroupLayout] = []
         group_states: list[_GroupState] = []
