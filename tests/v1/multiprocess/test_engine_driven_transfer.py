@@ -477,6 +477,102 @@ def test_musa_data_context_keeps_layout_validation_device_agnostic(
     )
 
 
+def test_engine_driven_hybrid_registration_uses_explicit_chunk_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A coarse recurrent page must not inflate the LMCache chunk span.
+
+    vLLM may expose one 8-token recurrent page together with a 1-slot
+    sequence-sharded attention page while LMCache's configured chunk remains
+    8 tokens.  The transfer context must gather one manager block per group;
+    deriving the span as ``blocks_in_chunk * first_group_block_size`` would
+    incorrectly require eight blocks and emit an empty payload.
+    """
+    # First Party
+    import lmcache.c_ops as lmc_ops
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    kv_caches = {
+        "mamba": torch.zeros(4, 8, 4),
+        "mla": torch.zeros(4, 1, 4),
+    }
+
+    def _fake_compute_kv_layout(
+        caches: dict[str, torch.Tensor], **_kwargs: Any
+    ) -> tuple[int, int, int, str, Any, int]:
+        block_size = 8 if "mamba" in caches else 1
+        return (
+            block_size,
+            1,
+            4,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_NB_BS_HS,
+            1,
+        )
+
+    captured_blocks_in_chunk: list[int] = []
+
+    def _fake_gather(
+        _caches: dict[str, torch.Tensor],
+        _block_ids: list[int],
+        blocks_in_chunk: int,
+        **_kwargs: Any,
+    ) -> list[torch.Tensor]:
+        captured_blocks_in_chunk.append(blocks_in_chunk)
+        return [torch.zeros(1)]
+
+    engine_context = MagicMock()
+    engine_context.prepare_store_grouped.return_value = (
+        [torch.zeros(1), torch.zeros(1)],
+        [0, 0],
+        [0, 1],
+    )
+    engine_context.commit_store.return_value = True
+    monkeypatch.setattr(worker_transfer, "compute_kv_layout", _fake_compute_kv_layout)
+    monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _fake_gather)
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: engine_context,
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    ctx = EngineDrivenTransferContext()
+
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=8,
+        tokens_per_chunk=8,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=(
+            EngineGroupInfo(0, (0,), tokens_per_block=8),
+            EngineGroupInfo(1, (1,), tokens_per_block=8),
+        ),
+    )
+
+    result = ctx.submit_store(
+        "req",
+        _default_key(),
+        1,
+        kv_caches,
+        [[0], [0]],
+        MagicMock(),
+        8,
+    ).result()
+
+    assert result is True
+    assert captured_blocks_in_chunk == [1, 1]
+
+
 def test_musa_data_context_store_uses_device_agnostic_gather(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
