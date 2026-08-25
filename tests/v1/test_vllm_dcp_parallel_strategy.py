@@ -51,7 +51,7 @@ def test_mla_dcp_maps_replicated_tp_ranks_to_dcp_shards(
 def test_build_parallel_strategy_reads_dcp_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(lmcache_mp_connector, "mla_enabled", lambda _: True)
+    monkeypatch.setattr(lmcache_mp_connector, "mla_only", lambda _: True)
     parallel_config = SimpleNamespace(
         world_size=8,
         rank=5,
