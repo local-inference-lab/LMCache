@@ -195,6 +195,21 @@ def mla_enabled(model_config: "ModelConfig") -> bool:
     )
 
 
+def _use_multiple_attentions(model_config: "ModelConfig") -> bool:
+    """Whether the model mixes attention with recurrent/linear layers."""
+    return bool(getattr(model_config, "is_hybrid", False))
+
+
+def mla_only(model_config: "ModelConfig") -> bool:
+    """Whether every cached tensor is replicated across tensor-parallel ranks.
+
+    LMCache's MLA parallel shortcut shares cached bytes between TP ranks. That
+    is correct for pure MLA models, but not for hybrid models such as Kimi-K3:
+    their MLA state is replicated while recurrent/KDA state is rank-sharded.
+    """
+    return mla_enabled(model_config) and not _use_multiple_attentions(model_config)
+
+
 def create_lmcache_metadata(
     vllm_config=None,
     model_config=None,
