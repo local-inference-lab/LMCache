@@ -106,6 +106,19 @@ logger = lmcache_init_logger(__name__)
 
 
 # Helper functions
+def _should_skip_mixed_recurrent_retrieve(
+    has_recurrent_cache: bool,
+    num_computed_tokens: int,
+    num_lmcache_hit_tokens: int,
+) -> bool:
+    """Reject an unqualified external tail spliced onto local recurrent state."""
+    return (
+        has_recurrent_cache
+        and num_computed_tokens > 0
+        and num_lmcache_hit_tokens > num_computed_tokens
+    )
+
+
 def _has_preemption_reqs(scheduler_output: SchedulerOutput) -> bool:
     """Return whether the scheduler output contains preemption-related requests.
 
@@ -241,6 +254,7 @@ class LMCacheMPRequestTracker:
     # Staging load operation -- save vllm and lmcache hit tokens during lookup
     num_vllm_hit_tokens: int = 0
     num_lmcache_hit_tokens: int = 0
+    skip_mixed_recurrent_retrieve: bool = False
 
     # Main state
     state: LMCacheMPRequestState = LMCacheMPRequestState.PREFETCHING
@@ -257,6 +271,7 @@ class LMCacheMPRequestTracker:
         self.num_stored_tokens = 0
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
+        self.skip_mixed_recurrent_retrieve = False
         self.state = LMCacheMPRequestState.PREFETCHING
         self.mm_adjusted_prompt_ids = []
         mm_hashes, mm_positions = extract_mm_features(request)
@@ -272,7 +287,8 @@ class LMCacheMPRequestTracker:
         """Check whether the current request needs retrieve, will be used
         update_stage_after_alloc"""
         return (
-            self.num_lmcache_hit_tokens > self.num_vllm_hit_tokens
+            not self.skip_mixed_recurrent_retrieve
+            and self.num_lmcache_hit_tokens > self.num_vllm_hit_tokens
             and self.state != LMCacheMPRequestState.READY
         )
 
@@ -700,6 +716,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError(f"Unknown KVConnectorRole: {self.role}")
 
         kv_cache_config = getattr(self, "_kv_cache_config", None)
+        self._has_recurrent_cache = bool(
+            getattr(kv_cache_config, "has_mamba_layers", False)
+        )
         vllm_groups = (
             getattr(kv_cache_config, "kv_cache_groups", ()) or ()
             if kv_cache_config is not None
@@ -1040,6 +1059,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             * self._hit_alignment_tokens
         )
         tracker.num_lmcache_hit_tokens = ret
+
+        # Local APC state and a deeper external tail are not composable for
+        # recurrent groups in this connector. Keep the lookup locked until
+        # update_state_after_alloc releases it, then recompute the tail from
+        # the trusted local state.
+        if _should_skip_mixed_recurrent_retrieve(
+            self._has_recurrent_cache,
+            num_computed_tokens,
+            ret,
+        ):
+            tracker.skip_mixed_recurrent_retrieve = True
+            return 0, False
 
         need_to_load = max(0, ret - num_computed_tokens)
         logger.debug(
