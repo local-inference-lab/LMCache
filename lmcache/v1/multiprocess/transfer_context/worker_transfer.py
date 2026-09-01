@@ -635,6 +635,11 @@ class LMCacheDrivenTransferContext(TransferContext):
             RequestType.STORE,
             [key, instance_id, block_ids, event_ipc_handle],
         ).to_device_future(device=self._device)
+        # Multiple incremental stores for one request overwrite the adapter's
+        # request-keyed event slot. Tie every producer event to its own remote
+        # future so the exported IPC event remains valid until the sidecar has
+        # finished waiting on it and reading the corresponding GPU pages.
+        future.retain_reference(event)
         self._inflight_store_futures.add(future)
         return future
 
