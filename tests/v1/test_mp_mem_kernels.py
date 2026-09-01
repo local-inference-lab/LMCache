@@ -656,7 +656,7 @@ def test_block_transfer_roundtrip_large_block(dtype, mem_device):
 def test_block_transfer_roundtrip_byte_odd_padded_mla_page():
     """Opaque byte-odd rows round-trip without touching dim-0 padding."""
     device = torch.device(torch_device_type)
-    nl, nb, bs, nh, hs = 2, 24, 16, 1, 561
+    nl, nb, bs, nh, hs = 2, 40, 16, 1, 561
     block_stride_elems = bs * hs + 37
     tokens_per_object = 256
     blocks_per_object = tokens_per_object // bs
