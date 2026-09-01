@@ -490,12 +490,14 @@ class _PaddedAttentionPageViewEdit(KVCacheGroupEdit):
     """Canonicalize a padded attention layer as an opaque rank-3 page.
 
     Current vLLM HMA layouts expose MLA as ``[B, H=1, N, C]`` and a replicated
-    DFlash page as e.g. ``[B, H=2, N=16, C=256]``. In both cases the inner page
-    is tightly packed, while sibling pages create a gap between dim-0 rows.
-    LMCache's opaque ``[B, N, C]`` format supports that authoritative padded
-    block stride. Re-factoring all inner page elements over the engine's
-    logical block size is a zero-copy view and preserves every payload byte;
-    the resulting dimensions are addressing metadata, not semantic K/V axes.
+    DFlash page as e.g. ``[B, H=2, N=16, C=256]``. The semantic inner page is
+    tightly packed, while the declared physical page can also append opaque
+    model-owned state before sibling pages create the remaining gap between
+    dim-0 rows. LMCache's opaque ``[B, N, C]`` format supports that
+    authoritative padded block stride. Re-factoring the complete declared page
+    over the engine's logical block size is a zero-copy view and preserves both
+    semantic KV and any opaque page tail; the resulting dimensions are
+    addressing metadata, not semantic K/V axes.
     """
 
     name = "padded-attention-page-view"
@@ -523,11 +525,31 @@ class _PaddedAttentionPageViewEdit(KVCacheGroupEdit):
         """Return a padded-stride-preserving opaque ``[B, BS, HS]`` view.
 
         Raises:
-            ValueError: If one physical page cannot be factored evenly over
-                the engine's logical block size.
+            ValueError: If the declared page is not element-aligned, cannot be
+                factored evenly over the engine's logical block size, is
+                smaller than the semantic tensor page, or exceeds the physical
+                dim-0 stride.
         """
         assert isinstance(kv_cache, torch.Tensor)
-        page_elems = kv_cache.shape[1:].numel()
+        element_size = kv_cache.element_size()
+        page_bytes = spec.page_size_bytes
+        if page_bytes % element_size:
+            raise ValueError(
+                f"declared attention page size {page_bytes} bytes is not aligned "
+                f"to tensor element size {element_size}"
+            )
+        page_elems = page_bytes // element_size
+        semantic_page_elems = kv_cache.shape[1:].numel()
+        if page_elems < semantic_page_elems:
+            raise ValueError(
+                f"declared attention page has {page_elems} elements but the "
+                f"semantic tensor page requires {semantic_page_elems}"
+            )
+        if page_elems > kv_cache.stride(0):
+            raise ValueError(
+                f"declared attention page has {page_elems} elements but the "
+                f"physical block stride is only {kv_cache.stride(0)}"
+            )
         if page_elems % spec.block_size:
             raise ValueError(
                 f"a {page_elems}-element attention page cannot be factored "
