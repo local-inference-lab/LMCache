@@ -623,6 +623,76 @@ def test_padded_attention_page_views_preserve_hma_block_padding(
 
 
 @requires_vllm
+def test_padded_attention_page_view_includes_declared_opaque_tail():
+    """Model-owned bytes appended to an MLA page must round-trip with KV."""
+    # Third Party
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MLAAttentionSpec,
+    )
+    from vllm.v1.kv_cache_interface import MambaSpec as VllmMambaSpec
+
+    # First Party
+    from lmcache.integration.vllm.kv_cache_group_edits import (
+        apply_kv_cache_group_edits,
+    )
+
+    num_blocks = 3
+    semantic_page_elems = 32
+    declared_page_elems = 40
+    block_stride_elems = 80
+    pool = torch.arange(num_blocks * block_stride_elems, dtype=torch.uint8)
+    attention = pool.as_strided(
+        (num_blocks, 1, 4, 8),
+        (block_stride_elems, semantic_page_elems, 8, 1),
+    )
+    mla_spec = MLAAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.uint8,
+        page_size_padded=declared_page_elems,
+    )
+    mamba_spec = VllmMambaSpec(
+        block_size=4,
+        shapes=((13,),),
+        dtypes=(torch.float32,),
+        page_size_padded=64,
+        mamba_cache_mode="align",
+    )
+    mamba_pool = torch.zeros(num_blocks * 16, dtype=torch.float32)
+    mamba = mamba_pool.as_strided(
+        (num_blocks, 1, 1, 13),
+        (16, 13, 13, 1),
+    )
+    kv_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attention"], mla_spec),
+            KVCacheGroupSpec(["mamba"], mamba_spec),
+        ],
+        kv_cache_layout="NHD",
+    )
+
+    edited = apply_kv_cache_group_edits(
+        kv_config,
+        {"attention": attention, "mamba": mamba},
+        {"kv_layout": "NHD"},
+    )["attention"]
+
+    assert isinstance(edited, torch.Tensor)
+    assert edited.shape == (num_blocks, 4, 10)
+    assert edited.stride() == (block_stride_elems, 10, 1)
+    assert edited.data_ptr() == attention.data_ptr()
+    assert torch.equal(
+        edited[1].reshape(-1),
+        pool[block_stride_elems : block_stride_elems + declared_page_elems],
+    )
+
+
+@requires_vllm
 @pytest.mark.parametrize("attention_kind", ["mla", "standard"])
 def test_subpaged_attention_excludes_incomplete_logical_page_tail(
     attention_kind: Literal["mla", "standard"],
