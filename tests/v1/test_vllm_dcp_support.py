@@ -629,9 +629,11 @@ def test_padded_attention_page_view_includes_declared_opaque_tail():
     from vllm.v1.kv_cache_interface import (
         KVCacheConfig,
         KVCacheGroupSpec,
-        MLAAttentionSpec,
     )
     from vllm.v1.kv_cache_interface import MambaSpec as VllmMambaSpec
+    from vllm.v1.kv_cache_interface import (
+        MLAAttentionSpec,
+    )
 
     # First Party
     from lmcache.integration.vllm.kv_cache_group_edits import (
@@ -690,6 +692,111 @@ def test_padded_attention_page_view_includes_declared_opaque_tail():
         edited[1].reshape(-1),
         pool[block_stride_elems : block_stride_elems + declared_page_elems],
     )
+
+
+@requires_vllm
+def test_packed_nvfp4_page_uses_one_opaque_slot_per_logical_block():
+    """A non-token-factorable NVFP4 page transfers as one exact block record."""
+    # Third Party
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+    )
+    from vllm.v1.kv_cache_interface import MambaSpec as VllmMambaSpec
+    from vllm.v1.kv_cache_interface import (
+        MLAAttentionSpec,
+    )
+
+    # First Party
+    from lmcache.integration.vllm.kv_cache_group_edits import (
+        apply_kv_cache_group_edits,
+    )
+    from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    import lmcache.lmcache_native as lmcache_native
+
+    num_blocks = 3
+    logical_block_size = 512
+    semantic_record_bytes = 304
+    semantic_page_bytes = logical_block_size * semantic_record_bytes
+    declared_page_bytes = 177_408
+    block_stride_bytes = 200_000
+    pool = torch.arange(
+        num_blocks * block_stride_bytes, dtype=torch.int64
+    ).to(torch.uint8)
+    attention = pool.as_strided(
+        (num_blocks, 1, logical_block_size, semantic_record_bytes),
+        (
+            block_stride_bytes,
+            semantic_page_bytes,
+            semantic_record_bytes,
+            1,
+        ),
+    )
+    mla_spec = MLAAttentionSpec(
+        block_size=logical_block_size,
+        num_kv_heads=1,
+        head_size=semantic_record_bytes,
+        dtype=torch.uint8,
+        page_size_padded=declared_page_bytes,
+    )
+    mamba_spec = VllmMambaSpec(
+        block_size=logical_block_size,
+        shapes=((13,),),
+        dtypes=(torch.float32,),
+        page_size_padded=logical_block_size * torch.float32.itemsize,
+        mamba_cache_mode="align",
+    )
+    mamba_pool = torch.zeros(
+        num_blocks * logical_block_size, dtype=torch.float32
+    )
+    mamba = mamba_pool.as_strided(
+        (num_blocks, 1, 1, 13),
+        (logical_block_size, 13, 13, 1),
+    )
+    kv_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attention"], mla_spec),
+            KVCacheGroupSpec(["mamba"], mamba_spec),
+        ],
+        kv_cache_layout="NHD",
+    )
+
+    edited = apply_kv_cache_group_edits(
+        kv_config,
+        {"attention": attention, "mamba": mamba},
+        {"kv_layout": "NHD"},
+    )["attention"]
+
+    assert isinstance(edited, torch.Tensor)
+    assert edited.shape == (num_blocks, 1, declared_page_bytes)
+    assert edited.stride() == (block_stride_bytes, declared_page_bytes, 1)
+    assert edited.data_ptr() == attention.data_ptr()
+    assert torch.equal(
+        edited[1].reshape(-1),
+        pool[block_stride_bytes : block_stride_bytes + declared_page_bytes],
+    )
+
+    manager = KVLayerGroupsManager(
+        [edited],
+        engine_kv_formats=[lmcache_native.EngineKVFormat.NL_X_NB_BS_HS],
+        engine_group_infos=[
+            EngineGroupInfo(
+                engine_group_id=0,
+                layer_indices=(0,),
+                tokens_per_block=logical_block_size,
+            )
+        ],
+        lmcache_tokens_per_chunk=4096,
+    )
+    group = manager.kernel_groups[0]
+    assert group.slots_per_block == 1
+    assert group.tokens_per_block == logical_block_size
+    assert group.calculate_slots(4096) == 8
+    assert group.shape_desc.hs == declared_page_bytes
+    assert group.shape_desc.block_stride_elems == block_stride_bytes
 
 
 @requires_vllm

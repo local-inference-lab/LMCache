@@ -494,10 +494,16 @@ class _PaddedAttentionPageViewEdit(KVCacheGroupEdit):
     tightly packed, while the declared physical page can also append opaque
     model-owned state before sibling pages create the remaining gap between
     dim-0 rows. LMCache's opaque ``[B, N, C]`` format supports that
-    authoritative padded block stride. Re-factoring the complete declared page
-    over the engine's logical block size is a zero-copy view and preserves both
-    semantic KV and any opaque page tail; the resulting dimensions are
-    addressing metadata, not semantic K/V axes.
+    authoritative padded block stride. The complete declared page is exposed
+    as a zero-copy view, preserving both semantic KV and any opaque page tail;
+    the resulting dimensions are addressing metadata, not semantic K/V axes.
+
+    Ordinary pages retain one physical slot per token. Packed pages whose byte
+    count cannot be factored over the logical block size (for example GLM-5.3
+    NVFP4 KV, whose per-page scale/tail records are not token-uniform) use one
+    physical slot for the whole page. ``EngineGroupInfo.tokens_per_block``
+    independently retains the logical token count, so LMCache's compressed
+    geometry maps one block ID to one complete opaque page.
     """
 
     name = "padded-attention-page-view"
@@ -522,13 +528,12 @@ class _PaddedAttentionPageViewEdit(KVCacheGroupEdit):
         kv_cache: RegisteredKVCache,
         _layout_hints: LayoutHints,
     ) -> torch.Tensor:
-        """Return a padded-stride-preserving opaque ``[B, BS, HS]`` view.
+        """Return a padded-stride-preserving opaque ``[B, slots, width]`` view.
 
         Raises:
-            ValueError: If the declared page is not element-aligned, cannot be
-                factored evenly over the engine's logical block size, is
-                smaller than the semantic tensor page, or exceeds the physical
-                dim-0 stride.
+            ValueError: If the declared page is not element-aligned, is smaller
+                than the semantic tensor page, or exceeds the physical dim-0
+                stride.
         """
         assert isinstance(kv_cache, torch.Tensor)
         element_size = kv_cache.element_size()
@@ -550,14 +555,15 @@ class _PaddedAttentionPageViewEdit(KVCacheGroupEdit):
                 f"declared attention page has {page_elems} elements but the "
                 f"physical block stride is only {kv_cache.stride(0)}"
             )
-        if page_elems % spec.block_size:
-            raise ValueError(
-                f"a {page_elems}-element attention page cannot be factored "
-                f"over block_size={spec.block_size}"
-            )
-        hidden_size = page_elems // spec.block_size
+        # A packed page need not have a uniform byte width per logical token.
+        # Treat such a page as one opaque physical slot.  The vLLM adapter
+        # carries spec.block_size separately as tokens_per_block, so the group
+        # manager derives the correct compression ratio and still consumes one
+        # engine block ID per logical page.
+        physical_slots = spec.block_size if page_elems % spec.block_size == 0 else 1
+        hidden_size = page_elems // physical_slots
         return kv_cache.as_strided(
-            (kv_cache.shape[0], spec.block_size, hidden_size),
+            (kv_cache.shape[0], physical_slots, hidden_size),
             (kv_cache.stride(0), hidden_size, 1),
         )
 
