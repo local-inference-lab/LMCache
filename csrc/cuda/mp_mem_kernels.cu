@@ -447,8 +447,6 @@ void multi_layer_block_kv_transfer(
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
     EngineKVFormat engine_kv_format, int skip_prefix_n_blocks) {
   int head_bytes = shape_desc.hs * shape_desc.element_size;
-  TORCH_CHECK(head_bytes % sizeof(uint16_t) == 0, "head_size * element_size (",
-              head_bytes, ") must be divisible by 2 for vectorized access");
 
   if (engine_kv_format == EngineKVFormat::NL_X_NB_BSV_BSS) {
     // Blocked-scale indexer cache: the per-token fp32 scale must be a whole
@@ -464,8 +462,14 @@ void multi_layer_block_kv_transfer(
     LAUNCH_TEMPLATED(uint4);  // 16 bytes per copy
   } else if (head_bytes % sizeof(uint32_t) == 0) {
     LAUNCH_TEMPLATED(uint32_t);  // 4 bytes per copy
+  } else if (head_bytes % sizeof(uint16_t) == 0) {
+    LAUNCH_TEMPLATED(uint16_t);  // 2 bytes per copy
   } else {
-    LAUNCH_TEMPLATED(uint16_t);  // 2 bytes per copy (minimum granularity)
+    // Opaque model-owned page tails can make a logical row byte-odd (for
+    // example GLM-5.3 C4's 561-byte FP8 row). The page and object are still
+    // byte-addressable, so retain correctness with a scalar-byte fallback
+    // instead of rejecting the whole store or truncating the tail.
+    LAUNCH_TEMPLATED(uint8_t);  // 1 byte per copy (correctness fallback)
   }
 }
 
