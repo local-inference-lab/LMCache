@@ -1281,15 +1281,19 @@ class LMCacheMPWorkerAdapter:
         # Transport context for transfer operations.
         self.transfer_ctx: TransferContext | None = None
 
-        # Request futures
-        self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
+        # Store jobs use scheduler-assigned integer identities. Callers that
+        # omit an identity retain request-id keys for API compatibility.
+        self.store_futures: dict[str | int, MessagingFuture[StoreResult]] = {}
+        self._store_future_request_ids: dict[str | int, str] = {}
+        self._store_future_job_ids: dict[str | int, int | None] = {}
+        self._store_future_keys_by_request: dict[str, set[str | int]] = {}
         # request_id -> (future, block_ids)
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
         # The IPC handle is not enough by itself; CUDA needs the exporting
         # event object to stay alive until the consumer is done with it.
-        self.store_events: dict[str, _IpcEvent] = {}
+        self.store_events: dict[str | int, _IpcEvent] = {}
         self.retrieve_events: dict[str, _IpcEvent] = {}
 
         # Block IDs whose retrieve failed, consumed by the scheduler's
@@ -1302,10 +1306,8 @@ class LMCacheMPWorkerAdapter:
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
         self._dropped_retrieves: set[str] = set()
 
-        # The store requests that have finished execution in LMCache
-        self.finished_stores: set[str] = set()
-        # The finished request ids that are passed via vLLM and also
-        # have corresponding store requests submitted to LMCache before
+        # Engine-finished requests remain here until all of their store jobs
+        # reach a terminal state.
         self.previously_finished: set[str] = set()
         # Request IDs already returned as finished_sending to the scheduler.
         # Prevents re-reporting the same ID after drain clears tracking sets.
@@ -1384,6 +1386,9 @@ class LMCacheMPWorkerAdapter:
 
         # Completed store requests to report via build_connector_worker_meta
         self._completed_store_requests: dict[str, int] = {}
+        # Individual store completions let the scheduler release source-block
+        # references without waiting for the whole request to finish.
+        self._completed_store_jobs: dict[int, int] = {}
 
     @property
     def is_healthy(self) -> bool:
@@ -1667,6 +1672,7 @@ class LMCacheMPWorkerAdapter:
         op: LoadStoreOp,
         event: _IpcEvent,
         cache_salt: str = "",
+        store_job_id: int | None = None,
     ):
         """
         Submit a KV cache store request to LMCache
@@ -1677,13 +1683,16 @@ class LMCacheMPWorkerAdapter:
             event: The CUDA event that is recorded after the current
                 model inference step
             cache_salt: Per-user isolation salt.
+            store_job_id: Scheduler identity for this asynchronous store.
         """
         self._ensure_heartbeat_started()
 
         if not self.is_kv_writer:
+            self._record_completed_store_job(store_job_id)
             return
 
         if not self.is_healthy:
+            self._record_completed_store_job(store_job_id)
             return
 
         assert op.token_ids is not None
@@ -1708,8 +1717,14 @@ class LMCacheMPWorkerAdapter:
             event,
             self.blocks_in_chunk,
         )
-        self.store_futures[request_id] = future
-        self.store_events[request_id] = event
+        store_key: str | int = store_job_id if store_job_id is not None else request_id
+        if store_key in self.store_futures:
+            raise RuntimeError(f"duplicate in-flight store identity {store_key!r}")
+        self.store_futures[store_key] = future
+        self.store_events[store_key] = event
+        self._store_future_request_ids[store_key] = request_id
+        self._store_future_job_ids[store_key] = store_job_id
+        self._store_future_keys_by_request.setdefault(request_id, set()).add(store_key)
 
     @_lmcache_nvtx_annotate
     def submit_retrieve_request(
@@ -1773,6 +1788,7 @@ class LMCacheMPWorkerAdapter:
         ops: list[LoadStoreOp],
         event: _IpcEvent,
         cache_salts: list[str] | None = None,
+        store_job_ids: list[int | None] | None = None,
     ):
         """
         Submit a batched store request to LMCache
@@ -1786,11 +1802,27 @@ class LMCacheMPWorkerAdapter:
             cache_salts: Per-user isolation salts, one per request. If None,
                 all requests use cache_salt="". The list length should be the same as
                 request_ids.
+            store_job_ids: Scheduler identities, one per request. Callers that
+                do not carry store identities may omit the list.
         """
         if cache_salts is None:
             cache_salts = [""] * len(request_ids)
-        for request_id, op, salt in zip(request_ids, ops, cache_salts, strict=False):
-            self.submit_store_request(request_id, op, event, cache_salt=salt)
+        if store_job_ids is None:
+            store_job_ids = [None] * len(request_ids)
+        for request_id, op, salt, store_job_id in zip(
+            request_ids,
+            ops,
+            cache_salts,
+            store_job_ids,
+            strict=True,
+        ):
+            self.submit_store_request(
+                request_id,
+                op,
+                event,
+                cache_salt=salt,
+                store_job_id=store_job_id,
+            )
 
     @_lmcache_nvtx_annotate
     def batched_submit_retrieve_requests(
@@ -1820,18 +1852,17 @@ class LMCacheMPWorkerAdapter:
 
     def _process_finished_stores(
         self,
-        finished_req_ids_from_lmcache: set[str],
+        finished_store_keys: set[str | int],
         finished_req_ids_from_engine: set[str],
     ) -> set[str]:
-        """Merge LMCache-side and engine-side finished store info."""
-        self.finished_stores.update(finished_req_ids_from_lmcache)
-        ret_stores = set()
-        for req_id in finished_req_ids_from_engine:
-            if req_id in self.finished_stores or req_id in self.store_futures:
-                self.previously_finished.add(req_id)
-            elif self._returned_finished.add_if_absent(req_id):
-                ret_stores.add(req_id)
-        for req_id in self._update_and_get_finished_store():
+        """Return engine-finished requests after every store job is terminal."""
+        self._retire_store_futures(finished_store_keys)
+        self.previously_finished.update(finished_req_ids_from_engine)
+        ret_stores: set[str] = set()
+        for req_id in tuple(self.previously_finished):
+            if self._has_inflight_store(req_id):
+                continue
+            self.previously_finished.discard(req_id)
             if self._returned_finished.add_if_absent(req_id):
                 ret_stores.add(req_id)
         return ret_stores
@@ -1870,9 +1901,9 @@ class LMCacheMPWorkerAdapter:
         if not self.is_healthy:
             finished_stores = self._poll_store_futures()
             finished_retrieves = self._poll_retrieve_futures()
-            for request_id in finished_stores:
-                self.store_futures.pop(request_id, None)
-                self.store_events.pop(request_id, None)
+            for store_key in finished_stores:
+                self.store_futures.pop(store_key, None)
+                self.store_events.pop(store_key, None)
             for request_id in finished_retrieves:
                 self.retrieve_futures.pop(request_id, None)
                 self.retrieve_events.pop(request_id, None)
@@ -1901,9 +1932,9 @@ class LMCacheMPWorkerAdapter:
         finished_retrieves = self._poll_retrieve_futures()
 
         # Remove the finished requests from the tracking dicts
-        for request_id in finished_stores:
-            self.store_futures.pop(request_id, None)
-            self.store_events.pop(request_id, None)
+        for store_key in finished_stores:
+            self.store_futures.pop(store_key, None)
+            self.store_events.pop(store_key, None)
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
@@ -1966,9 +1997,9 @@ class LMCacheMPWorkerAdapter:
         if not self.is_healthy:
             finished_stores = self._poll_store_futures()
             finished_retrieves = self._poll_retrieve_futures()
-            for request_id in finished_stores:
-                self.store_futures.pop(request_id, None)
-                self.store_events.pop(request_id, None)
+            for store_key in finished_stores:
+                self.store_futures.pop(store_key, None)
+                self.store_events.pop(store_key, None)
             for request_id in finished_retrieves:
                 self.retrieve_futures.pop(request_id, None)
                 self.retrieve_events.pop(request_id, None)
@@ -1982,7 +2013,8 @@ class LMCacheMPWorkerAdapter:
             self._dropped_retrieves = set()
             finished_retrieves.update(dropped)
 
-            for req_id in finished_stores:
+            finished_requests = self._retire_store_futures(finished_stores)
+            for req_id in finished_requests:
                 self._completed_store_requests[req_id] = 1
             return None, finished_retrieves
 
@@ -1990,9 +2022,9 @@ class LMCacheMPWorkerAdapter:
         finished_retrieves = self._poll_retrieve_futures()
 
         # Remove the finished requests from the tracking dicts
-        for request_id in finished_stores:
-            self.store_futures.pop(request_id, None)
-            self.store_events.pop(request_id, None)
+        for store_key in finished_stores:
+            self.store_futures.pop(store_key, None)
+            self.store_events.pop(store_key, None)
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
@@ -2010,15 +2042,16 @@ class LMCacheMPWorkerAdapter:
         # the invocation of `get_finished` means that
         # these requests' KV caches are already fully stored.
         # or the requests normally ends without any store.
-        if finished_stores:
+        finished_requests = self._retire_store_futures(finished_stores)
+        if finished_requests:
             self.request_telemetry.on_request_store_finished(
-                request_ids_set=finished_stores,
+                request_ids_set=finished_requests,
                 model_name=self.model_name,
                 world_size=self.world_size,
                 kv_rank=self.worker_id,
             )
 
-        for req_id in finished_stores:
+        for req_id in finished_requests:
             self._completed_store_requests[req_id] = 1
         return None, finished_retrieves
 
@@ -2029,6 +2062,14 @@ class LMCacheMPWorkerAdapter:
         completed_store_requests = self._completed_store_requests
         self._completed_store_requests = {}
         return completed_store_requests
+
+    def get_completed_store_jobs(self) -> dict[int, int] | None:
+        """Return individual store jobs completed since the previous call."""
+        if not self._completed_store_jobs:
+            return None
+        completed_store_jobs = self._completed_store_jobs
+        self._completed_store_jobs = {}
+        return completed_store_jobs
 
     def num_blocks_per_chunk(self) -> int:
         """
@@ -2109,22 +2150,23 @@ class LMCacheMPWorkerAdapter:
         self.request_telemetry.close()
 
     # Helper functions
-    def _poll_store_futures(self) -> set[str]:
-        """Return terminal store request IDs and log unsuccessful stores."""
-        finished: set[str] = set()
-        for request_id, future in self.store_futures.items():
+    def _poll_store_futures(self) -> set[str | int]:
+        """Return terminal store identities and log unsuccessful stores."""
+        finished: set[str | int] = set()
+        for store_key, future in self.store_futures.items():
+            request_id = self._store_future_request_ids.get(store_key, str(store_key))
             try:
                 if not future.query():
                     continue
                 result = future.result(timeout=60)
             except Exception:
-                finished.add(request_id)
+                finished.add(store_key)
                 logger.exception(
                     "LMCache store raised for request_id=%s",
                     request_id,
                 )
                 continue
-            finished.add(request_id)
+            finished.add(store_key)
             if not result:
                 logger.error("LMCache store failed for request_id=%s", request_id)
         return finished
@@ -2165,17 +2207,42 @@ class LMCacheMPWorkerAdapter:
                 )
         return finished
 
-    def _update_and_get_finished_store(
-        self,
-    ) -> set[str]:
-        """Converge the internal states about finished stores
-        and returns the 'safe finished store request ids' back
-        """
-        safe_finished_s = self.finished_stores.intersection(self.previously_finished)
-        self.finished_stores.difference_update(self.previously_finished)
-        self.previously_finished.difference_update(safe_finished_s)
+    def _record_completed_store_job(self, store_job_id: int | None) -> None:
+        if store_job_id is None:
+            return
+        self._completed_store_jobs[store_job_id] = (
+            self._completed_store_jobs.get(store_job_id, 0) + 1
+        )
 
-        return safe_finished_s
+    def _retire_store_futures(self, finished_store_keys: set[str | int]) -> set[str]:
+        """Retire terminal futures and return requests with no store in flight."""
+        candidate_requests: set[str] = set()
+        for store_key in finished_store_keys:
+            request_id = self._store_future_request_ids.pop(
+                store_key,
+                store_key if isinstance(store_key, str) else str(store_key),
+            )
+            store_job_id = self._store_future_job_ids.pop(store_key, None)
+            self._record_completed_store_job(store_job_id)
+            request_keys = self._store_future_keys_by_request.get(request_id)
+            if request_keys is not None:
+                request_keys.discard(store_key)
+                if not request_keys:
+                    del self._store_future_keys_by_request[request_id]
+            candidate_requests.add(request_id)
+        return {
+            request_id
+            for request_id in candidate_requests
+            if not self._has_inflight_store(request_id)
+        }
+
+    def _has_inflight_store(self, request_id: str) -> bool:
+        keys = self._store_future_keys_by_request.get(request_id)
+        if keys:
+            return True
+        # Compatibility for tests and callers that inject request-keyed
+        # futures directly instead of using submit_store_request().
+        return request_id in self.store_futures
 
     def _create_key(
         self,

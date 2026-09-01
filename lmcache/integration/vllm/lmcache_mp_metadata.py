@@ -240,6 +240,10 @@ class LMCacheMPRequestMetadata:
     direction: Literal["STORE", "RETRIEVE"]
     op: LoadStoreOp
     cache_salt: str = ""
+    # Scheduler-assigned identity for one asynchronous store. The identity is
+    # carried to every worker so the scheduler can retain exactly the source
+    # blocks read by that store until all ranks report completion.
+    store_job_id: int | None = None
 
     @staticmethod
     def GetStoreMetadata(
@@ -546,21 +550,28 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
 
 @dataclass
 class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
-    """Worker -> Scheduler metadata for completed store events.
+    """Worker-to-scheduler metadata for completed asynchronous stores.
 
-    Each worker reports {req_id: 1} for newly completed stores.
-    ``aggregate()`` sums counts across workers within a step.
-    The scheduler-side manager accumulates across steps and processes
-    a store completion only when count reaches ``world_size``.
+    ``completed_store_jobs`` identifies individual stores whose source blocks
+    can be released after every worker reports completion. The request-level
+    counts remain the compatibility protocol for non-recurrent lazy offload.
+    ``aggregate()`` sums both counters across workers within one engine step.
     """
 
-    completed_store_requests: dict[str, int]
+    completed_store_requests: dict[str, int] = field(default_factory=dict)
+    completed_store_jobs: dict[int, int] = field(default_factory=dict)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
     ) -> "KVConnectorWorkerMetadata":
         assert isinstance(other, LMCacheMPWorkerMetadata)
-        merged = dict(self.completed_store_requests)
+        merged_requests = dict(self.completed_store_requests)
         for k, v in other.completed_store_requests.items():
-            merged[k] = merged.get(k, 0) + v
-        return LMCacheMPWorkerMetadata(completed_store_requests=merged)
+            merged_requests[k] = merged_requests.get(k, 0) + v
+        merged_jobs = dict(self.completed_store_jobs)
+        for k, v in other.completed_store_jobs.items():
+            merged_jobs[k] = merged_jobs.get(k, 0) + v
+        return LMCacheMPWorkerMetadata(
+            completed_store_requests=merged_requests,
+            completed_store_jobs=merged_jobs,
+        )

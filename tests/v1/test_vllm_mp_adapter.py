@@ -504,6 +504,45 @@ def test_submit_store_request_tracks_returned_future(fake_adapter, monkeypatch):
     assert adapter.store_futures["req-1"] is fake_future
 
 
+def test_store_jobs_release_independently_before_request_completion(
+    fake_adapter, monkeypatch
+) -> None:
+    """One request may have multiple stores without losing a completion."""
+    adapter, _send_mock, _ = fake_adapter
+    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    adapter.kv_caches = {"layer.0": fake_tensor}
+    first_future = MagicMock(name="first_store")
+    first_future.query.return_value = True
+    first_future.result.return_value = True
+    second_future = MagicMock(name="second_store")
+    second_future.query.return_value = False
+    second_future.result.return_value = True
+    transfer_ctx = MagicMock()
+    transfer_ctx.submit_store.side_effect = [first_future, second_future]
+    adapter.transfer_ctx = transfer_ctx
+    op = LoadStoreOp(token_ids=[1, 2, 3, 4], block_ids=[[7]], start=0, end=4)
+
+    adapter.submit_store_request("req-1", op, event=MagicMock(), store_job_id=10)
+    adapter.submit_store_request("req-1", op, event=MagicMock(), store_job_id=11)
+
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == set()
+    assert finished_retrieves == set()
+    assert adapter.get_completed_store_jobs() == {10: 1}
+    assert 11 in adapter.store_futures
+
+    second_future.query.return_value = True
+    finished_stores, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_stores == {"req-1"}
+    assert finished_retrieves == set()
+    assert adapter.get_completed_store_jobs() == {11: 1}
+    assert adapter.store_futures == {}
+
+
 def test_submit_store_request_expands_block_ids_to_views(fake_adapter, monkeypatch):
     adapter, _send_mock, _ = fake_adapter
     monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)

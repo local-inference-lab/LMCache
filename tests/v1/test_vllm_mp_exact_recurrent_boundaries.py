@@ -49,6 +49,34 @@ class UniformTypeKVCacheSpecs:
         self.kv_cache_specs = kv_cache_specs
 
 
+class RecordingBlockPool:
+    """Minimal block-pool contract for scheduler reference tests."""
+
+    class Blocks:
+        def __getitem__(self, block_id: int) -> SimpleNamespace:
+            return SimpleNamespace(block_id=block_id)
+
+    def __init__(self) -> None:
+        self.blocks = self.Blocks()
+        self.touched: list[list[int]] = []
+        self.freed: list[list[int]] = []
+
+    def touch(self, blocks: list[SimpleNamespace]) -> None:
+        self.touched.append([block.block_id for block in blocks])
+
+    def free_blocks(self, blocks: object) -> None:
+        self.freed.append([block.block_id for block in blocks])
+
+
+def _bind_recording_block_pool(connector: LMCacheMPConnector) -> RecordingBlockPool:
+    pool = RecordingBlockPool()
+    connector._gpu_block_pool = pool  # type: ignore[assignment]
+    connector._next_store_job_id = 0
+    connector._pinned_store_jobs = {}
+    connector._num_workers = 4
+    return pool
+
+
 def test_live_six_group_detection_finds_only_recurrent_groups() -> None:
     layer_counts = [9, 9, 8, 8]
     groups = [
@@ -136,6 +164,16 @@ def _store_tracker(num_chunks: int = 2) -> LMCacheMPRequestTracker:
     }
     tracker.num_scheduled_tokens = num_tokens
     return tracker
+
+
+def _current_block_table(
+    tracker: LMCacheMPRequestTracker,
+) -> tuple[list[int], ...]:
+    """Return an isolated scheduler-style snapshot of one tracker table."""
+    return tuple(
+        list(tracker.allocated_block_ids[group_id])
+        for group_id in range(len(GROUP_TOKENS_PER_BLOCK))
+    )
 
 
 def test_tracker_initializes_exact_recurrent_boundary_map() -> None:
@@ -243,24 +281,28 @@ def test_connector_ingests_only_exact_handoffs_for_recurrent_groups(
     connector._mamba_group_ids = RECURRENT_GROUP_IDS
     connector._group_tokens_per_block = GROUP_TOKENS_PER_BLOCK
     connector.lazy_offload = False
+    _bind_recording_block_pool(connector)
     connector.scheduler_adapter = SimpleNamespace(  # type: ignore[assignment]
         lmcache_tokens_per_chunk=CHUNK_TOKENS,
         report_block_allocations=lambda records: None,
     )
     scheduler_output = SimpleNamespace(
-        partial_tail_offloads={
-            "unknown": [(0, 71, CHUNK_TOKENS)],
-            "known": [
-                (0, 91, CHUNK_TOKENS),
-                (1, 92, CHUNK_TOKENS),
-                (2, 93, CHUNK_TOKENS),
-                (3, 94, CHUNK_TOKENS),
-                (ATTENTION_GROUP_ID, 95, CHUNK_TOKENS),
-                (DFLASH_GROUP_ID, 96, CHUNK_TOKENS),
-                (0, 0, 2 * CHUNK_TOKENS),
-                (1, -1, 2 * CHUNK_TOKENS),
-            ],
-        },
+        kv_connector_block_state=SimpleNamespace(
+            block_ids={"known": _current_block_table(tracker)},
+            boundary_state_offloads={
+                "unknown": [(0, 71, CHUNK_TOKENS)],
+                "known": [
+                    (0, 91, CHUNK_TOKENS),
+                    (1, 92, CHUNK_TOKENS),
+                    (2, 93, CHUNK_TOKENS),
+                    (3, 94, CHUNK_TOKENS),
+                    (ATTENTION_GROUP_ID, 95, CHUNK_TOKENS),
+                    (DFLASH_GROUP_ID, 96, CHUNK_TOKENS),
+                    (0, 0, 2 * CHUNK_TOKENS),
+                    (1, -1, 2 * CHUNK_TOKENS),
+                ],
+            },
+        ),
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=["known"],
@@ -285,6 +327,59 @@ def test_connector_ingests_only_exact_handoffs_for_recurrent_groups(
         "received_handoff_boundaries={0: [4096], 1: [4096], "
         "2: [4096], 3: [4096]}"
     ]
+
+
+def test_store_uses_authoritative_scheduler_block_table() -> None:
+    """A store must not use an append-only block mirror after table mutation."""
+    tracker = _store_tracker(num_chunks=1)
+    tracker.state = LMCacheMPRequestState.READY
+    authoritative = tuple(
+        [block_id + 10_000 for block_id in tracker.allocated_block_ids[group_id]]
+        for group_id in range(len(GROUP_TOKENS_PER_BLOCK))
+    )
+    connector = cast(LMCacheMPConnector, object.__new__(LMCacheMPConnector))
+    connector.request_trackers = {"store": tracker}
+    connector._mamba_group_ids = RECURRENT_GROUP_IDS
+    connector._group_tokens_per_block = GROUP_TOKENS_PER_BLOCK
+    connector.lazy_offload = False
+    _bind_recording_block_pool(connector)
+    connector.scheduler_adapter = SimpleNamespace(  # type: ignore[assignment]
+        lmcache_tokens_per_chunk=CHUNK_TOKENS,
+        report_block_allocations=lambda records: None,
+    )
+    scheduler_output = SimpleNamespace(
+        kv_connector_block_state=SimpleNamespace(
+            block_ids={"store": authoritative},
+            boundary_state_offloads={
+                "store": [
+                    (group_id, 20_000 + group_id, CHUNK_TOKENS)
+                    for group_id in RECURRENT_GROUP_IDS
+                ]
+            },
+        ),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["store"],
+            new_block_ids=[None],
+            resumed_req_ids=[],
+        ),
+        num_scheduled_tokens={"store": 0},
+        total_num_scheduled_tokens=0,
+        preempted_req_ids=[],
+    )
+
+    metadata = connector.build_connector_meta(cast(SchedulerOutput, scheduler_output))
+
+    assert metadata.requests[0].op.block_ids[ATTENTION_GROUP_ID] == list(
+        authoritative[ATTENTION_GROUP_ID]
+    )
+    assert metadata.requests[0].op.block_ids[DFLASH_GROUP_ID] == list(
+        authoritative[DFLASH_GROUP_ID]
+    )
+    for group_id in RECURRENT_GROUP_IDS:
+        assert metadata.requests[0].op.block_ids[group_id] == [0] * 7 + [
+            20_000 + group_id
+        ]
 
 
 def test_store_diagnostic_logs_are_bounded_without_changing_ranges(
@@ -376,17 +471,21 @@ def test_connector_retains_new_request_handoff_before_first_store() -> None:
     connector._mamba_group_ids = RECURRENT_GROUP_IDS
     connector._group_tokens_per_block = GROUP_TOKENS_PER_BLOCK
     connector.lazy_offload = False
+    pool = _bind_recording_block_pool(connector)
     connector.scheduler_adapter = SimpleNamespace(  # type: ignore[assignment]
         lmcache_tokens_per_chunk=CHUNK_TOKENS,
         report_block_allocations=lambda records: None,
     )
     scheduler_output = SimpleNamespace(
-        partial_tail_offloads={
-            "new-request": [
-                (group_id, 100 + group_id, CHUNK_TOKENS)
-                for group_id in RECURRENT_GROUP_IDS
-            ]
-        },
+        kv_connector_block_state=SimpleNamespace(
+            block_ids={"new-request": _current_block_table(tracker)},
+            boundary_state_offloads={
+                "new-request": [
+                    (group_id, 100 + group_id, CHUNK_TOKENS)
+                    for group_id in RECURRENT_GROUP_IDS
+                ]
+            },
+        ),
         scheduled_new_reqs=[SimpleNamespace(req_id="new-request")],
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=[],
@@ -406,6 +505,8 @@ def test_connector_retains_new_request_handoff_before_first_store() -> None:
     }
     assert len(metadata.requests) == 1
     assert metadata.requests[0].direction == "STORE"
+    assert metadata.requests[0].store_job_id == 0
+    assert len(pool.touched) == 1
     for group_id in RECURRENT_GROUP_IDS:
         assert metadata.requests[0].op.block_ids[group_id] == (
             [0] * 7 + [100 + group_id]
@@ -421,13 +522,17 @@ def test_multistep_store_emits_handoff_ready_prefix() -> None:
     connector._mamba_group_ids = RECURRENT_GROUP_IDS
     connector._group_tokens_per_block = GROUP_TOKENS_PER_BLOCK
     connector.lazy_offload = False
+    _bind_recording_block_pool(connector)
     connector.scheduler_adapter = SimpleNamespace(  # type: ignore[assignment]
         lmcache_tokens_per_chunk=CHUNK_TOKENS,
         report_block_allocations=lambda records: None,
     )
 
     first_step = SimpleNamespace(
-        partial_tail_offloads=None,
+        kv_connector_block_state=SimpleNamespace(
+            block_ids={"multistep": _current_block_table(tracker)},
+            boundary_state_offloads={},
+        ),
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=["multistep"],
@@ -448,20 +553,23 @@ def test_multistep_store_emits_handoff_ready_prefix() -> None:
         batch_start = batch_id * 8192
         num_scheduled_tokens = 8192 if batch_id < 3 else 0
         handoff_step = SimpleNamespace(
-            partial_tail_offloads={
-                "multistep": [
-                    (
-                        group_id,
-                        1000 * (batch_id + 1) + group_id,
-                        boundary_tokens,
-                    )
-                    for boundary_tokens in (
-                        batch_start + CHUNK_TOKENS,
-                        batch_start + 2 * CHUNK_TOKENS,
-                    )
-                    for group_id in RECURRENT_GROUP_IDS
-                ]
-            },
+            kv_connector_block_state=SimpleNamespace(
+                block_ids={"multistep": _current_block_table(tracker)},
+                boundary_state_offloads={
+                    "multistep": [
+                        (
+                            group_id,
+                            1000 * (batch_id + 1) + group_id,
+                            boundary_tokens,
+                        )
+                        for boundary_tokens in (
+                            batch_start + CHUNK_TOKENS,
+                            batch_start + 2 * CHUNK_TOKENS,
+                        )
+                        for group_id in RECURRENT_GROUP_IDS
+                    ]
+                },
+            ),
             scheduled_new_reqs=[],
             scheduled_cached_reqs=SimpleNamespace(
                 req_ids=["multistep"],
@@ -482,3 +590,44 @@ def test_multistep_store_emits_handoff_ready_prefix() -> None:
 
     assert tracker.num_scheduled_tokens == 32768
     assert tracker.num_stored_tokens == 32768
+
+
+def test_store_blocks_remain_referenced_until_every_worker_completes() -> None:
+    connector = cast(LMCacheMPConnector, object.__new__(LMCacheMPConnector))
+    connector.lazy_offload = False
+    pool = _bind_recording_block_pool(connector)
+    metadata = LMCacheMPConnectorMetadata()
+    metadata.add_request_metadata(
+        LMCacheMPRequestMetadata(
+            request_id="store",
+            direction="STORE",
+            op=metadata_mod.LoadStoreOp(
+                token_ids=list(range(CHUNK_TOKENS)),
+                block_ids=[[0, 71, 71], [72]],
+                start=0,
+                end=CHUNK_TOKENS,
+            ),
+        )
+    )
+
+    connector._reference_store_blocks(metadata)
+
+    assert metadata.requests[0].store_job_id == 0
+    assert pool.touched == [[71, 72]]
+    connector.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=metadata_mod.LMCacheMPWorkerMetadata(
+                completed_store_jobs={0: 3}
+            )
+        )
+    )
+    assert pool.freed == []
+    connector.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=metadata_mod.LMCacheMPWorkerMetadata(
+                completed_store_jobs={0: 1}
+            )
+        )
+    )
+    assert pool.freed == [[72, 71]]
+    assert connector.has_pending_push_work() is False
