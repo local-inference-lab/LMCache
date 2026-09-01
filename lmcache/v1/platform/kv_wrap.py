@@ -76,17 +76,22 @@ def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
 
 
 def _release_partial_kv_wrappers(wrappers: list[Any]) -> None:
-    """Best-effort unlink of SHM segments owned by partially built wrappers.
+    """Best-effort release of wrappers created before a batch failure.
 
     Used by :func:`wrap_kv_caches` to roll back a half-finished batch
-    when a later iteration raises. Only POSIX-SHM-backed wrappers carry
-    a ``shm_name`` attribute, so other wrapper kinds (e.g. CUDA-IPC)
-    are silently skipped.
+    when a later iteration raises. CUDA wrappers expose ``close``; POSIX-SHM
+    wrappers additionally carry ``shm_name`` and must be unlinked.
     """
     # First Party
     from lmcache.v1.multiprocess.posix_shm import shm_unlink
 
     for w in wrappers:
+        close = getattr(w, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:  # pragma: no cover - best effort
+                logger.debug("IPC wrapper close failed during rollback", exc_info=True)
         name = getattr(w, "shm_name", None)
         if name is None:
             continue

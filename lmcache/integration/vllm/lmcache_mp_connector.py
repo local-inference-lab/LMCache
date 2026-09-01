@@ -161,6 +161,15 @@ def _iter_kv_cache_specs(kv_cache_config: "KVCacheConfig | None") -> Iterable[An
             yield group_spec
 
 
+def _is_mamba_group_spec(spec: object) -> bool:
+    """Return whether a resolved KV group contains recurrent Mamba state."""
+    per_layer_specs = getattr(spec, "kv_cache_specs", None)
+    specs = per_layer_specs.values() if isinstance(per_layer_specs, dict) else (spec,)
+    return any(
+        any(cls.__name__ == "MambaSpec" for cls in type(item).__mro__) for item in specs
+    )
+
+
 def _has_recurrent_cache(kv_cache_config: "KVCacheConfig | None") -> bool:
     """Return whether the resolved cache contains recurrent-state pages."""
     if kv_cache_config is None:
@@ -168,8 +177,7 @@ def _has_recurrent_cache(kv_cache_config: "KVCacheConfig | None") -> bool:
     if bool(getattr(kv_cache_config, "has_mamba_layers", False)):
         return True
     return any(
-        any(cls.__name__ == "MambaSpec" for cls in type(spec).__mro__)
-        for spec in _iter_kv_cache_specs(kv_cache_config)
+        _is_mamba_group_spec(spec) for spec in _iter_kv_cache_specs(kv_cache_config)
     )
 
 
@@ -481,6 +489,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
       enters vLLM's waiting queue. Disabled by default.
     """
 
+    @property
+    def requires_local_prefill_serialization(self) -> bool:
+        return self._has_recurrent_cache and self._kv_transfer_config.is_kv_producer
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -596,6 +608,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self.lazy_offload = vllm_config.kv_transfer_config.get_from_extra_config(
             "lmcache.mp.lazy_offload", False
         )
+        if self.lazy_offload and self._has_recurrent_cache:
+            raise ValueError(
+                "LMCache MP lazy offload is unsupported for recurrent KV cache "
+                "groups because deferred jobs cannot retain exact boundary-state "
+                "blocks before selection. Disable lmcache.mp.lazy_offload."
+            )
 
         if self.role == KVConnectorRole.SCHEDULER:
             # Banner from the scheduler role only, so tensor-parallel
@@ -613,6 +631,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
             # GPU block pool reference
             self._gpu_block_pool: "BlockPool | None" = None
+            self._next_store_job_id = 0
+            # Store job -> (source block IDs, worker completions remaining).
+            self._pinned_store_jobs: dict[int, tuple[list[int], int]] = {}
+            self._num_workers = parallel_strategy.vllm_world_size
 
             # Initialize pending store for lazy offload mode
             if self.lazy_offload:
@@ -663,6 +685,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # the engine's base block size when no group metadata is available
         # (single non-hybrid group).
         self._group_tokens_per_block = group_tokens_per_block
+        self._mamba_group_ids = {
+            group_idx
+            for group_idx, group in enumerate(
+                getattr(kv_cache_config, "kv_cache_groups", ())
+            )
+            if _is_mamba_group_spec(group.kv_cache_spec)
+        }
+        logger.info(
+            "Detected recurrent KV cache groups: %s",
+            sorted(self._mamba_group_ids),
+        )
         for engine_group_idx, tokens_per_block in enumerate(
             self._group_tokens_per_block
         ):
@@ -851,12 +884,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         request_ids = []
         ops = []
         cache_salts = []
+        store_job_ids = []
         for meta in metadata.requests:
             if meta.direction != "STORE":
                 continue
             request_ids.append(meta.request_id)
             ops.append(meta.op)
             cache_salts.append(meta.cache_salt)
+            store_job_ids.append(meta.store_job_id)
 
         if len(request_ids) == 0:
             if self.dispatcher is not None:
@@ -866,7 +901,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         event = self.worker_adapter.create_recorded_event()
 
         self.worker_adapter.batched_submit_store_requests(
-            request_ids, ops, event, cache_salts=cache_salts
+            request_ids,
+            ops,
+            event,
+            cache_salts=cache_salts,
+            store_job_ids=store_job_ids,
         )
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "wait_for_save", event=event)
@@ -918,15 +957,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         return val
 
     def build_connector_worker_meta(self):
-        if not self.lazy_offload:
-            return None
-        completed_store_requests = self.worker_adapter.get_completed_store_requests()
-        if completed_store_requests:
+        completed_store_jobs = self.worker_adapter.get_completed_store_jobs()
+        completed_store_requests = (
+            self.worker_adapter.get_completed_store_requests()
+            if self.lazy_offload
+            else None
+        )
+        if completed_store_jobs or completed_store_requests:
             return LMCacheMPWorkerMetadata(
-                completed_store_requests=completed_store_requests
+                completed_store_requests=completed_store_requests or {},
+                completed_store_jobs=completed_store_jobs or {},
             )
-        else:
-            return None
+        return None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
@@ -1258,6 +1300,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
+        if not self.lazy_offload:
+            self._reference_store_blocks(metadata)
 
         if len(metadata) > 0:
             logger.debug("Final connector metadata: %s", metadata)
@@ -1275,13 +1319,32 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
-        if not self.lazy_offload:
-            return
-        if not self._gpu_block_pool:
-            raise ValueError("Lazy offload is enabled but gpu block pool is not binded")
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, LMCacheMPWorkerMetadata):
             return
+        if meta.completed_store_jobs:
+            pool = self._gpu_block_pool
+            if pool is None:
+                raise ValueError("GPU block pool must be bound before store completion")
+            for store_job_id, count in meta.completed_store_jobs.items():
+                pinned = self._pinned_store_jobs.get(store_job_id)
+                if pinned is None:
+                    continue
+                block_ids, remaining = pinned
+                remaining -= count
+                if remaining > 0:
+                    self._pinned_store_jobs[store_job_id] = (block_ids, remaining)
+                    continue
+                assert remaining == 0, (
+                    f"store job {store_job_id} reported by too many workers"
+                )
+                del self._pinned_store_jobs[store_job_id]
+                pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
+
+        if not self.lazy_offload:
+            return
+        if not self._gpu_block_pool:
+            raise ValueError("Lazy offload is enabled but gpu block pool is not bound")
         for req_id, count in meta.completed_store_requests.items():
             if self.scheduler_adapter.update_pending_store_count(req_id, count):
                 gpu_block_ids = self._pending_store.get_request_gpu_block_ids(req_id)
@@ -1381,6 +1444,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         return None
 
+    def has_pending_push_work(self) -> bool:
+        """Keep scheduler steps running while a store still reads GPU blocks."""
+        return bool(getattr(self, "_pinned_store_jobs", None))
+
     @classmethod
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None
@@ -1410,6 +1477,88 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     ##############################
     # Helper functions
     ##############################
+    def _ingest_exact_mamba_boundary_blocks_for_request(
+        self,
+        scheduler_output: SchedulerOutput,
+        request_id: str,
+        tracker: LMCacheMPRequestTracker,
+    ) -> None:
+        """Record one request's exact core-selected recurrent blocks."""
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        handoffs = block_state.boundary_state_offloads if block_state else {}
+        received_handoff_boundaries: dict[int, set[int]] = {}
+        for group_id, block_id, boundary_tokens in handoffs.get(request_id, ()):
+            if group_id not in self._mamba_group_ids or block_id <= 0:
+                continue
+            tracker.exact_mamba_boundary_blocks.setdefault(group_id, {})[
+                boundary_tokens
+            ] = block_id
+            received_handoff_boundaries.setdefault(group_id, set()).add(boundary_tokens)
+        if received_handoff_boundaries:
+            logger.info(
+                "Ingested exact recurrent handoffs: request_id=%s, "
+                "received_handoff_boundaries=%s",
+                request_id,
+                {
+                    group_id: sorted(boundaries)
+                    for group_id, boundaries in sorted(
+                        received_handoff_boundaries.items()
+                    )
+                },
+            )
+
+    def _apply_current_block_ids_for_request(
+        self,
+        scheduler_output: SchedulerOutput,
+        request_id: str,
+        tracker: LMCacheMPRequestTracker,
+    ) -> bool:
+        """Replace local mirrors with the scheduler's authoritative block table.
+
+        Align-mode recurrent tables are sparse and mutable. A positional table
+        assembled from allocation deltas can therefore name a freed or reused
+        block. The scheduler snapshot is the only valid source for a store
+        emitted in the same step.
+
+        Returns:
+            True when a scheduler snapshot was available for the request.
+        """
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        if block_state is None:
+            return False
+        block_ids = block_state.block_ids.get(request_id)
+        if block_ids is None:
+            return False
+        tracker.allocated_block_ids = {
+            group_id: list(group_block_ids)
+            for group_id, group_block_ids in enumerate(block_ids)
+        }
+        return True
+
+    def _reference_store_blocks(self, metadata: LMCacheMPConnectorMetadata) -> None:
+        """Retain every source block until all workers finish one store job."""
+        pool = self._gpu_block_pool
+        stores = [meta for meta in metadata.requests if meta.direction == "STORE"]
+        if not stores:
+            return
+        if pool is None:
+            raise ValueError("GPU block pool must be bound before a store is emitted")
+
+        for meta in stores:
+            store_job_id = self._next_store_job_id
+            self._next_store_job_id += 1
+            meta.store_job_id = store_job_id
+            # Null placeholders do not own storage. Deduplication ensures that
+            # an exact recurrent boundary also present in another view receives
+            # one matching touch/free pair.
+            block_ids = list(
+                dict.fromkeys(bid for bid in meta.op.flat_block_ids if bid > 0)
+            )
+            if not block_ids:
+                continue
+            pool.touch([pool.blocks[bid] for bid in block_ids])
+            self._pinned_store_jobs[store_job_id] = (block_ids, self._num_workers)
+
     def _process_retrieve_requests(
         self,
         metadata: LMCacheMPConnectorMetadata,
@@ -1437,6 +1586,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         for new_request in scheduler_output.scheduled_new_reqs:
             request_tracker = self._get_request_tracker(new_request.req_id)
+            self._apply_current_block_ids_for_request(
+                scheduler_output,
+                new_request.req_id,
+                request_tracker,
+            )
+            self._ingest_exact_mamba_boundary_blocks_for_request(
+                scheduler_output,
+                new_request.req_id,
+                request_tracker,
+            )
 
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
@@ -1445,6 +1604,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
+                self._mamba_group_ids,
             )
             if r_meta is not None:
                 # In lazy_offload mode, add to pending queue instead of immediate store
@@ -1470,10 +1630,23 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for idx, request_id in enumerate(cached_reqs.req_ids):
             request_tracker = self._get_request_tracker(request_id)
+            has_current_block_ids = self._apply_current_block_ids_for_request(
+                scheduler_output,
+                request_id,
+                request_tracker,
+            )
+            self._ingest_exact_mamba_boundary_blocks_for_request(
+                scheduler_output,
+                request_id,
+                request_tracker,
+            )
 
             # Update block ids
             new_block_ids = cached_reqs.new_block_ids[idx] or ()
-            if request_id not in cached_reqs.resumed_req_ids:
+            if (
+                not has_current_block_ids
+                and request_id not in cached_reqs.resumed_req_ids
+            ):
                 request_tracker.append_block_ids(new_block_ids)
 
             # Use the incremental num_scheduled_tokens to
@@ -1485,6 +1658,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
+                self._mamba_group_ids,
             )
 
             if r_meta is not None:

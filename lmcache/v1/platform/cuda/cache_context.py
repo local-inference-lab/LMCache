@@ -356,9 +356,11 @@ class GPUCacheContext(BaseCacheContext):
         separate_object_groups: bool = False,
         full_sw_kv: bool = False,
     ):
-        # Kept for close(): raw-IPC wrappers hold driver-level mappings
-        # that pin the exporter's device memory until explicitly closed.
+        # Kept for close(): CUDA wrappers hold driver-level mappings that pin
+        # exporter memory until explicitly closed.
         self._kv_wrappers: KVCache = list(kv_caches)
+        self._closed = False
+        self._gds_registered = False
         try:
             self._init_impl(
                 kv_caches,
@@ -450,6 +452,7 @@ class GPUCacheContext(BaseCacheContext):
         # context's CUDA stream.
         with torch_dev.stream(self.cuda_stream_):
             get_gds_context().register_gpu_buffer(self._temp_buffer.buffer)
+        self._gds_registered = True
 
         # Third Party
         import cupy
@@ -467,24 +470,51 @@ class GPUCacheContext(BaseCacheContext):
         )
 
     def close(self) -> None:
-        """Drain the context stream, deregister the GDS staging buffer and
-        release the imported KV mappings (reverse of __init__).
+        """Release staging resources and imported mappings without device reset.
 
-        The stream is synchronized first so no in-flight kernel still
-        touches the mappings when they are unmapped. The wrapper close
-        unmaps raw CUDA IPC imports; without it a dead worker's KV pool
-        stays resident on this process's GPUs for the process lifetime.
-        The tensors built over those mappings must not be dereferenced
-        afterwards -- the caller (``_release_entries``) drops the context
-        right after this call.
+        The stream is drained before aliases are dropped and imported CUDA
+        allocations are unmapped. CUDA contexts remain alive for safe
+        re-registration in the same sidecar process.
+
+        Raises:
+            RuntimeError: If one or more resources fail to close. Failed
+                wrapper references remain retained so cleanup can be retried.
         """
-        self.cuda_stream_.synchronize()
-        with torch_dev.stream(self.cuda_stream_):
-            get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
-        self._close_kv_wrappers()
+        if self._closed:
+            return
+        close_errors: list[BaseException] = []
+        if self._gds_registered:
+            try:
+                self.cuda_stream_.synchronize()
+                with torch_dev.stream(self.cuda_stream_):
+                    get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
+            except BaseException as exc:
+                close_errors.append(exc)
+            else:
+                self._gds_registered = False
+
+        # Drop every context-owned tensor alias before the final wrapper
+        # reference can unmap its allocation.
+        self.kv_caches_.clear()
+        self.group_kv_pointers_.clear()
+
+        remaining_wrappers: KVCache = []
+        for wrapper in self._kv_wrappers:
+            try:
+                wrapper.close()
+            except BaseException as exc:
+                close_errors.append(exc)
+                remaining_wrappers.append(wrapper)
+        self._kv_wrappers = remaining_wrappers
+        self._closed = not self._gds_registered and not self._kv_wrappers
+        if close_errors:
+            raise RuntimeError(
+                f"GPU cache context cleanup failed with "
+                f"{len(close_errors)} cleanup error(s)"
+            ) from close_errors[0]
 
     def _close_kv_wrappers(self) -> None:
-        """Close every KV wrapper, continuing past per-wrapper failures."""
+        """Best-effort close wrappers during failed construction."""
         for wrapper in self._kv_wrappers:
             try:
                 wrapper.close()

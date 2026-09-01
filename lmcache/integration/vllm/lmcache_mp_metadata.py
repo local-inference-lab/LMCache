@@ -58,6 +58,10 @@ class LMCacheMPRequestTracker:
     # during generation. Keyed by engine_group_idx; non-HMA models use 0.
     allocated_block_ids: dict[int, list[int]] = field(default_factory=dict)
 
+    # Exact core-issued recurrent boundary states, keyed by engine group and
+    # boundary token count. Positional align-mode tables are sparse and mutable.
+    exact_mamba_boundary_blocks: dict[int, dict[int, int]] = field(default_factory=dict)
+
     # Number of scheduled tokens in this request. We keep tracking this to
     # avoid saving tokens whose KV has not been computed yet.
     num_scheduled_tokens: int = 0
@@ -84,6 +88,7 @@ class LMCacheMPRequestTracker:
         self.cache_salt: str = request.cache_salt or ""
         self.all_token_ids = request.all_token_ids
         self.allocated_block_ids = {}
+        self.exact_mamba_boundary_blocks = {}
         self.num_stored_tokens = 0
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
@@ -179,18 +184,73 @@ class LMCacheMPRequestTracker:
         return self.__repr__()
 
 
+def apply_exact_mamba_store_blocks(
+    tracker: LMCacheMPRequestTracker,
+    block_ids: list[list[int]],
+    group_tokens_per_block: list[int],
+    mamba_group_ids: set[int],
+    lmcache_tokens_per_chunk: int,
+    start_token_idx: int,
+    end_token_idx: int,
+) -> bool:
+    """Replace positional recurrent source IDs with exact core handoffs.
+
+    The consolidated transfer path requires a full raw block table for every
+    chunk. Recurrent chunks therefore contain null placeholders followed by
+    the one exact boundary block selected by vLLM core.
+
+    Args:
+        tracker: Request tracker carrying exact blocks by group and boundary.
+        block_ids: Per-group positional block IDs to replace in place.
+        group_tokens_per_block: Token span of one raw block in each group.
+        mamba_group_ids: Engine group IDs containing recurrent state.
+        lmcache_tokens_per_chunk: Token span of one LMCache object chunk.
+        start_token_idx: Inclusive start of the store range.
+        end_token_idx: Exclusive end of the store range.
+
+    Returns:
+        True after replacing every recurrent group. False without mutation
+        when any required exact boundary handoff is absent.
+    """
+    replacements: dict[int, list[int]] = {}
+    for group_id in mamba_group_ids:
+        exact_boundaries = tracker.exact_mamba_boundary_blocks.get(group_id, {})
+        blocks_per_chunk = lmcache_tokens_per_chunk // group_tokens_per_block[group_id]
+        replacement: list[int] = []
+        for boundary_tokens in range(
+            start_token_idx + lmcache_tokens_per_chunk,
+            end_token_idx + 1,
+            lmcache_tokens_per_chunk,
+        ):
+            exact_block_id = exact_boundaries.get(boundary_tokens)
+            if exact_block_id is None:
+                return False
+            replacement.extend([0] * (blocks_per_chunk - 1))
+            replacement.append(exact_block_id)
+        replacements[group_id] = replacement
+
+    for group_id, replacement in replacements.items():
+        block_ids[group_id] = replacement
+    return True
+
+
 @dataclass
 class LMCacheMPRequestMetadata:
     request_id: str
     direction: Literal["STORE", "RETRIEVE"]
     op: LoadStoreOp
     cache_salt: str = ""
+    # Scheduler-assigned identity for one asynchronous store. The identity is
+    # carried to every worker so the scheduler can retain exactly the source
+    # blocks read by that store until all ranks report completion.
+    store_job_id: int | None = None
 
     @staticmethod
     def GetStoreMetadata(
         tracker: LMCacheMPRequestTracker,
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
+        mamba_group_ids: set[int] | None = None,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the store metadata for the current request tracker.
@@ -202,6 +262,14 @@ class LMCacheMPRequestMetadata:
                 paged chunk (one block ID) of that group, i.e. the group's
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+            mamba_group_ids: Engine groups whose positional block tables must
+                be replaced by exact recurrent-boundary handoffs. When a later
+                boundary has not arrived, the metadata covers only the longest
+                contiguous handoff-complete prefix.
+
+        Returns:
+            Store metadata for the next complete chunk range, or ``None`` when
+            no complete chunk is available.
         """
         num_engine_groups = len(group_tokens_per_block)
         # NOTE: the invariant here is that `num_stored_tokens` should
@@ -252,13 +320,77 @@ class LMCacheMPRequestMetadata:
 
         if num_chunks >= 1:
             start_token_idx = tracker.num_stored_tokens
-            end_token_idx = start_token_idx + num_chunks * lmcache_tokens_per_chunk
+            candidate_end_token_idx = (
+                start_token_idx + num_chunks * lmcache_tokens_per_chunk
+            )
+            end_token_idx = candidate_end_token_idx
+            if mamba_group_ids:
+                received_handoff_boundaries = {
+                    group_id: sorted(
+                        tracker.exact_mamba_boundary_blocks.get(group_id, {})
+                    )
+                    for group_id in sorted(mamba_group_ids)
+                }
+                required_boundaries = list(
+                    range(
+                        start_token_idx + lmcache_tokens_per_chunk,
+                        candidate_end_token_idx + 1,
+                        lmcache_tokens_per_chunk,
+                    )
+                )
+                end_token_idx = start_token_idx
+                for boundary_tokens in required_boundaries:
+                    if not all(
+                        boundary_tokens
+                        in tracker.exact_mamba_boundary_blocks.get(group_id, {})
+                        for group_id in mamba_group_ids
+                    ):
+                        break
+                    end_token_idx = boundary_tokens
+                if end_token_idx == start_token_idx:
+                    logger.debug(
+                        "Suppressing recurrent store: request_id=%s, "
+                        "recurrent_groups=%s, received_handoff_boundaries=%s, "
+                        "required_store_boundaries=%s, reason=no contiguous "
+                        "exact recurrent boundary",
+                        tracker.request_id,
+                        sorted(mamba_group_ids),
+                        received_handoff_boundaries,
+                        required_boundaries,
+                    )
+                    return None
+                if end_token_idx < candidate_end_token_idx:
+                    logger.info(
+                        "Truncating recurrent store to handoff-ready prefix: "
+                        "request_id=%s, "
+                        "recurrent_groups=%s, received_handoff_boundaries=%s, "
+                        "required_store_boundaries=%s, store_range=[%d, %d), "
+                        "reason=later exact recurrent boundary unavailable",
+                        tracker.request_id,
+                        sorted(mamba_group_ids),
+                        received_handoff_boundaries,
+                        required_boundaries,
+                        start_token_idx,
+                        end_token_idx,
+                    )
             block_ids = slice_block_ids_per_group(
                 tracker.allocated_block_ids,
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
             )
+            if mamba_group_ids and not apply_exact_mamba_store_blocks(
+                tracker,
+                block_ids,
+                group_tokens_per_block,
+                mamba_group_ids,
+                lmcache_tokens_per_chunk,
+                start_token_idx,
+                end_token_idx,
+            ):
+                # The core handoff may arrive in a later scheduler step.
+                # Never fall back to a stale positional recurrent state.
+                return None
             token_ids = tracker.get_token_ids()
             op = LoadStoreOp(
                 token_ids=token_ids,
@@ -272,6 +404,17 @@ class LMCacheMPRequestMetadata:
                 direction="STORE",
                 op=op,
                 cache_salt=tracker.cache_salt,
+            )
+            logger.info(
+                "Emitting store metadata: request_id=%s, store_range=[%d, %d), "
+                "block_counts_by_group=%s",
+                tracker.request_id,
+                start_token_idx,
+                end_token_idx,
+                {
+                    group_id: len(group_block_ids)
+                    for group_id, group_block_ids in enumerate(block_ids)
+                },
             )
 
             # Update the request tracker
@@ -407,21 +550,28 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
 
 @dataclass
 class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
-    """Worker -> Scheduler metadata for completed store events.
+    """Worker-to-scheduler metadata for completed asynchronous stores.
 
-    Each worker reports {req_id: 1} for newly completed stores.
-    ``aggregate()`` sums counts across workers within a step.
-    The scheduler-side manager accumulates across steps and processes
-    a store completion only when count reaches ``world_size``.
+    ``completed_store_jobs`` identifies individual stores whose source blocks
+    can be released after every worker reports completion. The request-level
+    counts remain the compatibility protocol for non-recurrent lazy offload.
+    ``aggregate()`` sums both counters across workers within one engine step.
     """
 
-    completed_store_requests: dict[str, int]
+    completed_store_requests: dict[str, int] = field(default_factory=dict)
+    completed_store_jobs: dict[int, int] = field(default_factory=dict)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
     ) -> "KVConnectorWorkerMetadata":
         assert isinstance(other, LMCacheMPWorkerMetadata)
-        merged = dict(self.completed_store_requests)
+        merged_requests = dict(self.completed_store_requests)
         for k, v in other.completed_store_requests.items():
-            merged[k] = merged.get(k, 0) + v
-        return LMCacheMPWorkerMetadata(completed_store_requests=merged)
+            merged_requests[k] = merged_requests.get(k, 0) + v
+        merged_jobs = dict(self.completed_store_jobs)
+        for k, v in other.completed_store_jobs.items():
+            merged_jobs[k] = merged_jobs.get(k, 0) + v
+        return LMCacheMPWorkerMetadata(
+            completed_store_requests=merged_requests,
+            completed_store_jobs=merged_jobs,
+        )

@@ -269,11 +269,7 @@ def test_server_store_and_retrieve_delegate_event_ordering(
         world_size=1,
         event_backend=cast(Any, backend),
     )
-    monkeypatch.setattr(
-        module,
-        "get_and_touch_context_entry",
-        lambda instance_id: entry,
-    )
+    module._cache_contexts[1] = entry
     key = SimpleNamespace(request_id="request", cache_salt="", worker_id=0)
 
     assert module.store(key, 1, [[]], b"store-producer") == (

@@ -5,6 +5,7 @@
 from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+import threading
 
 # Third Party
 import pytest
@@ -16,6 +17,7 @@ from lmcache.v1.distributed.api import (
 )
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
+    ContextEntry,
     LMCacheDrivenTransferModule,
 )
 from lmcache.v1.multiprocess.session import SessionManager
@@ -89,10 +91,9 @@ def test_missing_registration_returns_terminal_false(method_name: str) -> None:
     handle indicates that the server submitted no device work.
     """
     module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
-    module.get_and_touch_context_entry = MagicMock(  # type: ignore[method-assign]
-        return_value=None
-    )
     module._ctx = MagicMock()
+    module._cache_contexts = {}
+    module._lock = threading.Lock()
     module._ctx.session_manager.get.return_value = None
     producer_event = b"worker-producer-event"
     key = _cache_key(world_size=1, worker_id=0, request_id="request")
@@ -105,7 +106,7 @@ def test_missing_registration_returns_terminal_false(method_name: str) -> None:
     )
 
     assert result == (b"", False)
-    module.get_and_touch_context_entry.assert_called_once_with(42)
+    assert module.tracked_instance_count() == 0
 
 
 @pytest.mark.parametrize("mla", [False, True], ids=["sharded-kv", "mla-shared-kv"])
@@ -161,9 +162,8 @@ def test_tp_failed_worker_releases_only_its_reader_share_once(mla: bool) -> None
 
     module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
     module._ctx = ctx  # type: ignore[assignment]
-    module.get_and_touch_context_entry = MagicMock(  # type: ignore[method-assign]
-        return_value=None
-    )
+    module._cache_contexts = {}
+    module._lock = threading.Lock()
     failed_key = _cache_key(
         world_size=world_size,
         worker_id=failed_worker,
@@ -208,10 +208,9 @@ def test_tp_failed_worker_releases_only_its_reader_share_once(mla: bool) -> None
 def test_cleanup_exception_does_not_suppress_terminal_false() -> None:
     """A resolution failure must not consume the claim or strand the caller."""
     module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
-    module.get_and_touch_context_entry = MagicMock(  # type: ignore[method-assign]
-        return_value=None
-    )
     module._ctx = MagicMock()
+    module._cache_contexts = {}
+    module._lock = threading.Lock()
     session = MagicMock()
     session.prepare_failed_retrieve_release.return_value = (2, (0,), (-1,), 7)
     module._ctx.session_manager.get.return_value = session
@@ -228,3 +227,60 @@ def test_cleanup_exception_does_not_suppress_terminal_false() -> None:
 
     assert result == (b"", False)
     session.claim_failed_retrieve_release.assert_not_called()
+
+
+def test_registered_retrieve_block_underflow_releases_lookup_locks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed registered retrieve releases its prefetched reservation."""
+    hasher = _TestTokenHasher()
+    sessions = SessionManager(hasher, cleanup_interval=None)  # type: ignore[arg-type]
+    lookup_key = _cache_key(world_size=1, worker_id=None, request_id="request")
+    retrieve_key = _cache_key(world_size=1, worker_id=0, request_id="request")
+    session = sessions.get_or_create("request")
+    session.begin_lookup(lookup_key, (-1,))
+    session.record_prefetch_result(2, (0,))
+
+    hashes = hasher.compute_chunk_hashes(list(lookup_key.token_ids), end=lookup_key.end)
+    locked_keys = ipc_key_to_object_keys(retrieve_key, hashes, [0])[0]
+    storage = _CountingStorageManager()
+    storage.acquire(locked_keys)
+
+    cache_context = MagicMock()
+    cache_context.kv_layer_groups_manager.num_object_groups = 1
+    cache_context.kv_layer_groups_manager.num_kernel_groups = 1
+    cache_context.calculate_num_blocks.return_value = 1
+    event_backend = MagicMock()
+    entry = ContextEntry(
+        cache_context=cache_context,
+        model_name="test-model",
+        world_size=1,
+        event_backend=event_backend,
+    )
+    ctx = SimpleNamespace(
+        chunk_size=hasher.chunk_size,
+        token_hasher=hasher,
+        session_manager=sessions,
+        layout_desc_registry=MagicMock(),
+        storage_manager=storage,
+        resolve_obj_keys=MagicMock(return_value=[locked_keys]),
+        event_bus=MagicMock(),
+    )
+    module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
+    module._ctx = ctx  # type: ignore[assignment]
+    module._cache_contexts = {101: entry}
+    module._lock = threading.Lock()
+    monkeypatch.setattr(
+        "lmcache.v1.multiprocess.modules.lmcache_driven_transfer.torch_dev",
+        MagicMock(),
+    )
+
+    _handle, ok = module.retrieve(
+        retrieve_key,
+        101,
+        [[7]],
+        b"producer-event",
+    )
+
+    assert ok is False
+    assert all(storage.readers[key] == 0 for key in locked_keys)

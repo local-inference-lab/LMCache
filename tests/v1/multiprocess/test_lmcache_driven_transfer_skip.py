@@ -12,11 +12,13 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+import threading
 
 # First Party
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as mod
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
+    ContextEntry,
     LMCacheDrivenTransferModule,
     all_null_chunk_masks,
 )
@@ -90,6 +92,84 @@ def test_object_group_null_only_when_all_its_kernel_groups_null():
     assert masks == [[True, False]]
 
 
+def test_store_aborts_all_groups_when_later_copy_fails(monkeypatch):
+    """A later group failure releases every earlier write reservation."""
+    module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
+    kvlgm = SimpleNamespace(
+        num_object_groups=2,
+        num_kernel_groups=2,
+        object_groups=[_og([0]), _og([1])],
+    )
+    cache_context = MagicMock()
+    cache_context.kv_layer_groups_manager = kvlgm
+    cache_context.calculate_num_blocks.return_value = 1
+    event_backend = MagicMock()
+    entry = ContextEntry(
+        cache_context=cache_context,
+        model_name="m",
+        world_size=1,
+        event_backend=event_backend,
+    )
+    module._cache_contexts = {1: entry}
+    module._lock = threading.Lock()
+
+    ctx = MagicMock()
+    ctx.chunk_size = 256
+    ctx.resolve_obj_keys.return_value = [["g0c0"], ["g1c0"]]
+    memory_objs = {
+        "g0c0": MagicMock(get_size=MagicMock(return_value=10)),
+        "g1c0": MagicMock(get_size=MagicMock(return_value=10)),
+    }
+    ctx.storage_manager.reserve_write.side_effect = lambda keys, *_args: {
+        key: memory_objs[key] for key in keys
+    }
+    module._ctx = ctx
+
+    def fail_second_group(
+        cache_context,
+        block_ids,
+        memory_objs,
+        object_group_id,
+        batch_size,
+        skip_first_n_tokens,
+        direction,
+    ):
+        del (
+            cache_context,
+            block_ids,
+            memory_objs,
+            batch_size,
+            skip_first_n_tokens,
+            direction,
+        )
+        if object_group_id == 1:
+            raise RuntimeError("injected second-group copy failure")
+
+    submitted_callbacks: list[tuple[object, ...]] = []
+    monkeypatch.setattr(mod, "get_layout_desc", lambda *args, **kwargs: object())
+    monkeypatch.setattr(mod, "transfer_kv_per_object_group", fail_second_group)
+    monkeypatch.setattr(mod, "downsample_and_stage_block_ids", lambda cc, b: b)
+    monkeypatch.setattr(
+        mod,
+        "submit_callback_to_stream",
+        lambda *args, **_kwargs: submitted_callbacks.append(args),
+    )
+    monkeypatch.setattr(mod, "torch_dev", MagicMock())
+    monkeypatch.setattr(mod, "Event", MagicMock())
+
+    _handle, ok = module.store(
+        key=SimpleNamespace(request_id="req", worker_id=1),
+        instance_id=1,
+        gpu_block_ids=[[1], [2]],
+        event_ipc_handle=b"x",
+    )
+
+    assert ok is False
+    assert submitted_callbacks == [
+        (cache_context.cupy_stream, "abort_write", ["g0c0", "g1c0"])
+    ]
+
+
 # ------------------------------------------------------------------ #
 #  retrieve (read-side window)                                         #
 # ------------------------------------------------------------------ #
@@ -116,10 +196,14 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw, group_kinds=()):
     cache_context.max_batch_size = 8
 
     event_backend = MagicMock()
-    entry = SimpleNamespace(
-        cache_context=cache_context, model_name="m", event_backend=event_backend
+    entry = ContextEntry(
+        cache_context=cache_context,
+        model_name="m",
+        world_size=1,
+        event_backend=event_backend,
     )
-    module.get_and_touch_context_entry = MagicMock(return_value=entry)
+    module._cache_contexts = {1: entry}
+    module._lock = threading.Lock()
 
     # Object keys: one distinct key per (group, chunk).
     obj_keys = [
@@ -208,6 +292,72 @@ def test_retrieve_full_attention_only_reads_everything(monkeypatch):
     assert read_calls == [["g0c0", "g0c1", "g0c2"]]
     _grp, mem = transfer_calls[0]
     assert len(mem) == 3 and all(o is not None for o in mem)
+
+
+def test_retrieve_failure_releases_every_object_group_reservation(monkeypatch):
+    """A mid-retrieve failure releases read locks for untouched groups."""
+    module, _read_calls, _transfer_calls = _make_module(
+        monkeypatch,
+        num_chunks=1,
+        num_chunks_in_sw=[-1, -1, -1],
+    )
+    readers = {"g0c0": 1, "g1c0": 1, "g2c0": 1}
+
+    @contextmanager
+    def read_with_failure_cleanup(keys):
+        try:
+            yield [MagicMock(get_size=MagicMock(return_value=10)) for _ in keys]
+        except Exception:
+            for obj_key in keys:
+                readers[obj_key] -= 1
+            raise
+
+    def finish_read(keys, read_locks=1):
+        for obj_key in keys:
+            readers[obj_key] -= read_locks
+
+    def fail_second_group(
+        cache_context,
+        block_ids,
+        memory_objs,
+        object_group_id,
+        batch_size,
+        skip_first_n_tokens,
+        direction,
+    ):
+        del (
+            cache_context,
+            block_ids,
+            memory_objs,
+            batch_size,
+            skip_first_n_tokens,
+            direction,
+        )
+        if object_group_id == 1:
+            raise RuntimeError("injected second-group retrieve failure")
+
+    module.context.storage_manager.read_prefetched_results.side_effect = (
+        read_with_failure_cleanup
+    )
+    module.context.storage_manager.finish_read_prefetched.side_effect = finish_read
+    monkeypatch.setattr(mod, "transfer_kv_per_object_group", fail_second_group)
+    monkeypatch.setattr(
+        mod,
+        "submit_callback_to_stream",
+        lambda _stream, callback, keys: (
+            finish_read(keys) if callback == "finish_read_prefetched" else None
+        ),
+    )
+
+    _handle, ok = module.retrieve(
+        key=SimpleNamespace(request_id="req", cache_salt="salt"),
+        instance_id=1,
+        gpu_block_ids=[[1], [2], [3]],
+        event_ipc_handle=b"x",
+    )
+
+    assert ok is False
+    assert readers == {"g0c0": 0, "g1c0": 0, "g2c0": 0}
 
 
 def test_retrieve_never_reads_standalone_groups(monkeypatch):

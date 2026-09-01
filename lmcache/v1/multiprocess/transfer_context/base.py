@@ -40,7 +40,7 @@ import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
     # First Party
-    pass
+    from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache
 
 logger = init_logger(__name__)
 
@@ -373,6 +373,49 @@ def compute_kv_layout(
     )
 
 
+def _resolve_uniform_block_stride(
+    normalized: DiscoverableKVCache,
+    engine_kv_format: lmcache_native.EngineKVFormat,
+    num_layers: int,
+    group_idx: int,
+) -> int | None:
+    """Resolve one authoritative physical block stride for a transfer group.
+
+    Args:
+        normalized: Actual normalized tensors passed to the transfer operation.
+        engine_kv_format: Format used to interpret ``normalized``.
+        num_layers: Number of layers in the transfer group.
+        group_idx: Protocol-visible group index used in diagnostics.
+
+    Returns:
+        The common physical block stride in elements, or ``None`` when the
+        format uses the descriptor's tight-layout fallback.
+
+    Raises:
+        ValueError: If layers in the group disagree on physical block stride.
+    """
+    # First Party
+    from lmcache.v1.gpu_connector.utils import (
+        resolve_block_stride_and_log_layout,
+    )
+
+    layer_strides = [
+        resolve_block_stride_and_log_layout(
+            normalized,
+            engine_kv_format,
+            layer_idx=layer_idx,
+            group_idx=group_idx,
+        )
+        for layer_idx in range(num_layers)
+    ]
+    if len(set(layer_strides)) > 1:
+        raise ValueError(
+            f"engine-driven group {group_idx} layers disagree on physical "
+            f"block stride: {layer_strides}"
+        )
+    return layer_strides[0] if layer_strides else None
+
+
 def gather_paged_kv_to_cpu(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
@@ -382,6 +425,7 @@ def gather_paged_kv_to_cpu(
     out: list[torch.Tensor] | None = None,
     chunk_indices: list[int] | None = None,
     blocks_per_window: int | None = None,
+    group_idx: int = 0,
 ) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
 
@@ -402,6 +446,7 @@ def gather_paged_kv_to_cpu(
             (backward-compatible behaviour).
         blocks_per_window: Number of trailing physical blocks retained from
             each logical chunk. ``None`` stores the whole chunk.
+        group_idx: Protocol-visible group index used in layout diagnostics.
 
     Returns:
         List of CPU tensors, one per chunk. For split-K/V formats each chunk
@@ -413,7 +458,8 @@ def gather_paged_kv_to_cpu(
 
     Raises:
         ValueError: If ``out`` is provided with fewer buffers than the number
-            of gathered chunks.
+            of gathered chunks, or group layers disagree on physical block
+            stride.
     """
     # First Party
     from lmcache import device_ops
@@ -452,6 +498,12 @@ def gather_paged_kv_to_cpu(
         )
     window_tokens = bpw * block_size
 
+    block_stride_elems = _resolve_uniform_block_stride(
+        normalized,
+        engine_kv_format,
+        num_layers,
+        group_idx,
+    )
     shape_desc = make_page_buffer_shape_desc(
         normalized,
         engine_kv_format,
@@ -459,6 +511,7 @@ def gather_paged_kv_to_cpu(
         num_layers_in_group=num_layers,
         num_blocks=num_blocks,
         block_size=block_size,
+        block_stride_elems=block_stride_elems,
     )
 
     iter_indices = (
@@ -639,6 +692,7 @@ def scatter_cpu_to_paged_kv(
     layout_hints: LayoutHints | None = None,
     engine_kv_format: "lmcache_native.EngineKVFormat" | None = None,
     blocks_per_window: int | None = None,
+    group_idx: int = 0,
 ) -> None:
     """Scatter CPU chunk tensors back into paged KV tensors.
 
@@ -658,10 +712,12 @@ def scatter_cpu_to_paged_kv(
         engine_kv_format: Optional pre-detected KV format.
         blocks_per_window: Number of trailing physical blocks represented by
             each stored chunk. ``None`` means the whole logical chunk.
+        group_idx: Protocol-visible group index used in layout diagnostics.
 
     Raises:
         ValueError: If ``block_ids`` is shorter than
-            ``len(chunks) * blocks_per_chunk``.
+            ``len(chunks) * blocks_per_chunk``, or group layers disagree on
+            physical block stride.
     """
     # First Party
     from lmcache import device_ops
@@ -722,6 +778,12 @@ def scatter_cpu_to_paged_kv(
         0, tail_blocks - (blocks_per_chunk - bpw)
     )
 
+    block_stride_elems = _resolve_uniform_block_stride(
+        normalized,
+        engine_kv_format,
+        num_layers,
+        group_idx,
+    )
     shape_desc = make_page_buffer_shape_desc(
         normalized,
         engine_kv_format,
@@ -729,6 +791,7 @@ def scatter_cpu_to_paged_kv(
         num_layers_in_group=num_layers,
         num_blocks=num_blocks,
         block_size=block_size,
+        block_stride_elems=block_stride_elems,
     )
 
     selected_block_ids: list[int] = []

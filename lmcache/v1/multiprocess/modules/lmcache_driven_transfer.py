@@ -2,7 +2,7 @@
 """LMCache-driven KV cache transfer operations for the MPCacheServer."""
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any, Generator, Sequence
 import threading
@@ -642,6 +642,9 @@ class ContextEntry:
             PING. Selects the reap window (timeout vs registration grace).
             Latched only by PING, never by traffic.
         event_backend: Cached event backend selected for this context's device.
+        active_operations: Number of STORE/RETRIEVE handlers currently using
+            this context.
+        drained: Set while no active operation holds this context.
     """
 
     cache_context: BaseCacheContext
@@ -650,6 +653,12 @@ class ContextEntry:
     last_seen: float = 0.0
     has_liveness_signal: bool = False
     event_backend: EventIPCBackend | None = None
+    active_operations: int = 0
+    drained: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    def __post_init__(self) -> None:
+        """Initialize a newly registered context in the drained state."""
+        self.drained.set()
 
 
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
@@ -672,12 +681,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # empty_cache (leaf-lock invariant: no thread holds two locks).
         self._lock = threading.Lock()
 
-        # Route finish_write / finish_read_prefetched through a C++ host
+        # Route write/read completion through a C++ host
         # callback so the driver thread doesn't acquire the GIL.
         self._device_host_func_dispatcher = DeviceHostFuncDispatcher()
         self._device_host_func_dispatcher.register(
             "finish_write",
             self._ctx.storage_manager.finish_write,
+            payload_type=list[ObjectKey],
+        )
+        self._device_host_func_dispatcher.register(
+            "abort_write",
+            self._ctx.storage_manager.abort_write,
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.register(
@@ -711,6 +725,34 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             if entry is not None:
                 entry.last_seen = now
             return entry
+
+    def _acquire_context_entry(self, instance_id: int) -> ContextEntry | None:
+        """Acquire an operation lease while the entry is still registered."""
+        now = time.monotonic()
+        with self._lock:
+            entry = self._cache_contexts.get(instance_id)
+            if entry is None:
+                return None
+            entry.last_seen = now
+            if entry.active_operations == 0:
+                entry.drained.clear()
+            entry.active_operations += 1
+            return entry
+
+    def _release_context_entry(self, entry: ContextEntry) -> None:
+        """Release an operation lease and signal cleanup when fully drained."""
+        with self._lock:
+            if entry.active_operations < 1:
+                raise RuntimeError("cache context operation lease underflow")
+            entry.active_operations -= 1
+            if entry.active_operations == 0:
+                entry.drained.set()
+
+    @staticmethod
+    def _wait_for_entries_to_drain(entries: list[ContextEntry]) -> None:
+        """Wait outside the registry lock for all removed entries to drain."""
+        for entry in entries:
+            entry.drained.wait()
 
     def _release_failed_retrieve_locks(
         self,
@@ -817,7 +859,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ]
             for iid in stale_ids:
                 reaped.append((iid, self._cache_contexts.pop(iid)))
-        reaped_ids: list[int] = []
+        reaped_ids = [iid for iid, _entry in reaped]
         entries: list[ContextEntry] = []
         for iid, e in reaped:
             logger.warning(
@@ -826,13 +868,26 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 now - e.last_seen,
                 e.has_liveness_signal,
             )
-            reaped_ids.append(iid)
             entries.append(e)
         if reaped:
-            del e  # a bound name would pin the final entry (see _release_entries)
+            del e
             reaped.clear()
+            self._wait_for_entries_to_drain(entries)
             self._release_entries(entries)
         return reaped_ids
+
+    def _finalize_cuda_cleanup(self, close_errors: list[BaseException]) -> None:
+        """Collect dropped allocations without resetting reusable contexts."""
+        try:
+            torch_dev.empty_cache()
+        except BaseException as exc:
+            close_errors.append(exc)
+        ipc_collect = getattr(torch_dev, "ipc_collect", None)
+        if ipc_collect is not None:
+            try:
+                ipc_collect()
+            except BaseException as exc:
+                close_errors.append(exc)
 
     def _release_entries(self, entries: list[ContextEntry]) -> None:
         """Release a batch of entries and reclaim their device memory.
@@ -843,20 +898,34 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         if not entries:
             return
+        close_errors: list[BaseException] = []
         for entry in entries:
-            entry.cache_context.close()
-            self._ctx.layout_desc_registry.unregister(
-                entry.model_name, entry.world_size
-            )
+            try:
+                entry.cache_context.close()
+            except BaseException as exc:
+                close_errors.append(exc)
+                continue
+            try:
+                self._ctx.layout_desc_registry.unregister(
+                    entry.model_name, entry.world_size
+                )
+            except BaseException as exc:
+                close_errors.append(exc)
+        if close_errors:
+            self._finalize_cuda_cleanup(close_errors)
+            raise RuntimeError(
+                f"GPU cache context cleanup failed with "
+                f"{len(close_errors)} cleanup error(s)"
+            ) from close_errors[0]
+
         del entry
         entries.clear()
-        # ipc_collect() only unmaps a CUDA-IPC-imported segment once its last
-        # tensor reference is gone (LMCache#4014), hence the clear() above.
-        torch_dev.empty_cache()
-        ipc_collect = getattr(torch_dev, "ipc_collect", None)
-        if ipc_collect is not None:
-            # Backends without IPC collection omit this optional operation.
-            ipc_collect()
+        self._finalize_cuda_cleanup(close_errors)
+        if close_errors:
+            raise RuntimeError(
+                f"GPU cache context cleanup failed with "
+                f"{len(close_errors)} cleanup error(s)"
+            ) from close_errors[0]
 
     def get_handlers(self) -> list[HandlerSpec]:
         """Return handler specs for all request types this module serves.
@@ -895,6 +964,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             A dict containing registered GPU instance IDs and
             per-instance KV cache layout metadata.
         """
+        # First Party
+        from lmcache.v1.platform.cuda.cumem_ipc import (
+            imported_alias_refcount_total,
+            imported_registration_count,
+        )
+
         registered_gpu_ids: list[int] = []
         cache_context_meta: dict[str, dict] = {}
 
@@ -910,6 +985,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         return {
             "registered_gpu_ids": registered_gpu_ids,
             "cache_context_meta": cache_context_meta,
+            "imported_cumem_allocation_count": imported_registration_count(),
+            "imported_cumem_alias_refcount": imported_alias_refcount_total(),
         }
 
     def close(self) -> None:
@@ -921,6 +998,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with self._lock:
             entries = list(self._cache_contexts.values())
             self._cache_contexts.clear()
+        self._wait_for_entries_to_drain(entries)
         self._release_entries(entries)
 
     def register_kv_cache(
@@ -961,51 +1039,99 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     "Instance %d already registered; refreshing liveness",
                     instance_id,
                 )
+                close_errors: list[BaseException] = []
+                for wrapper in kv_caches:
+                    try:
+                        wrapper.close()
+                    except BaseException as exc:
+                        close_errors.append(exc)
+                if close_errors:
+                    raise RuntimeError(
+                        "duplicate KV cache registration cleanup failed with "
+                        f"{len(close_errors)} cleanup error(s)"
+                    ) from close_errors[0]
                 return
 
         # Build the context and layout descriptor outside the lock.
-        cache_context = create_cache_context(
-            kv_caches,
-            self._ctx.chunk_size,
-            layout_hints=layout_hints or None,
-            engine_group_infos=engine_group_infos,
-            engine_type=engine_type,
-            separate_object_groups=self._ctx.separate_object_groups,
-            full_sw_kv=self._ctx.full_sw_kv,
-        )
-        kv_groups_manager = cache_context.kv_layer_groups_manager
-        num_object_groups = kv_groups_manager.num_object_groups
-        event_backend = get_event_ipc_backend(cache_context.device)
-        event_backend.check_event_support(cache_context.device)
-        layout_desc = get_layout_desc(
-            cache_context, self._ctx.chunk_size, object_group_id=0
-        )
-        # One layout per object group, also in the single-group case: no
-        # None special-casing downstream (group 0 maps to the merged layout).
-        group_layout_descs = {
-            gid: get_layout_desc(
-                cache_context, self._ctx.chunk_size, object_group_id=gid
+        try:
+            cache_context = create_cache_context(
+                kv_caches,
+                self._ctx.chunk_size,
+                layout_hints=layout_hints or None,
+                engine_group_infos=engine_group_infos,
+                engine_type=engine_type,
+                separate_object_groups=self._ctx.separate_object_groups,
+                full_sw_kv=self._ctx.full_sw_kv,
             )
-            for gid in range(num_object_groups)
-        }
-        attn_desc = kv_groups_manager.get_attn_desc()
-        self._ctx.layout_desc_registry.register(
-            model_name,
-            world_size,
-            layout_desc,
-            attn_desc,
-            group_layout_descs=group_layout_descs,
-        )
+        except BaseException as exc:
+            cleanup_errors: list[BaseException] = [exc]
+            for wrapper in kv_caches:
+                try:
+                    wrapper.close()
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+            self._finalize_cuda_cleanup(cleanup_errors)
+            if len(cleanup_errors) == 1:
+                raise
+            raise RuntimeError(
+                "KV cache context construction and cleanup failed with "
+                f"{len(cleanup_errors) - 1} additional cleanup error(s)"
+            ) from exc
 
-        with self._lock:
-            self._cache_contexts[instance_id] = ContextEntry(
-                cache_context=cache_context,
-                model_name=model_name,
-                world_size=world_size,
-                last_seen=now,
-                has_liveness_signal=False,
-                event_backend=event_backend,
+        layout_registered = False
+        try:
+            kv_groups_manager = cache_context.kv_layer_groups_manager
+            num_object_groups = kv_groups_manager.num_object_groups
+            event_backend = get_event_ipc_backend(cache_context.device)
+            event_backend.check_event_support(cache_context.device)
+            layout_desc = get_layout_desc(
+                cache_context, self._ctx.chunk_size, object_group_id=0
             )
+            # One layout per object group, also in the single-group case: no
+            # None special-casing downstream (group 0 maps to the merged layout).
+            group_layout_descs = {
+                gid: get_layout_desc(
+                    cache_context, self._ctx.chunk_size, object_group_id=gid
+                )
+                for gid in range(num_object_groups)
+            }
+            attn_desc = kv_groups_manager.get_attn_desc()
+            self._ctx.layout_desc_registry.register(
+                model_name,
+                world_size,
+                layout_desc,
+                attn_desc,
+                group_layout_descs=group_layout_descs,
+            )
+            layout_registered = True
+
+            with self._lock:
+                self._cache_contexts[instance_id] = ContextEntry(
+                    cache_context=cache_context,
+                    model_name=model_name,
+                    world_size=world_size,
+                    last_seen=now,
+                    has_liveness_signal=False,
+                    event_backend=event_backend,
+                )
+        except BaseException as exc:
+            cleanup_errors = [exc]
+            try:
+                cache_context.close()
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+            self._finalize_cuda_cleanup(cleanup_errors)
+            if layout_registered:
+                try:
+                    self._ctx.layout_desc_registry.unregister(model_name, world_size)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+            if len(cleanup_errors) == 1:
+                raise
+            raise RuntimeError(
+                "KV cache registration and cleanup failed with "
+                f"{len(cleanup_errors) - 1} additional cleanup error(s)"
+            ) from exc
 
         logger.info(
             "Registered KV cache for GPU ID %d with %d layers",
@@ -1031,14 +1157,57 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
             return
 
-        # No scalar binding: `popped` must stay the only reference so
-        # _release_entries' reclaim actually unmaps the IPC segments.
+        self._wait_for_entries_to_drain(popped)
         self._release_entries(popped)
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
     @_lmcache_nvtx_annotate
     def store(
         self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        gpu_block_ids: list[list[int]],
+        event_ipc_handle: bytes,
+    ) -> tuple[bytes, bool]:
+        """Store registered GPU KV blocks while leasing their cache context.
+
+        Args:
+            key: IPC key describing the KV cache range.
+            instance_id: Registered worker instance ID.
+            gpu_block_ids: GPU block IDs indexed by kernel group.
+            event_ipc_handle: Producer event handle to wait on.
+
+        Returns:
+            Completion-event handle and whether the store succeeded. An
+            unregistered instance returns ``(b"", False)``.
+
+        Raises:
+            RuntimeError: If event IPC is unsupported or the registered
+                context has no event backend.
+        """
+        entry = self._acquire_context_entry(instance_id)
+        if entry is None:
+            # The worker can reconnect to a replacement server before its next
+            # registration probe. No device work was submitted in that window,
+            # so return an empty completion-event handle and a terminal False
+            # response instead of leaving the MQ future unanswered. Echoing the
+            # producer handle would make the originating process import its own
+            # IPC event, which is invalid on HIP.
+            logger.warning(
+                "Rejecting STORE for unregistered GPU instance ID %d",
+                instance_id,
+            )
+            return b"", False
+        try:
+            return self._store_registered(
+                entry, key, instance_id, gpu_block_ids, event_ipc_handle
+            )
+        finally:
+            self._release_context_entry(entry)
+
+    def _store_registered(
+        self,
+        entry: ContextEntry,
         key: IPCCacheServerKey,
         instance_id: int,
         gpu_block_ids: list[list[int]],
@@ -1074,19 +1243,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         st = time.perf_counter()
 
-        entry = self.get_and_touch_context_entry(instance_id)
-        if entry is None:
-            # The worker can reconnect to a replacement server before its next
-            # registration probe. No device work was submitted in that window,
-            # so return an empty completion-event handle and a terminal False
-            # response instead of leaving the MQ future unanswered. Echoing the
-            # producer handle would make the originating process import its own
-            # IPC event, which is invalid on HIP.
-            logger.warning(
-                "Rejecting STORE for unregistered GPU instance ID %d",
-                instance_id,
-            )
-            return b"", False
         cache_context = entry.cache_context
         model_name = entry.model_name
         event_backend = entry.event_backend
@@ -1241,7 +1397,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             finally:
                 event_backend.record_event(event, cache_context.stream)
                 # Fail closed: commit the reserved objects only when every chunk
-                # copied successfully; otherwise the whole store is skipped.
+                # copied successfully; otherwise release every reservation after
+                # any already-enqueued copies stop using their backing memory.
                 stored_count = len(all_dict) if store_succeeded else 0
                 if stored_count:
                     submit_callback_to_stream(
@@ -1251,6 +1408,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     )
                 else:
                     total_bytes = 0
+                    if all_dict:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "abort_write",
+                            list(all_dict.keys()),
+                        )
                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
@@ -1289,6 +1452,66 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         event_ipc_handle: bytes,
         skip_first_n_tokens: int = 0,
     ) -> tuple[bytes, bool]:
+        """Retrieve registered GPU KV blocks while leasing their cache context.
+
+        Args:
+            key: IPC key describing the KV cache range.
+            instance_id: Registered worker instance ID.
+            gpu_block_ids: Destination GPU block IDs indexed by kernel group.
+            event_ipc_handle: Producer event handle to wait on.
+            skip_first_n_tokens: Leading tokens that must not be overwritten.
+
+        Returns:
+            Completion-event handle and whether retrieval succeeded. An
+            unregistered instance returns ``(b"", False)`` after releasing its
+            failed-retrieve locks.
+
+        Raises:
+            RuntimeError: If event IPC is unsupported or the registered
+                context has no event backend.
+        """
+        entry = self._acquire_context_entry(instance_id)
+        if entry is None:
+            # See store(): there is no completion event because no device work
+            # was submitted. The False result lets the caller recover or
+            # recompute without importing its own producer event.
+            logger.warning(
+                "Rejecting RETRIEVE for unregistered GPU instance ID %d",
+                instance_id,
+            )
+            try:
+                self._release_failed_retrieve_locks(key, instance_id)
+            except Exception:
+                # A cleanup failure must never suppress the terminal response:
+                # the client otherwise waits forever because blocking-handler
+                # exceptions are only logged by the MQ server.
+                logger.exception(
+                    "Failed to release RETRIEVE locks for unregistered "
+                    "GPU instance ID %d",
+                    instance_id,
+                )
+            return b"", False
+        try:
+            return self._retrieve_registered(
+                entry,
+                key,
+                instance_id,
+                gpu_block_ids,
+                event_ipc_handle,
+                skip_first_n_tokens,
+            )
+        finally:
+            self._release_context_entry(entry)
+
+    def _retrieve_registered(
+        self,
+        entry: ContextEntry,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        gpu_block_ids: list[list[int]],
+        event_ipc_handle: bytes,
+        skip_first_n_tokens: int = 0,
+    ) -> tuple[bytes, bool]:
         """Retrieve the CPU KV cache and put into GPU blocks.
 
         Args:
@@ -1314,27 +1537,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         st = time.perf_counter()
 
-        entry = self.get_and_touch_context_entry(instance_id)
-        if entry is None:
-            # See store(): there is no completion event because no device work
-            # was submitted. The False result lets the caller recover or
-            # recompute without importing its own producer event.
-            logger.warning(
-                "Rejecting RETRIEVE for unregistered GPU instance ID %d",
-                instance_id,
-            )
-            try:
-                self._release_failed_retrieve_locks(key, instance_id)
-            except Exception:
-                # A cleanup failure must never suppress the terminal response:
-                # the client otherwise waits forever because blocking-handler
-                # exceptions are only logged by the MQ server.
-                logger.exception(
-                    "Failed to release RETRIEVE locks for unregistered "
-                    "GPU instance ID %d",
-                    instance_id,
-                )
-            return b"", False
         cache_context = entry.cache_context
         model_name = entry.model_name
         event_backend = entry.event_backend
@@ -1403,6 +1605,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     num_chunks,
                     blocks_per_chunk,
                 )
+                try:
+                    self._release_failed_retrieve_locks(key, instance_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to release RETRIEVE locks after block ID "
+                        "underflow for request_id=%s",
+                        key.request_id,
+                    )
                 event_backend.record_event(event, cache_context.stream)
                 return event_backend.export_event(event, cache_context.device), False
 
@@ -1441,10 +1651,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
             retrieve_succeeded = True
+            last_attempted_group = -1
             try:
                 for obj_group_id in range(num_object_groups):
                     if obj_group_id in skipped_groups:
                         continue
+                    last_attempted_group = obj_group_id
                     skip = group_skips[obj_group_id]
                     in_window_keys = obj_keys_per_obj_group[obj_group_id][skip:]
                     with self._ctx.storage_manager.read_prefetched_results(
@@ -1488,6 +1700,22 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         "finish_read_prefetched",
                         prefetched_keys,
                     )
+                if not retrieve_succeeded:
+                    untouched_keys = [
+                        obj_key
+                        for group_id in range(
+                            last_attempted_group + 1, num_object_groups
+                        )
+                        if group_id not in skipped_groups
+                        for obj_key in obj_keys_per_obj_group[group_id][
+                            group_skips[group_id] :
+                        ]
+                    ]
+                    if untouched_keys:
+                        self._ctx.storage_manager.finish_read_prefetched(
+                            untouched_keys,
+                            read_locks=1,
+                        )
                 num_tokens = (
                     num_chunks * self._ctx.chunk_size
                     if len(prefetched_keys) == expected_retained

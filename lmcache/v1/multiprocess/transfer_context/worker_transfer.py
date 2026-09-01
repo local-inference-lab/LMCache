@@ -19,6 +19,7 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints, get_device
 from lmcache.v1.multiprocess.custom_types import (
     EngineDrivenGroupLayout,
+    KVCache,
     RegisterEngineDrivenContextPayload,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
@@ -130,8 +131,19 @@ class MPTransferMode(str, Enum):
     LMCACHE_DRIVEN = "lmcache_driven"
 
 
-def _resolve_mode(mode: "str | MPTransferMode | None") -> MPTransferMode:
-    """Coerce ``mode`` into :class:`MPTransferMode`, falling back to env."""
+def resolve_transfer_mode(mode: "str | MPTransferMode | None") -> MPTransferMode:
+    """Resolve an explicit or environment-configured transfer mode.
+
+    Args:
+        mode: Explicit mode, or ``None`` to read
+            :data:`ENV_MP_TRANSFER_MODE` and default to ``auto``.
+
+    Returns:
+        The normalized transfer-mode enum.
+
+    Raises:
+        ValueError: If the configured value is not a supported mode.
+    """
     raw = (
         mode
         if mode is not None
@@ -489,6 +501,9 @@ class LMCacheDrivenTransferContext(TransferContext):
         self._device: torch.device | None = None
         self._event_backend: EventIPCBackend | None = None
         self._mq_timeout: float | None = None
+        # Exporter-side cuMem wrappers retain broker leases for as long as the
+        # server registration may request duplicate allocation FDs.
+        self._ipc_wrappers: KVCache = []
         # The server reads paged KV asynchronously through exported device
         # handles. Keep outstanding stores alive here so preemption can wait
         # for the actual remote reads before vLLM reuses their blocks. This
@@ -537,22 +552,42 @@ class LMCacheDrivenTransferContext(TransferContext):
         event_backend = get_event_ipc_backend(device)
         event_backend.check_event_support(device)
 
+        wrappers = wrap_kv_caches(kv_caches)
+        try:
+            future = send_request(
+                mq_client,
+                RequestType.REGISTER_KV_CACHE,
+                [
+                    instance_id,
+                    wrappers,
+                    model_name,
+                    world_size,
+                    engine_type,
+                    layout_hints,
+                    list(engine_group_infos),
+                ],
+            )
+            future.result(timeout=mq_timeout)
+        except BaseException as registration_exc:
+            close_errors: list[BaseException] = []
+            for wrapper in wrappers:
+                try:
+                    wrapper.close()
+                except BaseException as close_exc:
+                    close_errors.append(close_exc)
+            if close_errors:
+                raise RuntimeError(
+                    f"KV cache registration failed and "
+                    f"{len(close_errors)} exporter lease(s) failed to close"
+                ) from registration_exc
+            raise
+
+        old_wrappers = self._ipc_wrappers
+        self._ipc_wrappers = wrappers
+        for wrapper in old_wrappers:
+            wrapper.close()
         self._mq_client = mq_client
         self._send_request = send_request
-        future = send_request(
-            mq_client,
-            RequestType.REGISTER_KV_CACHE,
-            [
-                instance_id,
-                wrap_kv_caches(kv_caches),
-                model_name,
-                world_size,
-                engine_type,
-                layout_hints,
-                list(engine_group_infos),
-            ],
-        )
-        future.result(timeout=mq_timeout)
         self._device = device
         self._event_backend = event_backend
         self._mq_timeout = mq_timeout
@@ -719,13 +754,27 @@ class LMCacheDrivenTransferContext(TransferContext):
         ).to_device_future(device=self._device)
 
     def close(self) -> None:
-        """Release the message queue and cached event-backend state."""
+        """Release exporter leases, message queue, and event-backend state."""
+        close_errors: list[BaseException] = []
+        remaining: KVCache = []
+        for wrapper in self._ipc_wrappers:
+            try:
+                wrapper.close()
+            except BaseException as exc:
+                close_errors.append(exc)
+                remaining.append(wrapper)
+        self._ipc_wrappers = remaining
         self._mq_client = None
         self._send_request = None
         self._device = None
         self._event_backend = None
         self._mq_timeout = None
         self._inflight_store_futures.clear()
+        if close_errors:
+            raise RuntimeError(
+                f"LMCache-driven exporter cleanup failed with "
+                f"{len(close_errors)} error(s)"
+            ) from close_errors[0]
 
     def flush_inflight_stores(self) -> None:
         """Wait for server-side device reads that preemption could overwrite.
@@ -793,6 +842,7 @@ class EngineDrivenTransferContext(TransferContext):
                     out=(out_buffers[group_idx] if out_buffers is not None else None),
                     chunk_indices=indices,
                     blocks_per_window=group.layout.blocks_per_window,
+                    group_idx=group.layout.object_group_id,
                 )
             )
         return payloads
@@ -804,7 +854,7 @@ class EngineDrivenTransferContext(TransferContext):
         group_payloads: list[list[torch.Tensor]],
         skip_first_n_tokens: int,
     ) -> None:
-        """Validate all group payloads before scheduling any destination writes."""
+        """Validate and scatter each group's retained payload suffix."""
         num_chunks = _validate_group_block_ids(self._worker_groups, block_ids)
         if len(group_payloads) != len(self._worker_groups):
             raise ValueError("retrieve payload does not cover every registered group")
@@ -812,10 +862,15 @@ class EngineDrivenTransferContext(TransferContext):
         for group_idx, (group, payloads) in enumerate(
             zip(self._worker_groups, group_payloads, strict=True)
         ):
-            if len(payloads) != num_chunks:
+            retained_chunks = (
+                num_chunks
+                if group.layout.num_chunks_in_window < 0
+                else min(num_chunks, group.layout.num_chunks_in_window)
+            )
+            if len(payloads) != retained_chunks:
                 raise ValueError(
                     f"group {group_idx} returned {len(payloads)} chunks; "
-                    f"expected {num_chunks}"
+                    f"expected {retained_chunks}"
                 )
             expected_shape = torch.Size(group.layout.shape)
             expected_dtype = getattr(torch, group.layout.dtype_str)
@@ -831,7 +886,9 @@ class EngineDrivenTransferContext(TransferContext):
         for group_idx, (group, payloads) in enumerate(
             zip(self._worker_groups, group_payloads, strict=True)
         ):
-            group_block_ids = block_ids[group_idx]
+            skipped_chunks = num_chunks - len(payloads)
+            skipped_blocks = skipped_chunks * group.layout.blocks_per_chunk
+            group_block_ids = block_ids[group_idx][skipped_blocks:]
             if group.layout.group_kind == "recurrent" and skip_first_n_tokens == 0:
                 payloads, group_block_ids = _collapse_chunks_for_single_destination(
                     payloads,
@@ -842,8 +899,9 @@ class EngineDrivenTransferContext(TransferContext):
             physical_block_size = (
                 group.layout.shape[-2] // group.layout.blocks_per_window
             )
+            skipped_logical_tokens = skipped_blocks * group.layout.tokens_per_block
             physical_skip = (
-                skip_first_n_tokens
+                max(0, skip_first_n_tokens - skipped_logical_tokens)
                 * physical_block_size
                 // group.layout.tokens_per_block
             )
@@ -856,6 +914,7 @@ class EngineDrivenTransferContext(TransferContext):
                 layout_hints=self._layout_hints,
                 engine_kv_format=group.engine_kv_format,
                 blocks_per_window=group.layout.blocks_per_window,
+                group_idx=group.layout.object_group_id,
             )
 
     @property
@@ -1351,7 +1410,7 @@ def create_transfer_context(
             f"All KV cache tensors must share one device type, got {device_types}"
         )
     device_type = next(iter(device_types))
-    resolved_mode = _resolve_mode(mode)
+    resolved_mode = resolve_transfer_mode(mode)
     logger.info(
         "Creating transfer context (device_type=%s, mode=%s)",
         device_type,

@@ -307,6 +307,40 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             [group.object_group_id for group in context.effective_group_layouts],
         )
 
+    def _resolve_retrieve_group_obj_keys(
+        self, key: IPCCacheServerKey, context: EngineDrivenContextMetadata
+    ) -> list[list[ObjectKey]]:
+        """Resolve only the retained suffix of each hybrid retrieve group.
+
+        Args:
+            key: Cache key for the logical token range to retrieve.
+            context: Registered transfer metadata containing per-group windows.
+
+        Returns:
+            Object-key groups in registration order. Full-attention groups
+            retain every key; finite-window groups retain their newest keys.
+
+        Raises:
+            ValueError: If grouped metadata and resolved key groups disagree.
+        """
+        obj_key_groups = self._resolve_group_obj_keys(key, context)
+        if not context.group_layouts:
+            return obj_key_groups
+        if len(obj_key_groups) != len(context.group_layouts):
+            raise ValueError(
+                "resolved object-key groups do not match registered group layouts"
+            )
+        return [
+            (
+                obj_keys
+                if layout.num_chunks_in_window < 0
+                else obj_keys[-layout.num_chunks_in_window :]
+            )
+            for layout, obj_keys in zip(
+                context.group_layouts, obj_key_groups, strict=True
+            )
+        ]
+
     def register_kv_cache_engine_driven_context(
         self,
         payload: RegisterEngineDrivenContextPayload,
@@ -611,7 +645,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
-            resolve_obj_keys=lambda transfer_key: self._resolve_group_obj_keys(
+            resolve_obj_keys=lambda transfer_key: self._resolve_retrieve_group_obj_keys(
                 transfer_key, entry.metadata
             ),
         )

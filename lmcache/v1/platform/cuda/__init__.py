@@ -64,6 +64,8 @@ def _select_ipc_wrapper_cls() -> "type[DeviceIPCWrapper]":
         :class:`RawCudaIPCWrapper` (driver-level CUDA IPC mem handles,
         no shared ``/dev/shm`` assumed) when isolated IPC is enabled,
         otherwise :class:`CudaIPCWrapper` (PyTorch storage IPC).
+        Both factories select ``CuMemCudaIPCWrapper`` for a live vLLM
+        VMM allocation.
     """
 
     # First Party
