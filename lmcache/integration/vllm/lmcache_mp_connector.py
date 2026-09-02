@@ -308,6 +308,33 @@ class LMCacheMPRequestTracker:
     def increase_num_scheduled_tokens(self, num_new_tokens: int):
         self.num_scheduled_tokens += num_new_tokens
 
+    def anchor_num_scheduled_tokens(
+        self, engine_num_computed_tokens: int, num_new_tokens: int
+    ) -> None:
+        """Set the computed-token bound from the scheduler's own count.
+
+        ``engine_num_computed_tokens`` is the request's ``num_computed_tokens``
+        as the scheduler reports it in the scheduler output: it already
+        includes the prefix-cache and external hits and has been rewound for
+        every draft token rejected in earlier steps. After the current step
+        the engine will have computed ``engine_num_computed_tokens +
+        num_new_tokens`` tokens; ``num_scheduled_tokens`` holds that count
+        minus the hit prefix so ``GetStoreMetadata`` can keep adding the
+        larger hit count back. Accumulating the scheduled counts instead
+        (``increase_num_scheduled_tokens``) drifts upward by the number of
+        rejected draft tokens, which only the ``len(all_token_ids)`` bound
+        then keeps out of the store range.
+
+        Args:
+            engine_num_computed_tokens: ``num_computed_tokens`` of the request
+                in the scheduler output for this step.
+            num_new_tokens: tokens scheduled for the request in this step.
+        """
+        hit_tokens = max(self.num_vllm_hit_tokens, self.num_lmcache_hit_tokens)
+        self.num_scheduled_tokens = max(
+            0, engine_num_computed_tokens + num_new_tokens - hit_tokens
+        )
+
     def increase_num_stored_tokens(self, num_new_tokens: int):
         """Increase the number of stored tokens for the current request
         This function will be called when processing the cached requests.
@@ -415,6 +442,13 @@ class LMCacheMPRequestMetadata:
             if num_engine_groups > 0
             else 0
         )
+        # ``len(all_token_ids)`` is the safety bound when engine steps overlap
+        # (asynchronous scheduling, pipeline parallelism): the scheduler
+        # appends a sampled token only after the step that verified it,
+        # while ``num_computed_tokens`` (hence ``computed_tokens``) already
+        # counts the placeholders of a step still in flight. A store window
+        # therefore never covers a position whose KV a running or rejected
+        # draft step could still rewrite.
         min_available_tokens = min(
             len(tracker.all_token_ids),
             allocated_tokens,
@@ -568,6 +602,11 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
         self.need_flush_before_forward: bool = False
+        # Retrieves the scheduler expected but could not issue (tracker /
+        # allocation desync): ``(request_id, flat block ids)`` pairs the
+        # worker reports as failed loads so vLLM recomputes instead of
+        # waiting forever for a load that was never submitted.
+        self.suppressed_retrieves: list[tuple[str, list[int]]] = []
 
     def add_request_metadata(self, request_metadata: LMCacheMPRequestMetadata):
         self.requests.append(request_metadata)
@@ -859,6 +898,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         ops = []
         cache_salts = []
 
+        for request_id, flat_block_ids in getattr(
+            metadata, "suppressed_retrieves", []
+        ):
+            self.worker_adapter.fail_retrieve(request_id, flat_block_ids)
         for meta in metadata.requests:
             if meta.direction != "RETRIEVE":
                 continue
@@ -1363,6 +1406,20 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if r_metadata is not None:
                 metadata.add_request_metadata(r_metadata)
+            else:
+                # The request is WAITING_FOR_REMOTE_KVS in the scheduler and
+                # only leaves that state through get_finished(); without a
+                # submitted retrieve nothing would ever report it. Hand the
+                # worker its allocated blocks so the load is reported failed
+                # and the scheduler recomputes.
+                flat_block_ids = [
+                    block_id
+                    for group_blocks in request_tracker.allocated_block_ids.values()
+                    for block_id in group_blocks
+                ]
+                metadata.suppressed_retrieves.append(
+                    (request_tracker.request_id, flat_block_ids)
+                )
             request_tracker.state = LMCacheMPRequestState.READY
 
     def _process_new_requests(
@@ -1376,7 +1433,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             request_tracker = self._get_request_tracker(new_request.req_id)
 
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
-            request_tracker.increase_num_scheduled_tokens(num_new_tokens)
+            request_tracker.anchor_num_scheduled_tokens(
+                new_request.num_computed_tokens, num_new_tokens
+            )
 
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
@@ -1402,10 +1461,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             if request_id not in cached_reqs.resumed_req_ids:
                 request_tracker.append_block_ids(new_block_ids)
 
-            # Use the incremental num_scheduled_tokens to
-            # stay consistent with _process_new_requests.
+            # Anchor on the scheduler's num_computed_tokens (rewound for
+            # rejected draft tokens) rather than accumulating scheduled
+            # counts; see anchor_num_scheduled_tokens.
             num_new_tokens = scheduler_output.num_scheduled_tokens[request_id]
-            request_tracker.increase_num_scheduled_tokens(num_new_tokens)
+            request_tracker.anchor_num_scheduled_tokens(
+                cached_reqs.num_computed_tokens[idx], num_new_tokens
+            )
 
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
