@@ -278,9 +278,14 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             write_obj_keys = [self._pending_shm_writes.pop(k) for k in stale_writes]
             read_obj_keys = [self._pending_shm_reads.pop(k) for k in stale_reads]
 
+        # A pending write is a reservation the worker never committed; its
+        # objects hold uninitialized memory. Finishing the write would publish
+        # them as cache hits (and the store controller would persist them to
+        # L2), so they are force-deleted instead, as the pickle path does for
+        # its leftover reservations.
         for obj_keys in write_obj_keys:
             if obj_keys:
-                self._ctx.storage_manager.finish_write(obj_keys)
+                self._ctx.storage_manager.delete_l1_keys(obj_keys, force=True)
         for obj_keys in read_obj_keys:
             if obj_keys:
                 self._ctx.storage_manager.finish_read_prefetched(obj_keys)

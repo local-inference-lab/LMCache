@@ -607,3 +607,45 @@ class TestConfigPlumbing:
                 ),
                 eviction_config=eviction_config,
             )
+
+
+class TestAbandonedWritesDuringFlush:
+    def test_abandoned_reservation_is_discarded_not_preserved(self):
+        """An expired, never-finished reservation in an eviction batch is
+        freed instead of being carried in L1 forever; committed keys in the
+        same batch are flushed and deleted as usual."""
+        config = L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(
+                size_in_bytes=POOL_BYTES,
+                use_lazy=False,
+                init_size_in_bytes=POOL_BYTES,
+                align_bytes=0x1000,
+            ),
+            write_ttl_seconds=1,
+            read_ttl_seconds=300,
+        )
+        l1_manager = L1Manager(config)
+        try:
+            adapter = FakeSyncStoreAdapter()
+            controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
+            committed, abandoned = _make_keys(2)
+            result = l1_manager.reserve_write(
+                [committed, abandoned], [False, False], OBJECT_LAYOUT
+            )
+            assert result[committed][0] == L1Error.SUCCESS
+            assert result[abandoned][0] == L1Error.SUCCESS
+            l1_manager.finish_write([committed])
+            time.sleep(1.2)  # the abandoned reservation's write lock expires
+
+            controller.execute_eviction_action(
+                EvictionAction(
+                    keys=[committed, abandoned],
+                    destination=EvictionDestination.L2_CACHE,
+                )
+            )
+
+            assert adapter.stored_batches == [[committed]]
+            assert l1_manager.get_object_state(committed) is None
+            assert l1_manager.get_object_state(abandoned) is None
+        finally:
+            l1_manager.close()
