@@ -50,6 +50,7 @@ def test_legacy_and_current_key_shapes(wire_key, filename, tmp_path):
 
         assert completed_id == future_id
         assert ok, error
-        assert (tmp_path / filename).read_bytes() == payload
+        # The object file is the payload followed by the integrity trailer.
+        assert (tmp_path / filename).read_bytes()[: len(payload)] == payload
     finally:
         client.close()

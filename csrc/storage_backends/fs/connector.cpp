@@ -7,9 +7,57 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <algorithm>
+#if defined(__x86_64__) || defined(__i386__)
+#include <nmmintrin.h>
+#define LMCACHE_HAVE_SSE42_CRC 1
+#endif
 
 namespace {
 std::atomic<uint64_t> next_temp_file_id{0};
+
+// Software CRC-32C: reflected polynomial 0x82F63B78, byte table built once.
+struct Crc32cTable {
+  uint32_t table[256];
+  Crc32cTable() {
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; ++k) c = (c & 1) ? (0x82F63B78U ^ (c >> 1)) : (c >> 1);
+      table[i] = c;
+    }
+  }
+};
+
+uint32_t crc32c_software(uint32_t crc, const uint8_t* p, size_t len) {
+  static const Crc32cTable t;
+  while (len--) crc = t.table[(crc ^ *p++) & 0xFFU] ^ (crc >> 8);
+  return crc;
+}
+
+#ifdef LMCACHE_HAVE_SSE42_CRC
+__attribute__((target("sse4.2"))) uint32_t crc32c_hardware(uint32_t crc,
+                                                           const uint8_t* p,
+                                                           size_t len) {
+  while (len >= 8) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    crc = static_cast<uint32_t>(_mm_crc32_u64(crc, v));
+    p += 8;
+    len -= 8;
+  }
+  while (len--) crc = _mm_crc32_u8(crc, *p++);
+  return crc;
+}
+#endif
+
+bool crc32c_hardware_available() {
+#ifdef LMCACHE_HAVE_SSE42_CRC
+  static const bool available = __builtin_cpu_supports("sse4.2");
+  return available;
+#else
+  return false;
+#endif
+}
 
 // O_DIRECT requires the buffer ADDRESS to be block-aligned as well as the
 // length; a misaligned address fails the read/write with EINVAL. Buffers
@@ -23,6 +71,20 @@ bool odirect_eligible(const void* buf, size_t len, size_t disk_block_size) {
 
 namespace lmcache {
 namespace connector {
+
+uint32_t crc32c_update(uint32_t state, const void* data, size_t len) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+#ifdef LMCACHE_HAVE_SSE42_CRC
+  if (crc32c_hardware_available()) {
+    return crc32c_hardware(state, p, len);
+  }
+#endif
+  return crc32c_software(state, p, len);
+}
+
+uint32_t crc32c(const void* data, size_t len) {
+  return crc32c_finish(crc32c_update(crc32c_begin(), data, len));
+}
 
 // ---------------------------------------------------------------
 // Helpers
@@ -203,23 +265,31 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
                              ": " + strerror(errno));
   }
 
+  // The payload is read in slices and each slice is folded into the
+  // checksum while it is still cache-resident, so verification costs one
+  // pass over cache-hot memory instead of a second pass over the whole
+  // object. A configured read_ahead_size sets the first slice so the
+  // filesystem readahead is triggered as before.
+  uint32_t crc_state = crc32c_begin();
   try {
-    size_t n;
-    if (conn.read_ahead_size > 0 && len > conn.read_ahead_size) {
-      // Trigger filesystem readahead with a small initial
-      // read, then read the remainder.
-      size_t ra = conn.read_ahead_size;
-      size_t n_head = read_all(fd, buf, ra);
-      if (n_head < ra) {
-        // Short read on the head portion — treat as
-        // incomplete
-        n = n_head;
-      } else {
-        size_t n_tail = read_all(fd, static_cast<char*>(buf) + ra, len - ra);
-        n = n_head + n_tail;
+    size_t n = 0;
+    char* out = static_cast<char*>(buf);
+    size_t first = (conn.read_ahead_size > 0 && len > conn.read_ahead_size)
+                       ? conn.read_ahead_size
+                       : std::min(len, READ_SLICE_BYTES);
+    if (do_odirect && conn.disk_block_size > 0) {
+      first = std::max(first, conn.disk_block_size) / conn.disk_block_size *
+              conn.disk_block_size;
+    }
+    while (n < len) {
+      size_t want = (n == 0) ? first : std::min(len - n, READ_SLICE_BYTES);
+      if (do_odirect && conn.disk_block_size > 0 && n + want < len) {
+        want = want / conn.disk_block_size * conn.disk_block_size;
       }
-    } else {
-      n = read_all(fd, buf, len);
+      size_t got = read_all(fd, out + n, want);
+      crc_state = crc32c_update(crc_state, out + n, got);
+      n += got;
+      if (got < want) break;  // EOF
     }
     if (n != len) {
       throw std::runtime_error("incomplete read for " + file_path.string() +
@@ -231,6 +301,47 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
     throw;
   }
   ::close(fd);
+  verify_trailer(file_path, len, crc32c_finish(crc_state));
+}
+
+// Verify the integrity trailer of a published object against the checksum
+// of the payload that was just read. The trailer is read through a separate
+// buffered descriptor so O_DIRECT alignment rules never apply to it.
+void FSConnector::verify_trailer(const std::filesystem::path& file_path,
+                                 size_t len, uint32_t payload_crc) {
+  struct stat st;
+  if (::stat(file_path.c_str(), &st) != 0) {
+    throw std::runtime_error("stat failed: " + file_path.string() + ": " +
+                             strerror(errno));
+  }
+  const uint64_t file_size = static_cast<uint64_t>(st.st_size);
+  if (file_size == len) {
+    return;  // object written before trailers existed: accepted unverified
+  }
+  if (file_size != len + sizeof(ObjectTrailer)) {
+    throw std::runtime_error("object size mismatch for " + file_path.string() +
+                             ": payload " + std::to_string(len) + ", file " +
+                             std::to_string(file_size));
+  }
+  int fd = ::open(file_path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    throw std::runtime_error("open for trailer failed: " + file_path.string() +
+                             ": " + strerror(errno));
+  }
+  ObjectTrailer trailer;
+  ssize_t got = ::pread(fd, &trailer, sizeof(trailer), static_cast<off_t>(len));
+  ::close(fd);
+  if (got != static_cast<ssize_t>(sizeof(trailer))) {
+    throw std::runtime_error("trailer read failed for " + file_path.string());
+  }
+  if (trailer.magic != OBJECT_TRAILER_MAGIC || trailer.payload_len != len) {
+    throw std::runtime_error("trailer mismatch for " + file_path.string());
+  }
+  if (payload_crc != trailer.crc32c) {
+    throw std::runtime_error("checksum mismatch for " + file_path.string() +
+                             ": stored " + std::to_string(trailer.crc32c) +
+                             ", computed " + std::to_string(payload_crc));
+  }
 }
 
 void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
@@ -278,8 +389,21 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
                              file_path.string());
   }
 
+  uint32_t crc_state = crc32c_begin();
   try {
-    write_all(fd, buf, len);
+    // Written in slices; each slice is folded into the checksum right after
+    // it is handed to the kernel, while it is still cache-resident.
+    const char* in = static_cast<const char*>(buf);
+    size_t off = 0;
+    while (off < len) {
+      size_t want = std::min(len - off, READ_SLICE_BYTES);
+      if (do_odirect && conn.disk_block_size > 0 && off + want < len) {
+        want = want / conn.disk_block_size * conn.disk_block_size;
+      }
+      write_all(fd, in + off, want);
+      crc_state = crc32c_update(crc_state, in + off, want);
+      off += want;
+    }
     if (::close(fd) != 0) {
       const int close_errno = errno;
       fd = -1;
@@ -287,6 +411,7 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
                                std::string(strerror(close_errno)));
     }
     fd = -1;
+    append_trailer_and_sync(tmp_path, len, crc32c_finish(crc_state));
   } catch (...) {
     if (fd >= 0) ::close(fd);
     std::filesystem::remove(tmp_path);
@@ -311,6 +436,56 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
     fprintf(stderr, "[LMCache SET] temporary file cleanup failed: %s: %s\n",
             tmp_path.c_str(), remove_ec.message().c_str());
   }
+  sync_directory(file_path.parent_path());
+}
+
+// Append the integrity trailer through a buffered descriptor (the payload
+// may have been written with O_DIRECT, whose alignment rules the 16-byte
+// trailer cannot meet) and make the whole inode durable before it is
+// published. A crash between the payload write and the publish leaves only
+// an unlinked temporary file behind.
+void FSConnector::append_trailer_and_sync(const std::filesystem::path& tmp_path,
+                                          size_t len, uint32_t payload_crc) {
+  ObjectTrailer trailer;
+  trailer.magic = OBJECT_TRAILER_MAGIC;
+  trailer.crc32c = payload_crc;
+  trailer.payload_len = static_cast<uint64_t>(len);
+  int fd = ::open(tmp_path.c_str(), O_WRONLY | O_APPEND);
+  if (fd < 0) {
+    throw std::runtime_error("open for trailer failed: " + tmp_path.string() +
+                             ": " + strerror(errno));
+  }
+  try {
+    write_all(fd, &trailer, sizeof(trailer));
+    if (::fsync(fd) != 0) {
+      throw std::runtime_error("fsync failed: " + tmp_path.string() + ": " +
+                               strerror(errno));
+    }
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  if (::close(fd) != 0) {
+    throw std::runtime_error("close after trailer failed: " +
+                             tmp_path.string() + ": " + strerror(errno));
+  }
+}
+
+// Make a published directory entry durable. Failure here does not affect
+// the object's correctness (the file is complete and verified on load), so
+// it is reported rather than raised.
+void FSConnector::sync_directory(const std::filesystem::path& dir) {
+  int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+  if (dfd < 0) {
+    fprintf(stderr, "[LMCache SET] directory open for fsync failed: %s: %s\n",
+            dir.c_str(), strerror(errno));
+    return;
+  }
+  if (::fsync(dfd) != 0) {
+    fprintf(stderr, "[LMCache SET] directory fsync failed: %s: %s\n",
+            dir.c_str(), strerror(errno));
+  }
+  ::close(dfd);
 }
 
 bool FSConnector::do_single_exists(WorkerFSConn& conn, const std::string& key) {
