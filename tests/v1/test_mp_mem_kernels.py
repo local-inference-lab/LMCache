@@ -580,6 +580,101 @@ def test_block_transfer_roundtrip_packed_nvfp4_page():
             assert torch.count_nonzero(target_pool[padding_start:padding_end]) == 0
 
 
+def test_block_transfer_roundtrip_mamba_dcp1_opaque_page():
+    """The exact GLM-5.3-Flash DCP1 state-page width round-trips whole."""
+    device = torch.device(torch_device_type)
+    nl, nb, bs, nh, hs = 2, 6, 1, 1, 1_085_440
+    block_stride_elems = hs + 64
+    slots_per_object = 1
+    num_objects = 2
+    total_blocks = slots_per_object * num_objects
+
+    source_pools = [
+        torch.zeros(nb * block_stride_elems, dtype=torch.uint8, device=device)
+        for _ in range(nl)
+    ]
+    for layer_idx, pool in enumerate(source_pools):
+        for block_idx in range(nb):
+            page_start = block_idx * block_stride_elems
+            page_end = page_start + hs
+            fill_value = (17 * layer_idx + block_idx + 1) % 251
+            pool[page_start:page_end].fill_(fill_value)
+            pool[page_start : page_start + 32] = torch.arange(
+                32, dtype=torch.uint8, device=device
+            ) + (layer_idx * 32)
+    target_pools = [
+        torch.zeros(nb * block_stride_elems, dtype=torch.uint8, device=device)
+        for _ in range(nl)
+    ]
+    source_vllm = [
+        pool.as_strided(
+            (nb, bs, hs),
+            (block_stride_elems, hs, 1),
+        )
+        for pool in source_pools
+    ]
+    target_vllm = [
+        pool.as_strided(
+            (nb, bs, hs),
+            (block_stride_elems, hs, 1),
+        )
+        for pool in target_pools
+    ]
+    mem_objects = create_memory_objects(
+        1,
+        nl,
+        slots_per_object,
+        hs,
+        num_objects,
+        torch.uint8,
+        device,
+    )
+
+    block_ids_d2h = list(range(total_blocks))
+    block_ids_h2d = list(range(total_blocks, 2 * total_blocks))
+    call_block_kernel(
+        source_vllm,
+        mem_objects,
+        block_ids_d2h,
+        FMT_MLA,
+        lmcache_native.TransferDirection.D2H,
+        nl,
+        nb,
+        bs,
+        nh,
+        hs,
+        True,
+        slots_per_object,
+        block_stride_elems=block_stride_elems,
+    )
+    call_block_kernel(
+        target_vllm,
+        mem_objects,
+        block_ids_h2d,
+        FMT_MLA,
+        lmcache_native.TransferDirection.H2D,
+        nl,
+        nb,
+        bs,
+        nh,
+        hs,
+        True,
+        slots_per_object,
+        block_stride_elems=block_stride_elems,
+    )
+    torch_dev.synchronize()
+
+    for src_block, dst_block in zip(block_ids_d2h, block_ids_h2d, strict=True):
+        for source, target in zip(source_vllm, target_vllm, strict=True):
+            assert torch.equal(target[dst_block], source[src_block])
+
+    for target_pool in target_pools:
+        for block_idx in block_ids_h2d:
+            padding_start = block_idx * block_stride_elems + hs
+            padding_end = (block_idx + 1) * block_stride_elems
+            assert torch.count_nonzero(target_pool[padding_start:padding_end]) == 0
+
+
 @pytest.mark.parametrize(
     "engine_kv_format,nl,nh,hs,is_mla",
     FORMAT_PARAMS,
