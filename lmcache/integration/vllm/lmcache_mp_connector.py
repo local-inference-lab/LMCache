@@ -5,7 +5,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import enum
+import hashlib
 import math
+import os
 import sys
 
 # Third Party
@@ -50,6 +52,10 @@ from lmcache.integration.vllm.kv_cache_groups import (
 )
 from lmcache.integration.vllm.utils import mla_enabled, vllm_layout_hints
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.distributed.api import (
+    CACHE_SALT_FORBIDDEN_CHARS,
+    CACHE_SALT_MAX_LEN,
+)
 from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
 
 try:
@@ -100,6 +106,77 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+CACHE_NAMESPACE_ENV = "LMCACHE_CACHE_NAMESPACE"
+"""Deployment-wide namespace for every LMCache key this server reads or
+writes. Its value becomes the leading component of each request's
+``cache_salt``, so entries written by a server configured with another
+namespace can never be looked up. The literal ``legacy`` selects the empty
+salt and keeps entries written before namespaces existed reachable."""
+
+CACHE_NAMESPACE_REQUIRED_ENV = "LMCACHE_REQUIRE_CACHE_NAMESPACE"
+"""When ``1``, ``LMCACHE_CACHE_NAMESPACE`` must be set: a server whose
+launcher did not decide a namespace refuses to start instead of sharing keys
+with an unknown configuration."""
+
+CACHE_NAMESPACE_LEGACY = "legacy"
+_CACHE_SALT_MAX_LEN = CACHE_SALT_MAX_LEN
+_CACHE_SALT_FORBIDDEN = CACHE_SALT_FORBIDDEN_CHARS
+
+
+def resolve_cache_namespace() -> str:
+    """Return the cache namespace selected by the environment.
+
+    Returns:
+        The namespace string, or ``""`` for the legacy (unnamespaced) key
+        space.
+
+    Raises:
+        ValueError: The namespace is required but absent, empty, or contains
+            a character ``ObjectKey`` rejects in a cache salt.
+    """
+    required = os.environ.get(CACHE_NAMESPACE_REQUIRED_ENV, "0") == "1"
+    value = os.environ.get(CACHE_NAMESPACE_ENV)
+    if value is None or value == "":
+        if required:
+            raise ValueError(
+                f"{CACHE_NAMESPACE_ENV} is not set but "
+                f"{CACHE_NAMESPACE_REQUIRED_ENV}=1; the launcher must decide "
+                "the cache namespace before starting the engine"
+            )
+        return ""
+    if value == CACHE_NAMESPACE_LEGACY:
+        return ""
+    if _CACHE_SALT_FORBIDDEN & set(value):
+        raise ValueError(f"{CACHE_NAMESPACE_ENV} contains a forbidden character")
+    if len(value) > _CACHE_SALT_MAX_LEN - 2:
+        raise ValueError(f"{CACHE_NAMESPACE_ENV} is too long")
+    return value
+
+
+def compose_cache_salt(namespace: str, request_salt: str | None) -> str:
+    """Combine the server namespace with a request's own cache salt.
+
+    Args:
+        namespace: Value returned by :func:`resolve_cache_namespace`.
+        request_salt: The request's ``cache_salt`` (``None`` or ``""`` when
+            the client sent none).
+
+    Returns:
+        ``request_salt`` (or ``""``) when there is no namespace; otherwise the
+        namespace alone, or ``"<namespace>.<request_salt>"``. A request salt
+        that would push the result past the ``ObjectKey`` limit is replaced
+        by its SHA-256 hex digest so different client salts stay distinct.
+    """
+    request_salt = request_salt or ""
+    if not namespace:
+        return request_salt
+    if not request_salt:
+        return namespace
+    composed = f"{namespace}.{request_salt}"
+    if len(composed) > _CACHE_SALT_MAX_LEN:
+        composed = f"{namespace}.{hashlib.sha256(request_salt.encode()).hexdigest()}"
+    return composed
 
 
 # Helper functions
@@ -273,9 +350,9 @@ class LMCacheMPRequestTracker:
 
     cache_salt: str = ""
 
-    def __init__(self, request: "Request"):
+    def __init__(self, request: "Request", namespace: str = ""):
         self.request_id = request.request_id
-        self.cache_salt: str = request.cache_salt or ""
+        self.cache_salt: str = compose_cache_salt(namespace, request.cache_salt)
         self.all_token_ids = request.all_token_ids
         self.allocated_block_ids = {}
         self.num_stored_tokens = 0
@@ -647,6 +724,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         validate_kv_cache_groups(getattr(self, "_kv_cache_config", None))
 
         assert vllm_config.kv_transfer_config is not None
+
+        # Namespacing of every key (lookup, store, retrieve, lock release)
+        # through the request trackers' cache_salt; see CACHE_NAMESPACE_ENV.
+        self._cache_namespace = resolve_cache_namespace()
+        if self._cache_namespace:
+            logger.info("LMCache cache namespace: %s", self._cache_namespace)
 
         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
@@ -1505,7 +1588,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 self.request_trackers.pop(request_id)
 
         if request_id not in self.request_trackers:
-            new_tracker = LMCacheMPRequestTracker(request)
+            new_tracker = LMCacheMPRequestTracker(
+                request, namespace=self._cache_namespace
+            )
             self.request_trackers[request_id] = new_tracker
         return self.request_trackers[request_id]
 
