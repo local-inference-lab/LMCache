@@ -410,8 +410,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         No-op if the connector does not expose ``submit_batch_delete``
         or if the key list is empty. Keys currently lookup-locked by an
-        in-flight prefetch are skipped: the load task would race the
-        unlink and fail with a phantom not_found.
+        in-flight prefetch are skipped (the load task would race the
+        unlink and fail with a phantom not_found), and so are keys of
+        stores still in flight (see the comment below).
         """
         if not keys or not self._has_delete:
             return
@@ -422,13 +423,20 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             # A key becomes lookup-locked only when the native EXISTS
             # completion is demultiplexed. Protect pending lookup keys as
             # well, otherwise eviction can delete a key between lookup
-            # submission and lock acquisition. Filtering and delete submit
-            # stay in one critical section so a new lookup cannot enter that
-            # same gap.
+            # submission and lock acquisition. Keys of stores still in
+            # flight are protected too: deleting one while its write is
+            # pending either resurrects the object after the delete (the
+            # store publishes last) or, when the store completes after the
+            # unlink, records a size for a key that no longer exists and
+            # inflates usage accounting for the life of the process.
+            # Filtering and delete submit stay in one critical section so a
+            # new lookup or store cannot enter that same gap.
             protected_keys = set(self._locked_keys)
             for op_type, _task_id, _num_keys, op_keys in self._pending_ops.values():
                 if op_type == self._OP_LOOKUP and op_keys is not None:
                     protected_keys.update(op_keys)
+            for store_keys, _sizes, _reserved in self._pending_store_sizes.values():
+                protected_keys.update(store_keys)
 
             delete_keys = [key for key in keys if key not in protected_keys]
             skipped_count = len(keys) - len(delete_keys)

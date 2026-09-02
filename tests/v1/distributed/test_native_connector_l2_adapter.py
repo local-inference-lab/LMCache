@@ -192,6 +192,29 @@ class DeferredExistsConnector(MockNativeConnector):
         self._push_completion(fid, True, "", [key in self._store for key in keys])
 
 
+class DeferredSetConnector(MockNativeConnector):
+    """Hold SET completion to expose the delete-versus-in-flight-store race."""
+
+    def __init__(self):
+        super().__init__()
+        self.pending_set: tuple[int, list[str], list] | None = None
+
+    def submit_batch_set(self, keys: list[str], memoryviews: list) -> int:
+        with self._lock:
+            fid = self._next_id
+            self._next_id += 1
+        self.pending_set = (fid, list(keys), list(memoryviews))
+        return fid
+
+    def complete_set(self) -> None:
+        assert self.pending_set is not None
+        fid, keys, memoryviews = self.pending_set
+        self.pending_set = None
+        for key, view in zip(keys, memoryviews, strict=True):
+            self._store[key] = bytes(view)
+        self._push_completion(fid, True, "", [True] * len(keys))
+
+
 # =============================================================================
 # Test Fixtures
 # =============================================================================
@@ -1309,6 +1332,31 @@ class TestDeleteInterface:
             wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
             assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
             adapter.submit_unlock([key])
+        finally:
+            adapter.close()
+
+    def test_delete_skips_keys_of_a_store_in_flight(self):
+        """A key whose store has been submitted but not completed is not
+        deleted; its accounting is intact once the store completes, and it
+        is deletable afterwards."""
+        client = DeferredSetConnector()
+        adapter = NativeConnectorL2Adapter(client)
+        key = create_object_key(1)
+        obj = create_memory_obj()
+        try:
+            adapter.submit_store_task([key], [obj])
+            adapter.delete([key])
+            assert client.pending_set is not None  # store still in flight
+
+            client.complete_set()
+            wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+            adapter.pop_completed_store_tasks()
+            assert _object_key_to_string(key) in client._store
+            assert adapter.get_usage().total_bytes_used == obj.get_size()
+
+            adapter.delete([key])
+            assert _object_key_to_string(key) not in client._store
+            assert adapter.get_usage().total_bytes_used == 0
         finally:
             adapter.close()
 
