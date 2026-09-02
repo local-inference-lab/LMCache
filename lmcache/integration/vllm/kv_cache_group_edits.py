@@ -443,9 +443,13 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
         groups in the shared pool.
 
         head_size = ceil(row / block_size), rounded up to the kernels'
-        vector alignment, and block_size * head_size may exceed the row
-        by at most this layer's own page padding
-        (spec.page_size_bytes), never reaching sibling bytes.
+        vector alignment.  If the page has enough padding, block_size *
+        head_size may exceed the semantic row while remaining inside this
+        layer's declared page.  Some exact-fit pages cannot be split into
+        vector-aligned token rows (GLM-5.3-Flash DCP1 is 4096 * 265 bytes).
+        Those pages use one opaque physical slot instead; the adapter carries
+        block_size independently as tokens_per_block, so logical scheduling
+        and cache keys remain unchanged.
         """
         assert isinstance(kv_cache, torch.Tensor), (
             "single-layer KV cache must be a torch.Tensor"
@@ -475,14 +479,36 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
             if candidate * block_size * elem <= page_bytes:
                 head_size = candidate
                 break
-        if head_size == 0:
+        if head_size != 0:
+            return kv_cache.as_strided(
+                (num_blocks, block_size, head_size),
+                (kv_cache.stride(0), head_size, 1),
+            )
+
+        # The semantic row is still a valid opaque page even when it cannot
+        # be factored into vector-aligned per-token rows.  Preserve the whole
+        # declared page as one physical slot.  EngineGroupInfo retains the
+        # logical block_size, and KVLayerGroupsManager therefore maps the one
+        # slot back to exactly one engine block ID.
+        if page_bytes % elem:
             raise ValueError(
-                f"cannot tile a {row}-element state row into {block_size} "
-                f"aligned tokens within the {page_bytes}-byte page"
+                f"declared Mamba page size {page_bytes} bytes is not aligned "
+                f"to tensor element size {elem}"
+            )
+        page_elems = page_bytes // elem
+        if page_elems < row:
+            raise ValueError(
+                f"declared Mamba page has {page_elems} elements but the state "
+                f"row requires {row}"
+            )
+        if page_elems > block_step:
+            raise ValueError(
+                f"declared Mamba page has {page_elems} elements but the "
+                f"physical block stride is only {block_step}"
             )
         return kv_cache.as_strided(
-            (num_blocks, block_size, head_size),
-            (kv_cache.stride(0), head_size, 1),
+            (num_blocks, 1, page_elems),
+            (kv_cache.stride(0), page_elems, 1),
         )
 
 
