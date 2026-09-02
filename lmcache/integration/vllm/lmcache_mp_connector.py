@@ -103,31 +103,6 @@ logger = lmcache_init_logger(__name__)
 
 
 # Helper functions
-def validate_single_inflight_batch(vllm_config: VllmConfig) -> None:
-    """Reject configurations that overlap engine steps.
-
-    The store window of a request is derived from ``request.all_token_ids``
-    at the moment the scheduler builds the connector metadata, while the
-    bytes are gathered from the paged KV cache after the forward pass. With
-    one batch in flight these agree: the tokens hashed are exactly the ones
-    whose KV the step leaves in the cache. Asynchronous scheduling or
-    pipeline parallelism (``max_concurrent_batches > 1``) let the next
-    step's placeholder tokens and block writes overlap the gather, so the
-    hashed tokens and the stored bytes could belong to different steps.
-
-    Raises:
-        ValueError: more than one engine batch may be in flight.
-    """
-    max_concurrent_batches = getattr(vllm_config, "max_concurrent_batches", 1)
-    if max_concurrent_batches > 1:
-        raise ValueError(
-            "LMCacheMPConnector requires a single in-flight engine batch "
-            f"(max_concurrent_batches={max_concurrent_batches}: async "
-            "scheduling or pipeline parallelism is enabled); the store window "
-            "would not match the KV bytes gathered after the step"
-        )
-
-
 def _recurrent_safe_lookup_end(num_tokens: int, chunk_tokens: int) -> int:
     """Return the largest reusable recurrent-state prefix boundary.
 
@@ -467,6 +442,13 @@ class LMCacheMPRequestMetadata:
             if num_engine_groups > 0
             else 0
         )
+        # ``len(all_token_ids)`` is the safety bound when engine steps overlap
+        # (asynchronous scheduling, pipeline parallelism): the scheduler
+        # appends a sampled token only after the step that verified it,
+        # while ``num_computed_tokens`` (hence ``computed_tokens``) already
+        # counts the placeholders of a step still in flight. A store window
+        # therefore never covers a position whose KV a running or rejected
+        # draft step could still rewrite.
         min_available_tokens = min(
             len(tracker.all_token_ids),
             allocated_tokens,
@@ -702,7 +684,6 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # Fail fast, before the server handshake below.
         validate_mamba_step_alignment(vllm_config)
         validate_kv_cache_groups(getattr(self, "_kv_cache_config", None))
-        validate_single_inflight_batch(vllm_config)
 
         assert vllm_config.kv_transfer_config is not None
 

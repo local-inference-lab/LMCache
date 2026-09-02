@@ -220,12 +220,32 @@ def test_anchored_scheduled_tokens_exclude_rejected_draft_tokens() -> None:
     assert tracker.num_scheduled_tokens == 0
 
 
-def test_single_inflight_batch_guard() -> None:
-    # First Party
-    from lmcache.integration.vllm.lmcache_mp_connector import (
-        validate_single_inflight_batch,
+def test_store_window_stops_at_verified_tokens_when_steps_overlap() -> None:
+    """With asynchronous scheduling the scheduler's computed-token count
+    includes the placeholders of a step still in flight; the store window
+    must stop at the tokens the scheduler has appended (verified)."""
+    verified = 2 * CHUNK_TOKENS - 2
+    request = SimpleNamespace(
+        request_id="req-1", cache_salt="", all_token_ids=list(range(verified))
+    )
+    tracker = LMCacheMPRequestTracker(request)
+    tracker.num_lmcache_hit_tokens = 0
+    tracker.num_vllm_hit_tokens = 0
+    # 16-token blocks covering three chunks: allocation is not the bound.
+    tracker.allocated_block_ids = {0: list(range(3 * CHUNK_TOKENS // 16))}
+    # The in-flight step counts its 4 placeholders (1 + 3 drafts) as
+    # computed: 2 * CHUNK_TOKENS + 2 > verified.
+    tracker.anchor_num_scheduled_tokens(
+        engine_num_computed_tokens=verified, num_new_tokens=4
     )
 
-    validate_single_inflight_batch(SimpleNamespace(max_concurrent_batches=1))
-    with pytest.raises(ValueError, match="single in-flight engine batch"):
-        validate_single_inflight_batch(SimpleNamespace(max_concurrent_batches=2))
+    metadata = LMCacheMPRequestMetadata.GetStoreMetadata(tracker, CHUNK_TOKENS, [16])
+
+    assert metadata is not None
+    assert metadata.direction == "STORE"
+    assert metadata.op.start == 0
+    # Only the chunk fully inside the verified prefix is stored; the chunk
+    # whose last two tokens are still placeholders is not.
+    assert metadata.op.end == CHUNK_TOKENS
+    assert len(metadata.op.token_ids) == verified
+    assert tracker.num_stored_tokens == CHUNK_TOKENS
