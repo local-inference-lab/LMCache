@@ -519,12 +519,24 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             )
 
     def register_listener(self, listener: L2AdapterListener) -> None:
-        """Register a listener and replay the one-time startup snapshot."""
+        """Register a listener and replay the one-time startup snapshot.
+
+        The snapshot lists durable objects oldest to newest. Eviction
+        policies treat one ``on_l2_keys_stored`` batch as the chunks of a
+        single request and rank its later entries as the first eviction
+        victims (``LRUEvictionPolicy.on_keys_created`` inserts a batch in
+        reverse). Replaying the age-ordered snapshot as-is would therefore
+        seed the newest objects as least recently used and make the first
+        eviction after a restart delete the most recent cache contents. The
+        snapshot is replayed newest to oldest so the seeded recency order
+        matches object age: the oldest object is evicted first.
+        """
         with self._lock:
             replay = self._startup_replay
             self._startup_replay = None
         if replay is not None and replay[0]:
-            listener.on_l2_keys_stored(*replay)
+            keys, sizes = replay
+            listener.on_l2_keys_stored(keys[::-1], sizes[::-1])
         super().register_listener(listener)
 
     def report_status(self) -> dict[str, Any]:

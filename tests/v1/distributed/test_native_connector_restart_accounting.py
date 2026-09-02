@@ -48,9 +48,27 @@ class TestPrimeExistingKeys:
         restart_adapter.register_listener(first)
         restart_adapter.register_listener(second)
 
-        assert first.stored == [(keys, [100, 200])]
+        # The snapshot is age-ordered (oldest first); the replay is reversed
+        # so a policy that ranks a batch's later entries as earlier eviction
+        # victims seeds the oldest object as least recently used.
+        assert first.stored == [(keys[::-1], [200, 100])]
         assert second.stored == []
         assert restart_adapter.get_usage().total_bytes_used == 300
+
+    def test_startup_snapshot_seeds_lru_oldest_first(self, restart_adapter):
+        # First Party
+        from lmcache.v1.distributed.eviction import L2EvictionPolicy
+        from lmcache.v1.distributed.eviction_policy.lru import LRUEvictionPolicy
+
+        oldest, middle, newest = (create_object_key(i) for i in (1, 2, 3))
+        restart_adapter.prime_existing_keys([oldest, middle, newest], [1, 1, 1])
+        policy = LRUEvictionPolicy()
+
+        restart_adapter.register_listener(L2EvictionPolicy(policy))
+        actions = policy.get_eviction_actions(2 / 3)
+
+        evicted = [key for action in actions for key in action.keys]
+        assert evicted == [oldest, middle]
 
     def test_empty_snapshot_is_consumed_without_callback(self, restart_adapter):
         restart_adapter.prime_existing_keys([], [])
