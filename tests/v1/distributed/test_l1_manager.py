@@ -43,6 +43,7 @@ interface docstrings. The tests focus on:
 
 # Standard
 import threading
+import time
 
 # Third Party
 import pytest
@@ -1969,4 +1970,86 @@ class TestIsKeyEvictable:
         manager.finish_read([key], extra_count=1)
         assert manager.is_key_evictable(key) is True
 
+        manager.close()
+
+
+# =============================================================================
+# Uncommitted writes
+# =============================================================================
+
+
+class TestUncommittedWrites:
+    """A reserved object whose writer never finished must never be served."""
+
+    @pytest.fixture
+    def short_write_ttl_config(self, basic_memory_config):
+        return L1ManagerConfig(
+            memory_config=basic_memory_config,
+            write_ttl_seconds=1,
+            read_ttl_seconds=300,
+        )
+
+    def test_expired_uncommitted_write_stays_unreadable(
+        self, short_write_ttl_config, basic_layout
+    ):
+        manager = L1Manager(short_write_ttl_config)
+        key = make_object_key(7001)
+        assert manager.reserve_write([key], [False], basic_layout)[key][0] == (
+            L1Error.SUCCESS
+        )
+
+        time.sleep(1.2)  # write lock TTL expires, the writer never commits
+
+        error, mem_obj = manager.reserve_read([key])[key]
+        assert error == L1Error.KEY_NOT_READABLE
+        assert mem_obj is None
+        # The expired reservation is reclaimable, not servable.
+        assert manager.is_key_evictable(key)
+
+        manager.close()
+
+    def test_discard_abandoned_writes_frees_only_expired_reservations(
+        self, short_write_ttl_config, basic_layout
+    ):
+        manager = L1Manager(short_write_ttl_config)
+        abandoned = make_object_key(7002)
+        committed = make_object_key(7003)
+        in_progress = make_object_key(7004)
+        manager.reserve_write([abandoned, committed], [False, False], basic_layout)
+        manager.finish_write([committed])
+
+        time.sleep(1.2)
+        manager.reserve_write([in_progress], [False], basic_layout)  # fresh lock
+
+        discarded = manager.discard_abandoned_writes(
+            [abandoned, committed, in_progress, make_object_key(7005)]
+        )
+
+        assert discarded == [abandoned]
+        assert manager.reserve_read([abandoned])[abandoned][0] == L1Error.KEY_NOT_EXIST
+        assert manager.reserve_read([committed])[committed][0] == L1Error.SUCCESS
+        assert manager.reserve_read([in_progress])[in_progress][0] == (
+            L1Error.KEY_NOT_READABLE
+        )
+
+        manager.finish_read([committed])
+        manager.close()
+
+    def test_update_reservation_hides_object_until_finished(
+        self, basic_l1_config, basic_layout
+    ):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(7006)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+        assert manager.reserve_read([key])[key][0] == L1Error.SUCCESS
+        manager.finish_read([key])
+
+        result = manager.reserve_write([key], [False], basic_layout, mode="update")
+        assert result[key][0] == L1Error.SUCCESS
+        assert manager.reserve_read([key])[key][0] == L1Error.KEY_NOT_READABLE
+
+        manager.finish_write([key])
+        assert manager.reserve_read([key])[key][0] == L1Error.SUCCESS
+        manager.finish_read([key])
         manager.close()
