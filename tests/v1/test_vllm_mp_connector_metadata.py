@@ -156,3 +156,76 @@ def test_retrieve_metadata_skip_tokens_preserved_on_emitted_op() -> None:
     assert metadata.op.start == 0
     assert metadata.op.end == CHUNK_TOKENS
     assert metadata.op.skip_first_n_tokens == 16
+
+
+def test_suppressed_retrieve_is_reported_to_the_worker_as_failed_load() -> None:
+    """A tracker in WAITING_FOR_LOAD whose retrieve is suppressed must not be
+    left for the scheduler to wait on: the connector metadata carries the
+    request id and its allocated blocks so the worker reports a failed load
+    and vLLM recomputes."""
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import (
+        LMCacheMPConnector,
+        LMCacheMPConnectorMetadata,
+    )
+
+    short = _tracker(
+        num_tokens=CHUNK_TOKENS,
+        lmcache_hit_tokens=CHUNK_TOKENS,
+        vllm_hit_tokens=0,
+        allocated_block_ids={0: [7, 8], 1: [30]},  # 2 x 16 < 64 tokens
+    )
+    covered = _tracker(
+        num_tokens=CHUNK_TOKENS,
+        lmcache_hit_tokens=CHUNK_TOKENS,
+        vllm_hit_tokens=0,
+        allocated_block_ids={0: [0, 1, 2, 3], 1: [10, 11]},
+    )
+    covered.request_id = "req-2"
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.scheduler_adapter = SimpleNamespace(lmcache_tokens_per_chunk=CHUNK_TOKENS)
+    connector._group_tokens_per_block = [16, 32]
+    connector.request_trackers = {"req-1": short, "req-2": covered}
+    metadata = LMCacheMPConnectorMetadata()
+
+    connector._process_retrieve_requests(metadata)
+
+    assert [m.request_id for m in metadata.requests] == ["req-2"]
+    assert metadata.suppressed_retrieves == [("req-1", [7, 8, 30])]
+    assert short.state == LMCacheMPRequestState.READY
+    assert covered.state == LMCacheMPRequestState.READY
+
+
+def test_anchored_scheduled_tokens_exclude_rejected_draft_tokens() -> None:
+    """The computed-token bound follows the scheduler's num_computed_tokens
+    (rewound for rejected drafts) instead of accumulating scheduled counts."""
+    request = SimpleNamespace(
+        request_id="req-1", cache_salt="", all_token_ids=list(range(100))
+    )
+    tracker = LMCacheMPRequestTracker(request)
+    tracker.num_lmcache_hit_tokens = 64
+    tracker.num_vllm_hit_tokens = 0
+
+    # Step 1: 64 hit tokens computed, 4 scheduled (1 + 3 drafts).
+    tracker.anchor_num_scheduled_tokens(engine_num_computed_tokens=64, num_new_tokens=4)
+    assert tracker.num_scheduled_tokens + 64 == 68
+    # Only 2 of the 3 drafts were accepted: the scheduler reports 66.
+    tracker.anchor_num_scheduled_tokens(engine_num_computed_tokens=66, num_new_tokens=4)
+    assert tracker.num_scheduled_tokens + 64 == 70
+    # Accumulation would have claimed 72 computed tokens here.
+    tracker.increase_num_scheduled_tokens(0)
+    assert tracker.num_scheduled_tokens == 6
+    # A count below the hit prefix (fresh tracker after preemption) clamps at 0.
+    tracker.anchor_num_scheduled_tokens(engine_num_computed_tokens=0, num_new_tokens=16)
+    assert tracker.num_scheduled_tokens == 0
+
+
+def test_single_inflight_batch_guard() -> None:
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import (
+        validate_single_inflight_batch,
+    )
+
+    validate_single_inflight_batch(SimpleNamespace(max_concurrent_batches=1))
+    with pytest.raises(ValueError, match="single in-flight engine batch"):
+        validate_single_inflight_batch(SimpleNamespace(max_concurrent_batches=2))
