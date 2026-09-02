@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -19,6 +20,35 @@ static constexpr char KEY_SEP = '@';
 static constexpr const char* PATH_SLASH_REPLACEMENT = "-SEP-";
 static constexpr const char* FILE_EXT = ".data";
 static constexpr const char* TMP_EXT = ".tmp";
+
+// Integrity trailer appended to every object file after the payload.
+//
+// do_single_set writes the payload, then this trailer, fsyncs the file and
+// publishes it; do_single_get reads the payload and verifies the trailer
+// (magic, payload length, CRC-32C of the payload). A mismatch is reported
+// as a failed load for that key, which the caller treats as a miss. Objects
+// written before the trailer existed carry none: their file size equals the
+// payload length and they are accepted unverified.
+struct ObjectTrailer {
+  uint32_t magic;
+  uint32_t crc32c;
+  uint64_t payload_len;
+};
+static constexpr uint32_t OBJECT_TRAILER_MAGIC = 0x31434D4CU;  // "LMC1"
+static_assert(sizeof(ObjectTrailer) == 16, "ObjectTrailer layout");
+
+// CRC-32C (Castagnoli, reflected, init/xorout 0xFFFFFFFF), hardware
+// accelerated on SSE4.2 CPUs. The streaming form folds successive slices:
+//   state = crc32c_begin(); state = crc32c_update(state, p, n); ...
+//   crc = crc32c_finish(state);
+inline uint32_t crc32c_begin() { return 0xFFFFFFFFU; }
+uint32_t crc32c_update(uint32_t state, const void* data, size_t len);
+inline uint32_t crc32c_finish(uint32_t state) { return state ^ 0xFFFFFFFFU; }
+uint32_t crc32c(const void* data, size_t len);
+
+// Payloads are read and written in slices of this size so the checksum of
+// each slice is computed while the slice is cache-resident.
+static constexpr size_t READ_SLICE_BYTES = size_t{1} << 20;
 
 // Per-worker connection state for the FS connector.
 // O_DIRECT engages per request only when both the transfer length and the
@@ -73,6 +103,12 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   static std::string replace_all(const std::string& str,
                                  const std::string& from,
                                  const std::string& to);
+
+  static void verify_trailer(const std::filesystem::path& file_path,
+                             size_t len, uint32_t payload_crc);
+  static void append_trailer_and_sync(const std::filesystem::path& tmp_path,
+                                      size_t len, uint32_t payload_crc);
+  static void sync_directory(const std::filesystem::path& dir);
 
   std::string base_path_;
   std::string relative_tmp_dir_;

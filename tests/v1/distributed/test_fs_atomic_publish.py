@@ -77,7 +77,8 @@ def test_native_duplicate_stores_publish_one_complete_file(tmp_path):
             assert results == [True, True]
 
         published = (tmp_path / "model@0x00000000@duplicate.data").read_bytes()
-        assert published in (first, second)
+        # The object file is the payload followed by the integrity trailer.
+        assert published[: len(first)] in (first, second)
         assert list(tmp_path.glob("*.tmp.*")) == []
     finally:
         client.close()
