@@ -14,8 +14,6 @@ pytest.importorskip("vllm", reason="MP connector imports vLLM at module load")
 from vllm.v1.core.sched.output import SchedulerOutput  # noqa: E402
 
 # First Party
-import lmcache.integration.vllm.lmcache_mp_connector as connector_mod  # noqa: E402
-import lmcache.integration.vllm.lmcache_mp_metadata as metadata_mod  # noqa: E402
 from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
     LMCacheMPConnector,
     _is_mamba_group_spec,
@@ -26,6 +24,8 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
     LMCacheMPRequestState,
     LMCacheMPRequestTracker,
 )
+import lmcache.integration.vllm.lmcache_mp_connector as connector_mod  # noqa: E402
+import lmcache.integration.vllm.lmcache_mp_metadata as metadata_mod  # noqa: E402
 
 GROUP_TOKENS_PER_BLOCK = [512, 512, 512, 512, 2048, 512]
 CHUNK_TOKENS = 4096
@@ -64,7 +64,7 @@ class RecordingBlockPool:
     def touch(self, blocks: list[SimpleNamespace]) -> None:
         self.touched.append([block.block_id for block in blocks])
 
-    def free_blocks(self, blocks: object) -> None:
+    def free_blocks(self, blocks: list[SimpleNamespace]) -> None:
         self.freed.append([block.block_id for block in blocks])
 
 

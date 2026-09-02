@@ -4,7 +4,7 @@ stubbed (see ``fake_adapter``); no GPU or live server needed. End-to-end
 recovery: ``.buildkite/k3_tests/multiprocess/scripts/run-restart-recovery.sh``."""
 
 # Standard
-from typing import Callable, ClassVar
+from typing import Callable, ClassVar, cast
 from unittest.mock import MagicMock
 import gc
 import os
@@ -341,7 +341,7 @@ def test_forced_lmcache_driven_cumem_failure_is_closed(
         kv_caches: dict[str, torch.Tensor],
         mode: str | MPTransferMode | None,
     ) -> MagicMock:
-        context = original_factory(kv_caches, mode)
+        context = cast(MagicMock, original_factory(kv_caches, mode))
         context.register.side_effect = CuMemIPCUnsupportedError("not exportable")
         return context
 
@@ -385,7 +385,7 @@ def test_register_generic_failure_restores_previous_and_closes_new(
         kv_caches: dict[str, torch.Tensor],
         mode: str | MPTransferMode | None,
     ) -> MagicMock:
-        context = original_factory(kv_caches, mode)
+        context = cast(MagicMock, original_factory(kv_caches, mode))
         context.register.side_effect = fail_registration
         return context
 
@@ -415,7 +415,7 @@ def test_register_timeout_restores_previous_and_closes_new(
         kv_caches: dict[str, torch.Tensor],
         mode: str | MPTransferMode | None,
     ) -> MagicMock:
-        context = contexts_factory(kv_caches, mode)
+        context = cast(MagicMock, contexts_factory(kv_caches, mode))
         context.register.side_effect = TimeoutError("server down")
         return context
 
@@ -449,7 +449,7 @@ def test_successful_registration_publishes_then_closes_previous(
         kv_caches: dict[str, torch.Tensor],
         mode: str | MPTransferMode | None,
     ) -> MagicMock:
-        context = contexts_factory(kv_caches, mode)
+        context = cast(MagicMock, contexts_factory(kv_caches, mode))
         context.register.side_effect = observe_registration
         return context
 
@@ -1443,7 +1443,7 @@ def test_recover_callback_closes_superseded_transfer_ctx(
     original_factory = adapter_mod.create_transfer_context
 
     def failing_register(kv_caches: dict[str, torch.Tensor], mode: str) -> MagicMock:
-        ctx = original_factory(kv_caches, mode)
+        ctx = cast(MagicMock, original_factory(kv_caches, mode))
         ctx.register.side_effect = TimeoutError("server down")
         return ctx
 
@@ -1486,7 +1486,7 @@ def test_shutdown_waits_for_inflight_recovery_before_unregister(
         kv_caches: dict[str, torch.Tensor],
         mode: str | MPTransferMode | None,
     ) -> MagicMock:
-        context = original_factory(kv_caches, mode)
+        context = cast(MagicMock, original_factory(kv_caches, mode))
         context.register.side_effect = delayed_register
         return context
 
@@ -1499,9 +1499,12 @@ def test_shutdown_waits_for_inflight_recovery_before_unregister(
     assert recovery_entered.wait(timeout=5.0)
 
     shutdown_done = threading.Event()
-    shutdown_thread = threading.Thread(
-        target=lambda: (adapter.shutdown(), shutdown_done.set())
-    )
+
+    def shutdown_adapter() -> None:
+        adapter.shutdown()
+        shutdown_done.set()
+
+    shutdown_thread = threading.Thread(target=shutdown_adapter)
     shutdown_thread.start()
     assert not shutdown_done.wait(timeout=0.05)
     assert not any(

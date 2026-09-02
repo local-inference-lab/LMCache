@@ -566,11 +566,11 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
     ) -> "KVConnectorWorkerMetadata":
         assert isinstance(other, LMCacheMPWorkerMetadata)
         merged_requests = dict(self.completed_store_requests)
-        for k, v in other.completed_store_requests.items():
-            merged_requests[k] = merged_requests.get(k, 0) + v
+        for request_id, count in other.completed_store_requests.items():
+            merged_requests[request_id] = merged_requests.get(request_id, 0) + count
         merged_jobs = dict(self.completed_store_jobs)
-        for k, v in other.completed_store_jobs.items():
-            merged_jobs[k] = merged_jobs.get(k, 0) + v
+        for job_id, count in other.completed_store_jobs.items():
+            merged_jobs[job_id] = merged_jobs.get(job_id, 0) + count
         return LMCacheMPWorkerMetadata(
             completed_store_requests=merged_requests,
             completed_store_jobs=merged_jobs,

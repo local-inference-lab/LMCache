@@ -17,6 +17,7 @@ module (``torch_dev``).
 # Standard
 # Standard Library
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 import threading
 import time
@@ -153,7 +154,7 @@ def test_cleanup_waits_for_active_store(
             raise TimeoutError("active STORE was not released")
         raise RuntimeError("stop after lifetime check")
 
-    module.context.resolve_obj_keys.side_effect = block_resolve
+    cast(MagicMock, module.context.resolve_obj_keys).side_effect = block_resolve
 
     def run_store() -> None:
         try:
