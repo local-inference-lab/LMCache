@@ -578,8 +578,13 @@ class KVLayerGroupsManager:
         self._full_sw_kv = True
 
     def get_subchunk_sw_size_tokens(self, kernel_group_idx: int) -> int:
-        """Return the sub-chunk sliding window size of a given kernel group.
-        The size is measured in the number of tokens.
+        """Return the page-aligned transfer window of a kernel group.
+
+        The size is measured in logical tokens. A sliding window smaller than
+        one engine page still transfers that complete page: the block-copy
+        interface addresses pages, not partial pages, and transferring the
+        superset preserves the attention window's state. Larger sub-chunk
+        windows are validated as whole-page multiples during construction.
 
         This is for the models like DSV4 where the sliding window size is
         smaller than the tokens in a single lmcache chunk.
@@ -588,18 +593,19 @@ class KVLayerGroupsManager:
             kernel_group_idx: 0-based kernel group index.
 
         Returns:
-            The sub-chunk sliding window size. Will be the same as the
-            chunk size for non-slding-window models or big-sliding-
-            window models.
+            The page-aligned sub-chunk transfer size. This is the chunk size
+            for non-sliding-window models and windows at least as large as a
+            chunk.
         """
-        sw_size_tokens = self._kernel_groups[kernel_group_idx].sw_size_tokens
+        group = self._kernel_groups[kernel_group_idx]
+        sw_size_tokens = group.sw_size_tokens
         # full_sw_kv: report the full chunk as the window so store/transfer keep
         # every block (chunk stays valid for reuse at any position).
         if self._full_sw_kv:
             return self._lmcache_tokens_per_chunk
         if sw_size_tokens == -1 or sw_size_tokens >= self._lmcache_tokens_per_chunk:
             return self._lmcache_tokens_per_chunk
-        return sw_size_tokens
+        return max(sw_size_tokens, group.tokens_per_block)
 
     def get_attn_desc(self) -> AttnWindowDesc:
         """Return the cross-chunk attention windows of all object groups.
@@ -748,8 +754,8 @@ class KVLayerGroupsManager:
                   ``slots_per_block``
                 - ``lmcache_tokens_per_chunk`` is not a whole multiple of
                   ``tokens_per_block``
-                - a sub-chunk sliding window is not a whole multiple of
-                  ``tokens_per_block``
+                - a sub-chunk sliding window larger than one page is not a
+                  whole multiple of ``tokens_per_block``
         """
         if tokens_per_block % slots_per_block != 0:
             raise ValueError(
@@ -763,7 +769,7 @@ class KVLayerGroupsManager:
                 f"tokens_per_block {tokens_per_block}"
             )
         if (
-            0 < sw_size_tokens < lmcache_tokens_per_chunk
+            tokens_per_block < sw_size_tokens < lmcache_tokens_per_chunk
             and sw_size_tokens % tokens_per_block != 0
         ):
             raise ValueError(

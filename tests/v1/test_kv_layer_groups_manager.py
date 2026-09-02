@@ -334,8 +334,9 @@ class TestValidateBlockChunkSizeConfig:
     """Construction-time validation of the block/chunk size configuration:
     ``tokens_per_block`` (engine KV cache spec) must pack whole
     ``slots_per_block`` (registered tensor batch dimension), an LMCache chunk
-    must span whole paged blocks, and a sub-chunk sliding window must cover
-    whole paged blocks.
+    must span whole paged blocks, and a sub-chunk sliding window larger than
+    one page must cover whole paged blocks. A smaller window transfers its one
+    containing page.
     """
 
     def _validate(
@@ -355,6 +356,8 @@ class TestValidateBlockChunkSizeConfig:
         self._validate(slots=8, tokens=16)
         # Sub-chunk window aligned to whole paged blocks.
         self._validate(slots=16, tokens=16, sw=64)
+        # A window inside one indivisible page transfers the complete page.
+        self._validate(slots=256, tokens=256, chunk=4096, sw=128)
         # Big window (>= chunk) needs no sub-chunk alignment.
         self._validate(slots=16, tokens=16, sw=1000)
 
@@ -687,15 +690,18 @@ class TestKernelAndObjectGroups:
         )
         assert [g.sw_size_tokens for g in manager.kernel_groups] == [-1, 64]
 
-    def test_subchunk_window_not_block_aligned_rejected(self):
-        # A 64-token window over 256-slot blocks does not cover whole blocks;
-        # construction fails loudly instead of mistransferring.
+    def test_subpage_window_transfers_one_complete_page(self):
+        # DFlash can use a sliding window smaller than its engine page. The
+        # transfer retains one complete page because block IDs cannot address
+        # a partial page.
         tensors = [torch.randn(2, 32, 256, 8, 64, dtype=torch.float16)]
-        with pytest.raises(ValueError, match="sliding window"):
-            _build_manager(
-                tensors,
-                engine_group_infos=[EngineGroupInfo(0, (0,), sw_size_tokens=64)],
-            )
+        manager = _build_manager(
+            tensors,
+            engine_group_infos=[EngineGroupInfo(0, (0,), sw_size_tokens=64)],
+        )
+        assert manager.get_subchunk_sw_size_tokens(0) == 256
+        assert manager.get_slots_per_chunk_in_sw(0) == 256
+        assert manager.calculate_num_blocks(0, 256) == 1
 
     def test_subchunk_sw_size_tokens(self):
         # lmcache chunk size is 256 (default), 32-slot blocks. Sub-chunk
