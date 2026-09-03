@@ -825,6 +825,66 @@ def test_compute_kv_layout_empty_raises_value_error() -> None:
         compute_kv_layout({})
 
 
+def test_engine_driven_registration_uses_logical_chunk_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compressed physical slots cannot redefine the scheduler token span."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    def _fake_layout(
+        caches: dict[str, torch.Tensor], **_kwargs: Any
+    ) -> tuple[int, int, int, str, Any, int]:
+        return (
+            1,
+            len(caches),
+            8448,
+            "uint8",
+            lmc_ops.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS,
+            1,
+        )
+
+    monkeypatch.setattr(worker_transfer, "compute_kv_layout", _fake_layout)
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        MagicMock(return_value=MagicMock()),
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    send_request = MagicMock(return_value=future)
+
+    EngineDrivenTransferContext().register(
+        instance_id=1,
+        kv_caches={
+            "layer_0": torch.zeros(4, 1, 64, 2, 66, dtype=torch.uint8),
+            "layer_1": torch.zeros(4, 1, 64, 2, 66, dtype=torch.uint8),
+            "layer_2": torch.zeros(4, 1, 64, 2, 66, dtype=torch.uint8),
+            "layer_3": torch.zeros(4, 1, 64, 2, 66, dtype=torch.uint8),
+        },
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        tokens_per_chunk=512,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=send_request,
+        engine_group_infos=(
+            EngineGroupInfo(0, (0, 1), tokens_per_block=256),
+            EngineGroupInfo(1, (2, 3), tokens_per_block=256),
+        ),
+    )
+
+    payload = send_request.call_args.args[2][0]
+    assert payload.group_layouts[0].tokens_per_block == 256
+    assert payload.group_layouts[0].window_tokens == 2
+
+
 @pytest.mark.parametrize(
     (
         "builder_fn",
