@@ -283,6 +283,92 @@ def call_block_kernel(
     )
 
 
+@pytest.mark.parametrize(
+    "engine_kv_format,pool_shape",
+    [
+        (FMT_VLLM_FUSED_NHD, (12, 3, 4, 2, 16)),
+        (FMT_VLLM_FUSED_HND, (12, 3, 2, 4, 16)),
+    ],
+    ids=["nhd", "hnd"],
+)
+def test_blocks_first_fused_kv_padded_stride_roundtrip(engine_kv_format, pool_shape):
+    """CUDA transfers address each layer through the physical block stride."""
+    device = torch.device("cuda")
+    num_blocks, num_layers = pool_shape[:2]
+    block_size = 4
+    num_heads = 2
+    fused_head_size = 16
+    source_pool = (
+        torch.arange(
+            int(torch.tensor(pool_shape).prod()), dtype=torch.int64, device=device
+        )
+        .to(torch.uint8)
+        .reshape(pool_shape)
+    )
+    target_pool = torch.full(pool_shape, 0xA5, dtype=torch.uint8, device=device)
+    source_layers = [source_pool[:, layer_idx] for layer_idx in range(num_layers)]
+    target_layers = [target_pool[:, layer_idx] for layer_idx in range(num_layers)]
+    block_stride = source_layers[0].stride(0)
+    logical_page_elems = source_layers[0][0].numel()
+    assert block_stride == num_layers * logical_page_elems
+
+    tokens_per_object = block_size * 2
+    memory_objects = create_memory_objects(
+        1,
+        num_layers,
+        tokens_per_object,
+        num_heads * fused_head_size,
+        1,
+        torch.uint8,
+        device,
+    )
+    source_block_ids = [1, 7]
+    target_block_ids = [3, 9]
+    call_block_kernel(
+        source_layers,
+        memory_objects,
+        source_block_ids,
+        engine_kv_format,
+        lmcache_native.TransferDirection.D2H,
+        num_layers,
+        num_blocks,
+        block_size,
+        num_heads,
+        fused_head_size,
+        True,
+        tokens_per_object,
+        block_stride_elems=block_stride,
+    )
+    # The helper creates a temporary device pointer array. Production retains
+    # that array for the connector lifetime; synchronize here before the local
+    # tensor can be reclaimed and reused by the following launch.
+    torch.cuda.synchronize()
+    call_block_kernel(
+        target_layers,
+        memory_objects,
+        target_block_ids,
+        engine_kv_format,
+        lmcache_native.TransferDirection.H2D,
+        num_layers,
+        num_blocks,
+        block_size,
+        num_heads,
+        fused_head_size,
+        True,
+        tokens_per_object,
+        block_stride_elems=block_stride,
+    )
+    torch.cuda.synchronize()
+
+    for source_block, target_block in zip(
+        source_block_ids, target_block_ids, strict=True
+    ):
+        assert torch.equal(target_pool[target_block], source_pool[source_block])
+    untouched = set(range(num_blocks)) - set(target_block_ids)
+    for block_idx in untouched:
+        assert torch.all(target_pool[block_idx] == 0xA5)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
