@@ -31,6 +31,8 @@ def _create_random_tensor(
 ) -> torch.Tensor:
     if dtype == torch.float8_e4m3fn:
         return torch.rand(shape, dtype=torch.bfloat16, device=device).to(dtype)
+    if dtype == torch.uint8:
+        return torch.randint(0, 256, shape, dtype=dtype, device=device)
     return torch.rand(shape, dtype=dtype, device=device)
 
 
@@ -270,6 +272,125 @@ def call_block_kernel(
         engine_kv_format,
         skip_prefix_n_blocks,
     )
+
+
+def test_fused_nhd_transfer_supports_64_heads() -> None:
+    """Compressed-state pages with 64 heads use a legal CUDA block shape."""
+    device = torch.device("cuda")
+    num_layers, num_blocks = 2, 8
+    block_size, num_heads, fused_head_size = 1, 64, 132
+    source = create_vllm_tensors(
+        FMT_VLLM_FUSED_NHD,
+        num_layers,
+        num_blocks,
+        block_size,
+        num_heads,
+        fused_head_size,
+        torch.uint8,
+        device,
+    )
+    destination = create_zero_vllm_tensors(
+        FMT_VLLM_FUSED_NHD,
+        num_layers,
+        num_blocks,
+        block_size,
+        num_heads,
+        fused_head_size,
+        torch.uint8,
+        device,
+    )
+    objects = create_memory_objects(
+        1,
+        num_layers,
+        2,
+        num_heads * fused_head_size,
+        1,
+        torch.uint8,
+        device,
+    )
+
+    call_block_kernel(
+        source,
+        objects,
+        [1, 6],
+        FMT_VLLM_FUSED_NHD,
+        lmc_ops.TransferDirection.D2H,
+        num_layers,
+        num_blocks,
+        block_size,
+        num_heads,
+        fused_head_size,
+        True,
+        2,
+    )
+    call_block_kernel(
+        destination,
+        objects,
+        [2, 7],
+        FMT_VLLM_FUSED_NHD,
+        lmc_ops.TransferDirection.H2D,
+        num_layers,
+        num_blocks,
+        block_size,
+        num_heads,
+        fused_head_size,
+        True,
+        2,
+    )
+    torch.cuda.synchronize()
+
+    for layer in range(num_layers):
+        assert torch.equal(source[layer][1], destination[layer][2])
+        assert torch.equal(source[layer][6], destination[layer][7])
+
+
+def test_engine_driven_transfer_supports_interleaved_compressed_pages() -> None:
+    """Engine-driven transfer preserves interleaved 64-head cache pages."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    device = torch.device("cuda")
+    num_blocks, num_layers = 8, 2
+    pool_shape = (num_blocks, num_layers, 1, 64, 132)
+    source_pool = (
+        torch.arange(
+            int(torch.tensor(pool_shape).prod()), dtype=torch.int64, device=device
+        )
+        .to(torch.uint8)
+        .reshape(pool_shape)
+    )
+    destination_pool = torch.full(pool_shape, 0xA5, dtype=torch.uint8, device=device)
+    source = {f"layer_{layer}": source_pool[:, layer] for layer in range(num_layers)}
+    destination = {
+        f"layer_{layer}": destination_pool[:, layer] for layer in range(num_layers)
+    }
+    logical_page_elems = source_pool[:, 0][0].numel()
+    assert source_pool[:, 0].stride(0) == num_layers * logical_page_elems
+
+    chunks = gather_paged_kv_to_cpu(
+        source,
+        [1, 6],
+        blocks_per_chunk=2,
+        layout_hints={"kv_layout": "NHD"},
+    )
+    torch.cuda.synchronize()
+    scatter_cpu_to_paged_kv(
+        destination,
+        [2, 7],
+        chunks,
+        blocks_per_chunk=2,
+        layout_hints={"kv_layout": "NHD"},
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(destination_pool[2], source_pool[1])
+    assert torch.equal(destination_pool[7], source_pool[6])
+    untouched = set(range(num_blocks)) - {2, 7}
+    for block_idx in untouched:
+        assert torch.all(destination_pool[block_idx] == 0xA5)
 
 
 @pytest.mark.parametrize(
