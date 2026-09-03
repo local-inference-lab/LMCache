@@ -466,26 +466,15 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
     return probe.device
 
 
-# Formats whose per-layer tensor dim-0 is the *block* axis AND for
-# which we currently support dim-0 padding (e.g. DeepSeek V4
-# compressor / indexer caches sharing a KV pool with larger attn
-# groups). Today only the MLA layout (``NL_X_NB_BS_HS``, kv_size==1)
-# is exercised by real mixed-compression workloads.
-#
-# ``NL_X_NB_TWO_BS_NH_HS`` *could* in principle also be the block
-# axis on dim-0, but no real serving engine emits a padded layout of
-# that format yet, and supporting it would require: (a) deciding
-# (without a ground-truth example) which axis carries the padding
-# -- NB boundary vs K<->V offset -- and (b) a coordinated change in
-# ``attempt_permute_to_contiguous_view`` to let interior-dim padding
-# through for that one format. Rather than ship an unverifiable code
-# path, we keep ``NL_X_NB_TWO_BS_NH_HS`` out of this set, which means
-# any padded tensor of that format will fail loudly via the
-# non-block-axis dim-0-padding check below. Revisit and add a
-# properly-tested branch when a concrete use case lands.
+# Formats whose per-layer tensor dim-0 is the block axis and whose transfer
+# kernels consume ``PageBufferShapeDesc.block_stride_elems``. vLLM blocks-first
+# pools interleave every layer inside each physical block, so a per-layer view's
+# stride(0) spans the other layers as well as its own logical page.
 _BLOCK_AXIS_FORMATS: frozenset = frozenset(
     {
         lmc_ops.EngineKVFormat.NL_X_NB_BS_HS,
+        lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,
+        lmc_ops.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS,
     }
 )
 
@@ -563,8 +552,7 @@ def resolve_block_stride_and_log_layout(
                     "resolve_block_stride_and_log_layout: group's probe "
                     f"tensor has dim-0 padding ({padding} elements per "
                     f"block) but engine_kv_format={engine_kv_format!r} is not "
-                    "a supported dim-0-padded format (only "
-                    "NL_X_NB_BS_HS is); downstream transfer kernels "
+                    "a supported dim-0-padded format; downstream transfer kernels "
                     "cannot honour this padding and would read/write "
                     "wrong bytes. "
                     f"layer_idx={layer_idx}, shape={tuple(rep.shape)}, "
