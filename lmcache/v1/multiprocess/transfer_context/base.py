@@ -823,6 +823,9 @@ def scatter_cpu_to_paged_kv(
     if not selected_block_ids:
         return
 
+    # Only the ptr-only branch below pins temporaries; the tensor branch
+    # hands torch the chunks directly and keeps them alive itself.
+    dynamically_pinned = False
     if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
         # Python fallback: accepts tensor list directly for all params.
         paged_arg = normalized
@@ -846,8 +849,8 @@ def scatter_cpu_to_paged_kv(
         # Defensive check: Ensure all incoming CPU chunks are pinned memory.
         # Otherwise, the underlying CUDA kernel may throw an Illegal
         # Memory Access error during H2D transfer.
-        pinned_copy = False
-        if not all(chunk.is_pinned() for chunk in chunks):
+        dynamically_pinned = not all(chunk.is_pinned() for chunk in chunks)
+        if dynamically_pinned:
             logger.warning(
                 "Received unpinned CPU tensors in scatter_cpu_to_paged_kv. "
                 "Dynamically pinning memory now, which may incur additional"
@@ -857,7 +860,6 @@ def scatter_cpu_to_paged_kv(
                 chunk.pin_memory() if not chunk.is_pinned() else chunk
                 for chunk in chunks
             ]
-            pinned_copy = True
 
         # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
         _ptrs_np = np.array(
@@ -900,11 +902,19 @@ def scatter_cpu_to_paged_kv(
                 engine_kv_format,
                 batch_skip,
             )
-        # Dynamically pinned tensors are local temporaries whose data pointers
-        # must remain valid until the asynchronous transfer has completed.
-        if pinned_copy:
-            torch_dev.synchronize()
     # Fast path: The async GPU copy might still be in progress.
     # We intentionally omit synchronization here for performance.
     # WARNING: The caller MUST explicitly call `torch_dev.synchronize()`
     # before consuming these chunks to ensure data validity.
+
+    if dynamically_pinned:
+        # The temporaries pinned above are read by the async H2D launches
+        # through raw pointers, which torch's stream tracking cannot see.
+        # Returning drops the last reference to them, and the caching host
+        # allocator then hands that memory to the next caller while the
+        # copies are still in flight -- the next pin_memory() overwrites the
+        # bytes mid-transfer. The caller-side synchronize documented above
+        # cannot cover this: by then the temporaries are already gone.
+        # Only the dynamically pinned case pays this; caller-owned pinned
+        # chunks keep the fast path.
+        torch_dev.synchronize()
