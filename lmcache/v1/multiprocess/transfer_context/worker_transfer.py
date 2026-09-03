@@ -1253,6 +1253,7 @@ class EngineDrivenTransferContext(TransferContext):
         if self._worker_groups:
             torch_dev.synchronize()
             group_out_buffers: list[list[torch.Tensor]] | None = None
+            gather_started = False
             prepared = False
             try:
                 group_result = self._engine_driven_context.prepare_store_grouped(
@@ -1266,14 +1267,17 @@ class EngineDrivenTransferContext(TransferContext):
                     group_future: MessagingFuture[bool] = MessagingFuture()
                     group_future.set_result(True)
                     return group_future
+                gather_started = True
                 cpu_groups = self._gather_group_payloads(
                     kv_caches,
                     block_ids,
                     out_buffers=group_out_buffers,
                     group_chunk_indices=group_chunk_indices,
                 )
-                if group_out_buffers is not None:
-                    torch_dev.synchronize()
+                # Both SHM and pickle transports consume data produced by an
+                # asynchronous device-to-host gather. Commit only after every
+                # group payload is complete.
+                torch_dev.synchronize()
                 ok = self._engine_driven_context.commit_store_grouped(
                     key, instance_id, cpu_groups
                 )
@@ -1281,9 +1285,10 @@ class EngineDrivenTransferContext(TransferContext):
                     self._abort_store_safely(key, instance_id)
             except Exception:
                 logger.exception("Failed to store engine-driven hybrid chunks")
-                if group_out_buffers is not None:
+                if gather_started:
                     # A failed gather can leave asynchronous writes targeting
-                    # SHM views. Drain them before the server frees the slots.
+                    # SHM views or temporary pickle buffers. Drain them before
+                    # either storage is released.
                     torch_dev.synchronize()
                 if prepared:
                     self._abort_store_safely(key, instance_id)
@@ -1294,6 +1299,7 @@ class EngineDrivenTransferContext(TransferContext):
 
         torch_dev.synchronize()
         out_buffers: list[torch.Tensor] | None = None
+        gather_started = False
         prepared = False
         try:
             legacy_result = self._engine_driven_context.prepare_store(key, instance_id)
@@ -1306,6 +1312,7 @@ class EngineDrivenTransferContext(TransferContext):
                 future: MessagingFuture[bool] = MessagingFuture()
                 future.set_result(True)
                 return future
+            gather_started = True
             cpu_chunks = gather_paged_kv_to_cpu(
                 kv_caches,
                 _single_group_block_ids(block_ids),
@@ -1315,20 +1322,19 @@ class EngineDrivenTransferContext(TransferContext):
                 out=out_buffers,
                 chunk_indices=chunk_indices,
             )
-            if out_buffers is not None:
-                # SHM path uses async device->CPU copies; complete them before commit.
-                torch_dev.synchronize()
+            # Both SHM and pickle transports consume data produced by an
+            # asynchronous device-to-host gather.
+            torch_dev.synchronize()
             ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
             if not ok:
                 self._abort_store_safely(key, instance_id)
         except Exception:
             logger.exception("Failed to store engine-driven chunks")
-            if out_buffers is not None:
+            if gather_started:
                 torch_dev.synchronize()
             if prepared:
                 self._abort_store_safely(key, instance_id)
             ok = False
-
         future = MessagingFuture()
         future.set_result(ok)
         return future
