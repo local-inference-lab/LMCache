@@ -2,14 +2,17 @@
 
 #include "mp_mem_kernels.cuh"
 
+#include <algorithm>
+
 namespace {
 
 /**
  * Key logic in the kernel implementation:
  * 1. Each thread block is for (BS, NH, HS) part (i.e., a single block in the
  * paged buffer)
- * 2. Within a thread block, each warp is for a single head. Number of warps
- * in a thread block is equal to the number of heads (NH).
+ * 2. Within a thread block, each threadIdx.y row handles one head. The row has
+ * up to 32 threads and narrows when NH * 32 would exceed CUDA's 1024-thread
+ * block limit.
  * 3. Within a thread block, we do the loop over the BS (i.e., number of tokens
  * in the block) dimension.
  * 4. The grid will take over (2, NB, NL) dimensions. No matter what the actual
@@ -360,7 +363,16 @@ void multi_layer_block_kv_transfer_templated(
   // --- Grid and block dimensions ---
   int elements_per_head = shape_desc.hs * shape_desc.element_size /
                           static_cast<int>(sizeof(ScalarType));
-  int thread_dim_x = std::min(elements_per_head, 32);
+  TORCH_CHECK(shape_desc.nh >= 1 && shape_desc.nh <= 1024,
+              "num_heads must be in [1, 1024], got ", shape_desc.nh);
+  TORCH_CHECK(elements_per_head >= 1,
+              "head payload must contain at least one transfer element");
+  // Keep one thread-row per head while respecting CUDA's 1024-thread block
+  // limit. Compressed-state caches can expose 64 or more logical heads, so a
+  // full 32-thread row per head is not always a legal launch configuration.
+  // warp_copy already walks the head payload with blockDim.x as its stride;
+  // reducing the row width therefore preserves coverage and ordering.
+  int thread_dim_x = std::min({elements_per_head, 32, 1024 / shape_desc.nh});
   int thread_dim_y = shape_desc.nh;
 
   dim3 block(thread_dim_x, thread_dim_y);

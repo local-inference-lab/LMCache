@@ -24,6 +24,7 @@ from lmcache.v1.gpu_connector.utils import (  # noqa: E402
     get_head_size,
     get_num_heads,
     make_page_buffer_shape_desc,
+    resolve_block_stride_and_log_layout,
 )
 import lmcache.c_ops as lmc_ops  # noqa: E402
 
@@ -75,6 +76,55 @@ def test_make_shape_desc_vllm_mla():
     assert sd.kv_size == 1
     assert sd.nh == 1
     assert sd.hs == 512
+
+
+@pytest.mark.parametrize(
+    "engine_kv_format,view_shape,view_stride,block_size",
+    [
+        (
+            lmc_ops.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS,
+            (3, 1, 64, 2, 66),
+            (1_002_240, 8_448, 132, 66, 1),
+            1,
+        ),
+        (
+            lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,
+            (3, 64, 1, 2, 66),
+            (1_002_240, 132, 8_448, 66, 1),
+            1,
+        ),
+    ],
+    ids=["nhd", "hnd"],
+)
+def test_blocks_first_fused_kv_shape_desc_preserves_physical_block_stride(
+    engine_kv_format, view_shape, view_stride, block_size
+):
+    """The DS4 fused page retains its blocks-first physical block stride."""
+    storage_elems = (view_shape[0] - 1) * view_stride[0] + view_stride[0]
+    pool = torch.empty(storage_elems, dtype=torch.uint8, device="cuda")
+    kv_caches = [pool.as_strided(view_shape, view_stride)]
+
+    block_stride = resolve_block_stride_and_log_layout(
+        kv_caches,
+        engine_kv_format,
+        layer_idx=0,
+        group_idx=0,
+    )
+    sd = make_page_buffer_shape_desc(
+        kv_caches,
+        engine_kv_format,
+        layer_idx=0,
+        num_layers_in_group=1,
+        num_blocks=view_shape[0],
+        block_size=block_size,
+        block_stride_elems=block_stride,
+    )
+
+    assert tuple(kv_caches[0].stride()) == view_stride
+    assert sd.block_stride_elems == view_stride[0]
+    assert sd.kv_size == 1
+    assert sd.nh == 64
+    assert sd.hs == 132
 
 
 def test_make_shape_desc_sglang_mla():

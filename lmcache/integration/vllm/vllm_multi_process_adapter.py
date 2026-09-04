@@ -1346,6 +1346,7 @@ class LMCacheMPWorkerAdapter:
                 send_request=send_lmcache_request,
                 layout_hints=layout_hints,
                 engine_group_infos=self.engine_group_infos,
+                tokens_per_chunk=self.lmcache_tokens_per_chunk,
             )
         except TimeoutError:
             raise ConnectionError(
