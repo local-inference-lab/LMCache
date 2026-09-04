@@ -86,14 +86,14 @@ def test_make_shape_desc_vllm_mla():
     [
         (
             lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
-            (3, 1, 64, 2, 66),
-            (1_002_240, 8_448, 132, 66, 1),
+            (3, 1, 64, 132),
+            (1_002_240, 8_448, 132, 1),
             1,
         ),
         (
             lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
-            (3, 64, 1, 2, 66),
-            (1_002_240, 132, 8_448, 66, 1),
+            (3, 64, 1, 132),
+            (1_002_240, 132, 8_448, 1),
             1,
         ),
     ],
