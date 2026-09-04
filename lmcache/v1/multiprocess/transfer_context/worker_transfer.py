@@ -1061,11 +1061,16 @@ class EngineDrivenTransferContext(TransferContext):
                         f"{tokens_per_block}"
                     )
                 group_blocks_per_chunk = logical_chunk_tokens // tokens_per_block
+                if info.sw_size_tokens != -1 and info.sw_size_tokens <= 0:
+                    raise ValueError(
+                        f"group {object_group_id} sliding window "
+                        f"{info.sw_size_tokens} must be positive or -1"
+                    )
                 window_tokens = (
                     logical_chunk_tokens
-                    if info.sw_size_tokens < 0
+                    if info.sw_size_tokens == -1
                     or info.sw_size_tokens >= logical_chunk_tokens
-                    else info.sw_size_tokens
+                    else max(info.sw_size_tokens, tokens_per_block)
                 )
                 if window_tokens % tokens_per_block:
                     raise ValueError(
@@ -1099,7 +1104,7 @@ class EngineDrivenTransferContext(TransferContext):
                         if info.recurrent_state
                         else (
                             -1
-                            if info.sw_size_tokens < 0
+                            if info.sw_size_tokens == -1
                             else max(
                                 1,
                                 (info.sw_size_tokens + logical_chunk_tokens - 1)

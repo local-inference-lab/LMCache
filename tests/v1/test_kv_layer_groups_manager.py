@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Sequence
+from typing import cast
 
 # Third Party
 import pytest
 import torch
 
 # First Party
+from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache
 from lmcache.v1.kv_layer_groups import (
     EXCLUDED_ENGINE_GROUP,
     KernelGroupIdentity,
@@ -39,7 +41,7 @@ def _build_manager(
     # First Party
 
     return KVLayerGroupsManager(
-        tensors,
+        cast(DiscoverableKVCache, tensors),
         engine_kv_formats=[lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS]
         * len(tensors),
         engine_group_infos=engine_group_infos,
@@ -334,8 +336,9 @@ class TestValidateBlockChunkSizeConfig:
     """Construction-time validation of the block/chunk size configuration:
     ``tokens_per_block`` (engine KV cache spec) must pack whole
     ``slots_per_block`` (registered tensor batch dimension), an LMCache chunk
-    must span whole paged blocks, and a sub-chunk sliding window must cover
-    whole paged blocks.
+    must span whole paged blocks, and a sub-chunk sliding window larger than
+    one page must cover whole paged blocks. A smaller window transfers its one
+    containing page.
     """
 
     def _validate(
@@ -355,6 +358,8 @@ class TestValidateBlockChunkSizeConfig:
         self._validate(slots=8, tokens=16)
         # Sub-chunk window aligned to whole paged blocks.
         self._validate(slots=16, tokens=16, sw=64)
+        # A window inside one indivisible page transfers the complete page.
+        self._validate(slots=256, tokens=256, chunk=4096, sw=128)
         # Big window (>= chunk) needs no sub-chunk alignment.
         self._validate(slots=16, tokens=16, sw=1000)
 
@@ -366,6 +371,11 @@ class TestValidateBlockChunkSizeConfig:
     def test_chunk_not_divisible_by_ratio_raises(self):
         with pytest.raises(ValueError, match="lmcache_tokens_per_chunk"):
             self._validate(slots=1, tokens=96, chunk=256)
+
+    @pytest.mark.parametrize("sw", [0, -2])
+    def test_nonpositive_window_other_than_sentinel_raises(self, sw: int):
+        with pytest.raises(ValueError, match="must be positive or -1"):
+            self._validate(slots=16, tokens=16, sw=sw)
 
     def test_subchunk_window_not_block_aligned_raises(self):
         # A sub-chunk window of 100 tokens does not cover whole 16-token
@@ -687,15 +697,18 @@ class TestKernelAndObjectGroups:
         )
         assert [g.sw_size_tokens for g in manager.kernel_groups] == [-1, 64]
 
-    def test_subchunk_window_not_block_aligned_rejected(self):
-        # A 64-token window over 256-slot blocks does not cover whole blocks;
-        # construction fails loudly instead of mistransferring.
+    def test_subpage_window_transfers_one_complete_page(self):
+        # DFlash can use a sliding window smaller than its engine page. The
+        # transfer retains one complete page because block IDs cannot address
+        # a partial page.
         tensors = [torch.randn(2, 32, 256, 8, 64, dtype=torch.float16)]
-        with pytest.raises(ValueError, match="sliding window"):
-            _build_manager(
-                tensors,
-                engine_group_infos=[EngineGroupInfo(0, (0,), sw_size_tokens=64)],
-            )
+        manager = _build_manager(
+            tensors,
+            engine_group_infos=[EngineGroupInfo(0, (0,), sw_size_tokens=64)],
+        )
+        assert manager.get_subchunk_sw_size_tokens(0) == 256
+        assert manager.get_slots_per_chunk_in_sw(0) == 256
+        assert manager.calculate_num_blocks(0, 256) == 1
 
     def test_subchunk_sw_size_tokens(self):
         # lmcache chunk size is 256 (default), 32-slot blocks. Sub-chunk

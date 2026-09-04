@@ -915,6 +915,124 @@ def test_engine_driven_hybrid_registration_preserves_group_order_and_shapes(
     assert gathered_ids == [[10, 11], [20, 21, 22, 23]]
 
 
+def test_engine_driven_hybrid_registration_rounds_subpage_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A logical subpage window transfers one complete physical page."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            1,
+            8,
+            "float32",
+            lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
+            1,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        MagicMock(return_value=MagicMock()),
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse(
+        accepts_group_layouts=True
+    )
+    send_request = MagicMock(return_value=future)
+
+    EngineDrivenTransferContext().register(
+        instance_id=1,
+        kv_caches=_make_kv_caches(num_layers=2),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=send_request,
+        engine_group_infos=(
+            EngineGroupInfo(
+                engine_group_id=0,
+                layer_indices=(0,),
+                tokens_per_block=4,
+                sw_size_tokens=2,
+            ),
+            EngineGroupInfo(
+                engine_group_id=1,
+                layer_indices=(1,),
+                tokens_per_block=4,
+            ),
+        ),
+    )
+
+    layouts = send_request.call_args.args[2][0].group_layouts
+    assert layouts[0].blocks_per_chunk == 2
+    assert layouts[0].blocks_per_window == 1
+    assert layouts[0].shape == (1, 4, 8)
+    assert layouts[1].blocks_per_window == 2
+    assert layouts[1].shape == (1, 8, 8)
+
+
+@pytest.mark.parametrize("sw_size_tokens", [0, -2])
+def test_engine_driven_hybrid_registration_rejects_invalid_window(
+    monkeypatch: pytest.MonkeyPatch,
+    sw_size_tokens: int,
+) -> None:
+    """Only -1 may represent an absent sliding window."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            1,
+            8,
+            "float32",
+            lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
+            1,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must be positive or -1"):
+        EngineDrivenTransferContext().register(
+            instance_id=1,
+            kv_caches=_make_kv_caches(num_layers=2),
+            model_name="m",
+            world_size=1,
+            blocks_in_chunk=2,
+            mq_client=MagicMock(),
+            mq_timeout=1.0,
+            send_request=MagicMock(),
+            engine_group_infos=(
+                EngineGroupInfo(
+                    engine_group_id=0,
+                    layer_indices=(0,),
+                    tokens_per_block=4,
+                    sw_size_tokens=sw_size_tokens,
+                ),
+                EngineGroupInfo(
+                    engine_group_id=1,
+                    layer_indices=(1,),
+                    tokens_per_block=4,
+                ),
+            ),
+        )
+
+
 def test_engine_driven_hybrid_registration_uses_explicit_chunk_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
