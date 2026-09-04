@@ -2,18 +2,18 @@
 
 #include "mp_mem_kernels.cuh"
 
+#include <algorithm>
+
 namespace {
 
 /**
  * Key logic in the kernel implementation:
  * 1. Each thread block is for (BS, NH, HS) part (i.e., a single block in the
  * paged buffer)
- * 2. The thread block is 3D: threadIdx.x strides over the transfer units
- * within a head (at most 32 threads), threadIdx.y selects the head (one head
- * per y index, and threadIdx.z partitions the BS dimension (i.e., number of
- * tokens in the block).
- * 3. Within a thread block, we do loop over the BS dimension with a stride of
- * blockDim.z.
+ * 2. The thread block is 3D: threadIdx.x strides over transfer units within a
+ * head and narrows when NH * 32 would exceed CUDA's 1024-thread block limit;
+ * threadIdx.y selects the head; threadIdx.z partitions the BS dimension.
+ * 3. Threads loop over the BS dimension with blockDim.z as the stride.
  * 4. The grid will take over (2, NB, NL) dimensions. No matter what the actual
  * layout in memory is, we will calculate the global offset for the start of the
  * block
@@ -408,11 +408,17 @@ void multi_layer_block_kv_transfer_templated(
   // --- Grid and block dimensions ---
   int elements_per_head = shape_desc.hs * shape_desc.element_size /
                           static_cast<int>(sizeof(ScalarType));
-  int thread_dim_x = std::min(elements_per_head, 32);
+  TORCH_CHECK(shape_desc.nh >= 1 && shape_desc.nh <= 1024,
+              "num_heads must be in [1, 1024], got ", shape_desc.nh);
+  TORCH_CHECK(elements_per_head >= 1,
+              "head payload must contain at least one transfer element");
+  // Keep one thread-row per head while respecting CUDA's 1024-thread block
+  // limit. Compressed-state caches can expose 64 or more logical heads, so a
+  // full 32-thread row per head is not always a legal launch configuration.
+  // warp_copy already walks the head payload with blockDim.x as its stride;
+  // reducing the row width therefore preserves coverage and ordering.
+  int thread_dim_x = std::min({elements_per_head, 32, 1024 / shape_desc.nh});
   int thread_dim_y = shape_desc.nh;
-  TORCH_CHECK(thread_dim_y <= 32, "Number of heads (", thread_dim_y,
-              ") exceeds max threads per block in y-dim (32). This"
-              " should never happen in normal LLMs");
   int thread_dim_z =
       std::min(shape_desc.bs, 1024 / (thread_dim_x * thread_dim_y));
   thread_dim_z = std::min(thread_dim_z, 64);  // max threads per block in z-dim
@@ -446,7 +452,14 @@ void multi_layer_block_kv_transfer(
     const torch::Device& device, TransferDirection direction,
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
     EngineKVFormat engine_kv_format, int skip_prefix_n_blocks) {
-  int head_bytes = shape_desc.hs * shape_desc.element_size;
+  const size_t head_bytes =
+      static_cast<size_t>(shape_desc.hs) * shape_desc.element_size;
+  const size_t block_stride_bytes =
+      (shape_desc.block_stride_elems > 0
+           ? static_cast<size_t>(shape_desc.block_stride_elems)
+           : static_cast<size_t>(shape_desc.bs) * shape_desc.nh *
+                 shape_desc.hs) *
+      shape_desc.element_size;
 
   if (engine_kv_format == EngineKVFormat::NL_X_NB_BSV_BSS) {
     // Blocked-scale indexer cache: the per-token fp32 scale must be a whole
@@ -454,15 +467,21 @@ void multi_layer_block_kv_transfer(
     TORCH_CHECK(head_bytes % sizeof(uint32_t) == 0,
                 "NL_X_NB_BSV_BSS row bytes (", head_bytes,
                 ") must be divisible by 4");
+    TORCH_CHECK(block_stride_bytes % sizeof(uint32_t) == 0,
+                "NL_X_NB_BSV_BSS block stride bytes (", block_stride_bytes,
+                ") must be divisible by 4");
     LAUNCH_TEMPLATED(uint32_t);
     return;
   }
 
-  if (head_bytes % sizeof(uint4) == 0) {
+  if (head_bytes % sizeof(uint4) == 0 &&
+      block_stride_bytes % sizeof(uint4) == 0) {
     LAUNCH_TEMPLATED(uint4);  // 16 bytes per copy
-  } else if (head_bytes % sizeof(uint32_t) == 0) {
+  } else if (head_bytes % sizeof(uint32_t) == 0 &&
+             block_stride_bytes % sizeof(uint32_t) == 0) {
     LAUNCH_TEMPLATED(uint32_t);  // 4 bytes per copy
-  } else if (head_bytes % sizeof(uint16_t) == 0) {
+  } else if (head_bytes % sizeof(uint16_t) == 0 &&
+             block_stride_bytes % sizeof(uint16_t) == 0) {
     LAUNCH_TEMPLATED(uint16_t);  // 2 bytes per copy
   } else {
     // Opaque model-owned page tails can make a logical row byte-odd (for
