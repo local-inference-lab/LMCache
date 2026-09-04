@@ -99,6 +99,77 @@ class TestSession:
         assert store_hashes == all_hashes[1:]
         assert session.num_chunks_processed == 3  # no extra computation
 
+    def test_retrieve_session_reference_reuses_lookup_hashes(
+        self, hasher: TokenHasher, session: Session
+    ) -> None:
+        """A token-free worker key resolves the lookup's requested hash slice."""
+        tokens = list(range(12))
+        hashes = hasher.compute_chunk_hashes(tokens)
+        lookup_key = IPCCacheServerKey.from_token_ids(
+            model_name="m",
+            world_size=2,
+            worker_id=None,
+            token_ids=tokens,
+            start=0,
+            end=12,
+            request_id="req-1",
+            cache_salt="tenant-a",
+            num_kv_readers=2,
+        )
+        session.set_tokens(tokens)
+        session.begin_lookup(lookup_key, (-1,), tuple(hashes))
+        worker_key = IPCCacheServerKey.from_token_ids(
+            model_name="m",
+            world_size=2,
+            worker_id=1,
+            token_ids=tokens,
+            start=4,
+            end=12,
+            request_id="req-1",
+            cache_salt="tenant-a",
+            num_kv_readers=2,
+        )
+
+        resolved = session.resolve_retrieve_session_reference(
+            worker_key.as_retrieve_session_reference()
+        )
+
+        assert resolved == hashes[1:]
+
+    def test_retrieve_session_reference_rejects_wrong_isolation_domain(
+        self, hasher: TokenHasher, session: Session
+    ) -> None:
+        """A compact key cannot cross the cache salt of its active lookup."""
+        tokens = list(range(8))
+        lookup_key = IPCCacheServerKey.from_token_ids(
+            model_name="m",
+            world_size=1,
+            worker_id=None,
+            token_ids=tokens,
+            start=0,
+            end=8,
+            request_id="req-1",
+            cache_salt="tenant-a",
+        )
+        session.begin_lookup(
+            lookup_key,
+            (-1,),
+            tuple(hasher.compute_chunk_hashes(tokens)),
+        )
+        wrong_salt = IPCCacheServerKey.from_token_ids(
+            model_name="m",
+            world_size=1,
+            worker_id=0,
+            token_ids=[],
+            start=0,
+            end=8,
+            request_id="req-1",
+            cache_salt="tenant-b",
+        )
+
+        with pytest.raises(ValueError, match="does not match"):
+            session.resolve_retrieve_session_reference(wrong_salt)
+
 
 class TestSessionManager:
     def test_get_or_create_new(self, session_manager: SessionManager) -> None:

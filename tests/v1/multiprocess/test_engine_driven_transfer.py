@@ -392,6 +392,7 @@ def test_engine_driven_registration_response_defaults_capability_off() -> None:
 
     assert response.accepts_group_layouts is False
     assert response.accepts_store_abort is False
+    assert response.accepts_retrieve_session_reference is False
 
 
 def test_engine_driven_registration_response_is_wire_compatible() -> None:
@@ -400,6 +401,7 @@ def test_engine_driven_registration_response_is_wire_compatible() -> None:
     current = msgspec.msgpack.decode(old_wire, type=RegisterEngineDrivenContextResponse)
     assert current.accepts_group_layouts is False
     assert current.accepts_store_abort is False
+    assert current.accepts_retrieve_session_reference is False
 
     legacy_type = msgspec.defstruct(
         "LegacyRegisterEngineDrivenContextResponse",
@@ -411,6 +413,7 @@ def test_engine_driven_registration_response_is_wire_compatible() -> None:
             pool_size=8,
             accepts_group_layouts=True,
             accepts_store_abort=True,
+            accepts_retrieve_session_reference=True,
         )
     )
     legacy = msgspec.msgpack.decode(current_wire, type=legacy_type)
@@ -1780,6 +1783,7 @@ def test_server_registers_exact_hybrid_group_layouts_and_windows(
 
     assert response.accepts_group_layouts is True
     assert response.accepts_store_abort is True
+    assert response.accepts_retrieve_session_reference is True
     layouts = ctx.layout_desc_registry.find_group_layout_descs("m", 1)
     assert layouts is not None
     assert layouts[0].shapes == [torch.Size([2, 1, 8, 16])]
@@ -2869,12 +2873,16 @@ def test_engine_driven_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
             assert commit_cpu_data == b""
             return _CompletedFuture(True)
         if req_type == RequestType.PREPARE_RETRIEVE:
+            retrieve_key, _ = payload
+            assert retrieve_key.token_ids == ()
             return _CompletedFuture(
                 PrepareRetrieveResponse(
                     success=True, data=b"", context={"slots": slots}
                 )
             )
         if req_type == RequestType.COMMIT_RETRIEVE:
+            retrieve_key, _ = payload
+            assert retrieve_key.token_ids == ()
             return _CompletedFuture(True)
         raise AssertionError(f"Unexpected request type: {req_type}")
 
@@ -2893,6 +2901,7 @@ def test_engine_driven_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
         mq_timeout=1.0,
         shm_name=shm_name,
         pool_size=4096,
+        use_retrieve_session_reference=True,
     )
     try:
         key = _default_key()

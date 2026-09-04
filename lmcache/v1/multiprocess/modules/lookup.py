@@ -292,7 +292,11 @@ class LookupModule:
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
-        session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
+        session.begin_lookup(
+            key,
+            tuple(attn_desc.num_chunks_in_sw),
+            tuple(chunk_hashes),
+        )
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
 
         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
@@ -554,7 +558,9 @@ class LookupModule:
             )
             return
 
-        chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
+        chunk_hashes = session.get_lookup_chunk_hashes()
+        if chunk_hashes is None:
+            chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
         obj_keys = self._chunk_major_object_keys(session.lookup_ipc_key, chunk_hashes)
         # unified touch of all keys, which include retrieved and stored keys
         # TODO(chunxiaozheng): when l2 is enabled, the prefetched keys from l2 are temp
