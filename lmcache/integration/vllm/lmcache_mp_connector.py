@@ -50,7 +50,13 @@ from lmcache.integration.vllm.kv_cache_groups import (
 )
 from lmcache.integration.vllm.utils import mla_enabled, vllm_layout_hints
 from lmcache.utils import init_logger as lmcache_init_logger
-from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
+from lmcache.v1.multiprocess.group_view import (
+    chunk_block_ids,
+    first_chunk_using_block,
+    mark_block_id_skipped,
+    slice_block_ids_per_group,
+    validate_external_chunk_geometry,
+)
 
 try:
     # First Party
@@ -229,6 +235,14 @@ def build_parallel_strategy_from_vllm_config(
     )
 
 
+# vLLM's block pool reserves block id 0 as the placeholder "null block"
+# (``BlockPool.null_block``). Hybrid managers put it in a request's block table
+# wherever the request owns no state, for example the recurrent checkpoint
+# slots before a prefix-cache hit. Its bytes are shared by every KV cache group
+# and must stay zero: it is never a transfer source or destination.
+VLLM_NULL_BLOCK_ID = 0
+
+
 class LMCacheMPRequestState(enum.Enum):
     """
     State machine:
@@ -267,6 +281,10 @@ class LMCacheMPRequestTracker:
     # Staging load operation -- save vllm and lmcache hit tokens during lookup
     num_vllm_hit_tokens: int = 0
     num_lmcache_hit_tokens: int = 0
+    # External tokens the scheduler admitted for this request, reported by
+    # ``update_state_after_alloc``. ``-1`` until the scheduler reports it; the
+    # retrieve range is then bounded by the lookup hit alone.
+    num_admitted_external_tokens: int = -1
 
     # Main state
     state: LMCacheMPRequestState = LMCacheMPRequestState.PREFETCHING
@@ -281,6 +299,7 @@ class LMCacheMPRequestTracker:
         self.num_stored_tokens = 0
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
+        self.num_admitted_external_tokens = -1
         self.state = LMCacheMPRequestState.PREFETCHING
 
     ####
@@ -290,8 +309,59 @@ class LMCacheMPRequestTracker:
         """Check whether the current request needs retrieve, will be used
         update_stage_after_alloc"""
         return (
-            self.num_lmcache_hit_tokens > self.num_vllm_hit_tokens
+            self.retrieve_end_token(1) > self.num_vllm_hit_tokens
             and self.state != LMCacheMPRequestState.READY
+        )
+
+    def admit_external_tokens(self, num_external_tokens: int) -> None:
+        """Record how many external tokens the scheduler admitted.
+
+        The lookup reports every chunk LMCache can serve past the block-aligned
+        local hit it was shown. The scheduler then decides how many of those
+        tokens it actually loads: it can keep a local sub-block tail the lookup
+        never saw and admit none of them. A retrieve must cover exactly the
+        admitted range, so anything the scheduler did not admit is neither
+        loaded nor kept locked.
+
+        Args:
+            num_external_tokens: External token count passed to
+                ``update_state_after_alloc``; negative values count as zero.
+        """
+        self.num_admitted_external_tokens = max(0, int(num_external_tokens))
+
+    def retrieve_end_token(self, lmcache_tokens_per_chunk: int) -> int:
+        """Return the exclusive end of the range a retrieve may load.
+
+        This is the lookup hit, bounded by the admitted external range rounded
+        up to the object boundary so a non-aligned admission still loads every
+        object the scheduler counted on.
+
+        Args:
+            lmcache_tokens_per_chunk: Tokens represented by one LMCache object.
+
+        Returns:
+            A token index in ``[num_vllm_hit_tokens, num_lmcache_hit_tokens]``
+            when the scheduler has reported its admission, else the lookup hit.
+
+        Raises:
+            ValueError: If ``lmcache_tokens_per_chunk`` is not positive.
+        """
+        if lmcache_tokens_per_chunk <= 0:
+            raise ValueError(
+                "lmcache_tokens_per_chunk must be positive, "
+                f"got {lmcache_tokens_per_chunk}"
+            )
+        if self.num_admitted_external_tokens < 0:
+            return self.num_lmcache_hit_tokens
+        admitted_end = self.num_vllm_hit_tokens + self.num_admitted_external_tokens
+        aligned_end = (
+            (admitted_end + lmcache_tokens_per_chunk - 1)
+            // lmcache_tokens_per_chunk
+            * lmcache_tokens_per_chunk
+        )
+        return max(
+            self.num_vllm_hit_tokens,
+            min(self.num_lmcache_hit_tokens, aligned_end),
         )
 
     def is_ready_for_retrieving(self) -> bool:
@@ -373,8 +443,8 @@ class LMCacheMPRequestMetadata:
             lmcache_tokens_per_chunk: the number of tokens in a LMCache data chunk
             group_tokens_per_block: per-engine-group tokens covered by one
                 paged chunk (one block ID) of that group, i.e. the group's
-                KV cache spec ``block_size``. Must each divide
-                ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+                KV cache spec ``block_size``. Each group span must evenly divide,
+                or be evenly divided by, ``lmcache_tokens_per_chunk``.
         """
         num_engine_groups = len(group_tokens_per_block)
         # NOTE: the invariant here is that `num_stored_tokens` should
@@ -431,7 +501,46 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
+                external_chunk_size=lmcache_tokens_per_chunk,
             )
+            # A chunk whose source in any group is the null block holds no
+            # state for that group (a recurrent checkpoint the request never
+            # owned). Objects are keyed as a contiguous prefix, so the store
+            # window ends before the first such chunk instead of persisting
+            # the placeholder bytes as cache content.
+            null_chunk = first_chunk_using_block(
+                block_ids,
+                group_tokens_per_block,
+                lmcache_tokens_per_chunk,
+                num_chunks,
+                VLLM_NULL_BLOCK_ID,
+            )
+            if null_chunk is not None:
+                logger.debug(
+                    "Store for request %s stops before chunk %d: its block in "
+                    "at least one engine group is the null block.",
+                    tracker.request_id,
+                    null_chunk,
+                )
+                if null_chunk == 0:
+                    return None
+                block_ids = [
+                    [
+                        block_id
+                        for chunk_ids in chunk_block_ids(
+                            group_ids,
+                            tokens_per_block,
+                            lmcache_tokens_per_chunk,
+                            num_chunks,
+                        )[:null_chunk]
+                        for block_id in chunk_ids
+                    ]
+                    for group_ids, tokens_per_block in zip(
+                        block_ids, group_tokens_per_block, strict=True
+                    )
+                ]
+                num_chunks = null_chunk
+                end_token_idx = start_token_idx + num_chunks * lmcache_tokens_per_chunk
             token_ids = list(tracker.all_token_ids)
             op = LoadStoreOp(
                 token_ids=token_ids,
@@ -467,8 +576,8 @@ class LMCacheMPRequestMetadata:
             lmcache_tokens_per_chunk: the number of tokens in a LMCache data chunk
             group_tokens_per_block: per-engine-group tokens covered by one
                 paged chunk (one block ID) of that group, i.e. the group's
-                KV cache spec ``block_size``. Must each divide
-                ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+                KV cache spec ``block_size``. Each group span must evenly divide,
+                or be evenly divided by, ``lmcache_tokens_per_chunk``.
         """
         if not tracker.is_ready_for_retrieving():
             return None
@@ -483,7 +592,7 @@ class LMCacheMPRequestMetadata:
             // lmcache_tokens_per_chunk
             * lmcache_tokens_per_chunk
         )
-        end_token_idx = tracker.num_lmcache_hit_tokens
+        end_token_idx = tracker.retrieve_end_token(lmcache_tokens_per_chunk)
         assert end_token_idx % lmcache_tokens_per_chunk == 0, (
             "The number of LMCache hit tokens should be a multiple of the "
             "LMCache chunk size. "
@@ -534,7 +643,13 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
+                external_chunk_size=lmcache_tokens_per_chunk,
             )
+            # A null-block destination means the request owns no state for
+            # that chunk in that group (a recurrent checkpoint it resumes
+            # past). The worker drops those chunks for that group only; the
+            # other groups still load the range.
+            block_ids = mark_block_id_skipped(block_ids, VLLM_NULL_BLOCK_ID)
             token_ids = list(tracker.all_token_ids)
 
             # Compute how many tokens at the start of the retrieve range
@@ -772,22 +887,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     f"group {engine_group_idx} tokens_per_block "
                     f"{tokens_per_block} must be positive"
                 )
-        # Smallest token count aligned to every group's paged-chunk
-        # boundary; used to round down vLLM APC hit counts.
-        self._hit_alignment_tokens = math.lcm(*self._group_tokens_per_block)
         if self.role == KVConnectorRole.SCHEDULER:
-            # Chunk boundaries must land on every group's paged-chunk
-            # boundary so per-group block-id slicing stays aligned.
             lmcache_tokens_per_chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
-            for engine_group_idx, tokens_per_block in enumerate(
-                self._group_tokens_per_block
-            ):
-                if lmcache_tokens_per_chunk % tokens_per_block != 0:
-                    raise ValueError(
-                        f"LMCache chunk size {lmcache_tokens_per_chunk} must be "
-                        f"a multiple of group {engine_group_idx} "
-                        f"tokens_per_block {tokens_per_block}"
-                    )
+            self._hit_alignment_tokens = validate_external_chunk_geometry(
+                lmcache_tokens_per_chunk,
+                self._group_tokens_per_block,
+            )
+        else:
+            # Worker-side code does not combine scheduler-local hits. Keep the
+            # historical value until registration validates physical geometry.
+            self._hit_alignment_tokens = math.lcm(*self._group_tokens_per_block)
 
     @property
     def role(self) -> KVConnectorRole:
@@ -1093,10 +1202,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # Update num stored tokens for the tracker
         tracker.increase_num_stored_tokens(ret)
 
-        # Save the vllm and lmcache hit tokens. The vLLM hit count is
-        # rounded down to a boundary aligned for every engine group (e.g.
-        # a full-prompt APC hit reports ``num_prompt_tokens - 1``), so the
-        # retrieve-skip range stays paged-chunk-aligned in all groups.
+        # Save the vLLM and LMCache hit tokens. Round the local hit down to an
+        # external-object boundary (for example, a full-prompt APC hit reports
+        # ``num_prompt_tokens - 1``). Fine DCP geometry projects that boundary
+        # to a complete rank-local transfer sub-block before scatter.
         tracker.num_vllm_hit_tokens = (
             num_computed_tokens
             // self._hit_alignment_tokens
@@ -1149,6 +1258,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.append_block_ids(tuple(new_block_ids))
 
         # Update the state of the tracker
+        if tracker.state == LMCacheMPRequestState.PREFETCHING:
+            # The scheduler saw the lookup result and decided how much of it
+            # to load. Zero means it kept a local prefix (possibly a sub-block
+            # tail the lookup was never shown) and will compute the rest, so
+            # no retrieve may write into blocks the forward is about to use.
+            tracker.admit_external_tokens(num_external_tokens)
         condition = tracker.needs_retrieve()
         if tracker.state == LMCacheMPRequestState.PREFETCHING:
             # If need to retrieve, change to WAITING_FOR_LOAD
@@ -1164,6 +1279,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # Free locks on chunks that vLLM already computed and won't
             # retrieve from LMCache.
             if tracker.num_lmcache_hit_tokens > 0:
+                retrieve_end = tracker.retrieve_end_token(
+                    self.scheduler_adapter.lmcache_tokens_per_chunk
+                )
                 if not condition:
                     # No retrieve needed — free ALL locked chunks
                     free_end = tracker.num_lmcache_hit_tokens
@@ -1188,6 +1306,23 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                         "Free locks of tokens %d-%d since it is cached by vLLM.",
                         0,
                         free_end,
+                    )
+                if condition and retrieve_end < tracker.num_lmcache_hit_tokens:
+                    # Chunks past the admitted range are never retrieved, so
+                    # their lookup locks are released here instead of by the
+                    # retrieve.
+                    self.scheduler_adapter.free_lookup_locks(
+                        token_ids=list(tracker.all_token_ids),
+                        start=retrieve_end,
+                        end=tracker.num_lmcache_hit_tokens,
+                        request_id=request.request_id,
+                        cache_salt=tracker.cache_salt,
+                    )
+                    logger.debug(
+                        "Free locks of tokens %d-%d beyond the admitted "
+                        "external range.",
+                        retrieve_end,
+                        tracker.num_lmcache_hit_tokens,
                     )
 
     def build_connector_meta(

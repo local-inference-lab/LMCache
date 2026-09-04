@@ -176,56 +176,252 @@ def expand_engine_block_ids(
     return expanded
 
 
+def validate_external_chunk_geometry(
+    external_chunk_size: int,
+    group_tokens_per_block: Sequence[int],
+) -> int:
+    """Validate that each group and external object divide one another exactly.
+
+    External objects may contain one or more whole manager blocks, or one
+    manager block may span an integer number of finer external objects.
+
+    Args:
+        external_chunk_size: Global sequence-token span of one external object.
+        group_tokens_per_block: Global sequence-token span represented by one
+            manager block ID for each engine group.
+
+    Returns:
+        ``external_chunk_size`` after all group geometries validate.
+
+    Raises:
+        ValueError: If a size is non-positive or an external object and a
+            group's manager block do not divide one another exactly.
+    """
+    if external_chunk_size <= 0:
+        raise ValueError(
+            f"external chunk size must be positive, got {external_chunk_size}"
+        )
+    for engine_group_idx, tokens_per_block in enumerate(group_tokens_per_block):
+        if tokens_per_block <= 0:
+            raise ValueError(
+                f"group {engine_group_idx} tokens_per_block must be positive, "
+                f"got {tokens_per_block}"
+            )
+        if (
+            external_chunk_size % tokens_per_block
+            and tokens_per_block % external_chunk_size
+        ):
+            raise ValueError(
+                f"LMCache chunk size {external_chunk_size} and group "
+                f"{engine_group_idx} tokens_per_block {tokens_per_block} "
+                "must divide each other exactly"
+            )
+    return external_chunk_size
+
+
 def slice_block_ids_per_group(
     allocated_block_ids: Mapping[int, Sequence[int]],
     group_tokens_per_block: Sequence[int],
     start_token_idx: int,
     end_token_idx: int,
+    external_chunk_size: int | None = None,
 ) -> list[list[int]]:
-    """Slice each engine group's block IDs for a token range.
+    """Slice each group's block IDs for a token range.
 
-    The range is given in tokens — the only unit shared by every engine
-    group. A group whose paged chunks each cover ``tokens_per_block`` tokens
-    holds one block ID per ``tokens_per_block`` tokens, so the range is
-    divided by that group's ``tokens_per_block``. Example: over the same 256
-    tokens, a tokens_per_block-64 group gets 4 IDs while a
-    tokens_per_block-256 group gets 1.
+    When an external object is finer than a manager block, repeat that manager
+    ID once per external chunk. The worker later projects each repeated ID to
+    its rank-local physical sub-block. Omitting ``external_chunk_size`` keeps
+    the historical manager-boundary behavior.
 
     Args:
-        allocated_block_ids: Block IDs keyed by engine group id; a missing group
-            yields an empty list.
-        group_tokens_per_block: Each group's tokens-per-paged-chunk, in
-            engine-group order. Every value must be positive and divide both
-            range endpoints.
-        start_token_idx: Range start token index, inclusive.
-        end_token_idx: Range end token index, exclusive.
+        allocated_block_ids: Manager block IDs indexed by engine group ID.
+        group_tokens_per_block: Global sequence-token span represented by one
+            manager block ID for each engine group.
+        start_token_idx: Inclusive global sequence-token offset.
+        end_token_idx: Exclusive global sequence-token offset.
+        external_chunk_size: Optional global token span of one external object.
 
     Returns:
-        One block-ID list per engine group, in engine-group order.
+        One block-ID list per engine group. Fine external geometry repeats each
+        manager ID once for every external object it spans.
 
     Raises:
-        ValueError: If the range does not align to a group's chunk boundary.
+        ValueError: If sizes are non-positive, the requested range is
+            misaligned, fine geometry is non-integral, or the manager block
+            table does not cover the requested range.
     """
+    if start_token_idx < 0 or end_token_idx < start_token_idx:
+        raise ValueError(f"invalid token range [{start_token_idx}, {end_token_idx})")
+    if external_chunk_size is not None and external_chunk_size <= 0:
+        raise ValueError(
+            f"external chunk size must be positive, got {external_chunk_size}"
+        )
+    if external_chunk_size is not None and (
+        start_token_idx % external_chunk_size or end_token_idx % external_chunk_size
+    ):
+        raise ValueError(
+            f"token range [{start_token_idx}, {end_token_idx}) must align to "
+            f"external chunk size {external_chunk_size}"
+        )
+
     sliced: list[list[int]] = []
     for engine_group_idx, tokens_per_block in enumerate(group_tokens_per_block):
-        if start_token_idx % tokens_per_block != 0 or (
-            end_token_idx % tokens_per_block != 0
-        ):
+        if tokens_per_block <= 0:
+            raise ValueError(
+                f"group {engine_group_idx} tokens_per_block must be positive, "
+                f"got {tokens_per_block}"
+            )
+        if external_chunk_size is None or external_chunk_size >= tokens_per_block:
+            if (
+                external_chunk_size is not None
+                and external_chunk_size % tokens_per_block
+            ):
+                raise ValueError(
+                    f"external chunk size {external_chunk_size} is not a multiple "
+                    f"of group {engine_group_idx} tokens_per_block {tokens_per_block}"
+                )
+            if start_token_idx % tokens_per_block or end_token_idx % tokens_per_block:
+                raise ValueError(
+                    f"token range [{start_token_idx}, {end_token_idx}) does not "
+                    f"align to group {engine_group_idx} tokens_per_block "
+                    f"{tokens_per_block}"
+                )
+            group_block_ids = allocated_block_ids.get(engine_group_idx, [])
+            sliced.append(
+                list(
+                    group_block_ids[
+                        start_token_idx // tokens_per_block : end_token_idx
+                        // tokens_per_block
+                    ]
+                )
+            )
+            continue
+
+        if tokens_per_block % external_chunk_size:
+            raise ValueError(
+                f"external chunk size {external_chunk_size} does not divide "
+                f"group {engine_group_idx} tokens_per_block {tokens_per_block}"
+            )
+        if start_token_idx % external_chunk_size or end_token_idx % external_chunk_size:
             raise ValueError(
                 f"token range [{start_token_idx}, {end_token_idx}) does not "
-                f"align to group {engine_group_idx} tokens_per_block "
-                f"{tokens_per_block}"
+                f"align to external chunk size {external_chunk_size}"
             )
+
         group_block_ids = allocated_block_ids.get(engine_group_idx, [])
-        sliced.append(
-            list(
-                group_block_ids[
-                    start_token_idx // tokens_per_block : end_token_idx
-                    // tokens_per_block
-                ]
-            )
-        )
+        repeated: list[int] = []
+        for chunk_start in range(start_token_idx, end_token_idx, external_chunk_size):
+            manager_idx = chunk_start // tokens_per_block
+            if manager_idx >= len(group_block_ids):
+                raise ValueError(
+                    f"group {engine_group_idx} block table does not contain "
+                    f"manager block index {manager_idx}"
+                )
+            repeated.append(group_block_ids[manager_idx])
+        sliced.append(repeated)
     return sliced
+
+
+# Manager block id a request-side connector substitutes for a block that has
+# no transferable destination or source in one engine group. Worker-side
+# transfer code drops the external chunks that map to it for that group only.
+SKIPPED_BLOCK_ID = -1
+
+
+def chunk_block_ids(
+    group_block_ids: Sequence[int],
+    tokens_per_block: int,
+    external_chunk_size: int,
+    num_chunks: int,
+) -> list[list[int]]:
+    """Group one engine group's sliced block ids by external chunk.
+
+    ``group_block_ids`` must come from :func:`slice_block_ids_per_group` for
+    the same geometry: coarse groups list ``external_chunk_size //
+    tokens_per_block`` ids per chunk, fine groups repeat one manager id per
+    chunk.
+
+    Args:
+        group_block_ids: Block ids of one engine group for the sliced range.
+        tokens_per_block: Global token span of one manager block in the group.
+        external_chunk_size: Global token span of one external object.
+        num_chunks: Number of external chunks in the sliced range.
+
+    Returns:
+        ``num_chunks`` lists, one per external chunk in range order.
+
+    Raises:
+        ValueError: If the id count does not match the chunk geometry.
+    """
+    if tokens_per_block <= 0 or external_chunk_size <= 0 or num_chunks < 0:
+        raise ValueError("chunk geometry values must be positive")
+    ids_per_chunk = (
+        external_chunk_size // tokens_per_block
+        if external_chunk_size >= tokens_per_block
+        else 1
+    )
+    if len(group_block_ids) != ids_per_chunk * num_chunks:
+        raise ValueError(
+            f"{len(group_block_ids)} block ids do not cover {num_chunks} chunks "
+            f"of {ids_per_chunk} id(s)"
+        )
+    return [
+        list(group_block_ids[chunk * ids_per_chunk : (chunk + 1) * ids_per_chunk])
+        for chunk in range(num_chunks)
+    ]
+
+
+def first_chunk_using_block(
+    block_ids_per_group: Sequence[Sequence[int]],
+    group_tokens_per_block: Sequence[int],
+    external_chunk_size: int,
+    num_chunks: int,
+    block_id: int,
+) -> int | None:
+    """Return the first external chunk that maps to ``block_id`` in any group.
+
+    Args:
+        block_ids_per_group: Per-group block ids from
+            :func:`slice_block_ids_per_group` for the same range.
+        group_tokens_per_block: Global token span of one manager block per
+            engine group.
+        external_chunk_size: Global token span of one external object.
+        num_chunks: Number of external chunks in the range.
+        block_id: Manager block id to search for.
+
+    Returns:
+        The chunk index, or ``None`` when no group maps a chunk to ``block_id``.
+    """
+    first: int | None = None
+    for group_ids, tokens_per_block in zip(
+        block_ids_per_group, group_tokens_per_block, strict=True
+    ):
+        for chunk, ids in enumerate(
+            chunk_block_ids(group_ids, tokens_per_block, external_chunk_size, num_chunks)
+        ):
+            if block_id in ids:
+                first = chunk if first is None else min(first, chunk)
+                break
+    return first
+
+
+def mark_block_id_skipped(
+    block_ids_per_group: Sequence[Sequence[int]],
+    block_id: int,
+) -> list[list[int]]:
+    """Replace every occurrence of ``block_id`` with :data:`SKIPPED_BLOCK_ID`.
+
+    Args:
+        block_ids_per_group: Per-group block id lists of one transfer op.
+        block_id: Manager block id that must not be transferred.
+
+    Returns:
+        New per-group lists with the substitution applied.
+    """
+    return [
+        [SKIPPED_BLOCK_ID if bid == block_id else bid for bid in group_ids]
+        for group_ids in block_ids_per_group
+    ]
 
 
 def get_engine_group_indices(

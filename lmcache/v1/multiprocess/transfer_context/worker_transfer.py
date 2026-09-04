@@ -97,6 +97,51 @@ def _collapse_chunks_for_single_destination(
     return chunks[-1:], block_ids[last_start : last_start + blocks_in_chunk]
 
 
+def _drop_skipped_chunks(
+    chunks: list[torch.Tensor],
+    block_ids: list[int],
+    blocks_in_chunk: int,
+) -> tuple[list[torch.Tensor], list[int], int]:
+    """Drop the leading chunks whose destination is marked skipped.
+
+    The request-side connector substitutes a negative manager id for a block
+    that must not be written in one engine group (vLLM's null placeholder
+    block). Those chunks form a prefix of a retrieve range: hybrid managers
+    place placeholders before the block a request resumes from. Dropping them
+    keeps the remaining chunks contiguous, so the projected fine-chunk layout
+    and the object slots stay aligned.
+
+    Args:
+        chunks: CPU objects of the range, one per external chunk.
+        block_ids: Manager ids of the range, ``blocks_in_chunk`` per chunk.
+        blocks_in_chunk: Manager ids per external chunk in this group.
+
+    Returns:
+        ``(chunks, block_ids, dropped)`` for the kept suffix, where ``dropped``
+        is the number of leading chunks removed.
+
+    Raises:
+        ValueError: If a skipped destination follows a kept chunk; only a
+            leading prefix can be dropped without breaking object alignment.
+    """
+    num_chunks = len(chunks)
+    if blocks_in_chunk < 1 or len(block_ids) != num_chunks * blocks_in_chunk:
+        return chunks, block_ids, 0
+    skipped = [
+        any(bid < 0 for bid in block_ids[i * blocks_in_chunk : (i + 1) * blocks_in_chunk])
+        for i in range(num_chunks)
+    ]
+    dropped = 0
+    while dropped < num_chunks and skipped[dropped]:
+        dropped += 1
+    if any(skipped[dropped:]):
+        raise ValueError(
+            "a skipped block destination follows a kept chunk; only leading "
+            f"chunks can be dropped (skip mask {skipped})"
+        )
+    return chunks[dropped:], block_ids[dropped * blocks_in_chunk :], dropped
+
+
 # Helper functions
 def _supports_async_primitives() -> bool:
     """Probe whether the worker device supports the async store primitives.
@@ -247,6 +292,8 @@ class _GroupState:
         physical_tokens_per_block: Rank-local tensor slots held by that block.
             This can be smaller than ``logical_tokens_per_block`` under DCP.
         layout_desc: Chunk layout for this group's objects.
+        subblocks_per_manager: Number of fine external objects projected from
+            one logical manager block.
     """
 
     layer_names: list[str]
@@ -256,6 +303,206 @@ class _GroupState:
     layout_desc: MemoryLayoutDesc
     logical_tokens_per_block: int = 0
     physical_tokens_per_block: int = 0
+    subblocks_per_manager: int = 1
+
+
+def resolve_external_chunk_group_geometry(
+    *,
+    external_chunk_size: int,
+    logical_tokens_per_block: int,
+    physical_tokens_per_block: int,
+    sliding_window_tokens: int,
+) -> tuple[int, int, int, int]:
+    """Resolve logical manager geometry into one rank-local object layout."""
+    if (
+        min(
+            external_chunk_size,
+            logical_tokens_per_block,
+            physical_tokens_per_block,
+        )
+        <= 0
+    ):
+        raise ValueError("external, logical, and physical token sizes must be positive")
+
+    if external_chunk_size < logical_tokens_per_block:
+        if logical_tokens_per_block % external_chunk_size:
+            raise ValueError(
+                f"logical tokens_per_block {logical_tokens_per_block} is not a "
+                f"multiple of external chunk size {external_chunk_size}"
+            )
+        if sliding_window_tokens >= 0:
+            raise ValueError(
+                "fine external chunks cannot split sliding-window or recurrent "
+                "manager state"
+            )
+        subblocks_per_manager = logical_tokens_per_block // external_chunk_size
+        if physical_tokens_per_block % subblocks_per_manager:
+            raise ValueError(
+                f"physical tokens_per_block {physical_tokens_per_block} cannot be "
+                f"split into {subblocks_per_manager} external sub-blocks"
+            )
+        physical_window_tokens = physical_tokens_per_block // subblocks_per_manager
+        return subblocks_per_manager, 1, 1, physical_window_tokens
+
+    if external_chunk_size % logical_tokens_per_block:
+        raise ValueError(
+            f"external chunk size {external_chunk_size} is not a multiple of "
+            f"logical tokens_per_block {logical_tokens_per_block}"
+        )
+    blocks_in_chunk = external_chunk_size // logical_tokens_per_block
+    logical_window_tokens = (
+        external_chunk_size
+        if sliding_window_tokens < 0 or sliding_window_tokens >= external_chunk_size
+        else sliding_window_tokens
+    )
+    if logical_window_tokens % logical_tokens_per_block:
+        raise ValueError(
+            f"sliding-window size {logical_window_tokens} is not a multiple of "
+            f"logical tokens_per_block {logical_tokens_per_block}"
+        )
+    blocks_per_window = logical_window_tokens // logical_tokens_per_block
+    return (
+        1,
+        blocks_in_chunk,
+        blocks_per_window,
+        blocks_per_window * physical_tokens_per_block,
+    )
+
+
+def make_external_subblock_view(
+    kv_caches: dict[str, torch.Tensor],
+    *,
+    subblocks_per_manager: int,
+    physical_tokens_per_block: int,
+) -> dict[str, torch.Tensor]:
+    """Return zero-copy blocks-first views split into external sub-blocks."""
+    if subblocks_per_manager < 1:
+        raise ValueError(
+            f"subblocks_per_manager must be positive, got {subblocks_per_manager}"
+        )
+    if subblocks_per_manager == 1:
+        return kv_caches
+    if physical_tokens_per_block % subblocks_per_manager:
+        raise ValueError(
+            f"physical tokens_per_block {physical_tokens_per_block} cannot be "
+            f"split into {subblocks_per_manager} external sub-blocks"
+        )
+
+    subblock_tokens = physical_tokens_per_block // subblocks_per_manager
+    views: dict[str, torch.Tensor] = {}
+    for layer_name, tensor in kv_caches.items():
+        if (
+            tensor.ndim != 3
+            or tensor.shape[1] != physical_tokens_per_block
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "fine external chunks require contiguous one-plane blocks-first "
+                "KV tensors shaped [num_blocks, block_size, hidden]; "
+                f"layer {layer_name!r} has shape {tuple(tensor.shape)} and "
+                f"contiguous={tensor.is_contiguous()}"
+            )
+        views[layer_name] = tensor.view(
+            tensor.shape[0] * subblocks_per_manager,
+            subblock_tokens,
+            tensor.shape[2],
+        )
+    return views
+
+
+def project_external_chunk_block_ids(
+    block_ids: list[int],
+    *,
+    start_token_idx: int,
+    external_chunk_size: int,
+    logical_tokens_per_block: int,
+    physical_tokens_per_block: int,
+) -> tuple[list[int], int]:
+    """Project manager IDs onto rank-local external sub-block IDs."""
+    if (
+        min(
+            external_chunk_size,
+            logical_tokens_per_block,
+            physical_tokens_per_block,
+        )
+        <= 0
+    ):
+        raise ValueError("external, logical, and physical token sizes must be positive")
+    if start_token_idx % external_chunk_size:
+        raise ValueError(
+            f"start token {start_token_idx} is not aligned to external chunk "
+            f"size {external_chunk_size}"
+        )
+    if external_chunk_size >= logical_tokens_per_block:
+        if external_chunk_size % logical_tokens_per_block:
+            raise ValueError(
+                f"external chunk size {external_chunk_size} is not a multiple "
+                f"of logical tokens_per_block {logical_tokens_per_block}"
+            )
+        return list(block_ids), physical_tokens_per_block
+
+    if logical_tokens_per_block % external_chunk_size:
+        raise ValueError(
+            f"logical tokens_per_block {logical_tokens_per_block} is not a "
+            f"multiple of external chunk size {external_chunk_size}"
+        )
+    subblocks_per_manager = logical_tokens_per_block // external_chunk_size
+    if physical_tokens_per_block % subblocks_per_manager:
+        raise ValueError(
+            f"physical tokens_per_block {physical_tokens_per_block} cannot be "
+            f"split into {subblocks_per_manager} external sub-blocks"
+        )
+    first_external_chunk = start_token_idx // external_chunk_size
+    previous_manager_id = block_ids[0] if block_ids else None
+    for chunk_offset, manager_block_id in enumerate(block_ids[1:], start=1):
+        subblock_idx = (first_external_chunk + chunk_offset) % subblocks_per_manager
+        if subblock_idx and manager_block_id != previous_manager_id:
+            raise ValueError(
+                f"manager block ID changed before external sub-block wrap at "
+                f"offset {chunk_offset}"
+            )
+        if not subblock_idx and manager_block_id == previous_manager_id:
+            raise ValueError(
+                f"manager block ID did not change at external sub-block wrap "
+                f"at offset {chunk_offset}"
+            )
+        previous_manager_id = manager_block_id
+    projected = [
+        manager_block_id * subblocks_per_manager
+        + (first_external_chunk + chunk_offset) % subblocks_per_manager
+        for chunk_offset, manager_block_id in enumerate(block_ids)
+    ]
+    return projected, physical_tokens_per_block // subblocks_per_manager
+
+
+def project_external_chunk_skip_tokens(
+    logical_skip_tokens: int,
+    *,
+    logical_tokens_per_block: int,
+    physical_tokens_per_block: int,
+    subblocks_per_manager: int,
+) -> int:
+    """Convert a global-token skip to rows in a rank-local transfer view."""
+    if subblocks_per_manager < 1:
+        raise ValueError(
+            f"subblocks_per_manager must be positive, got {subblocks_per_manager}"
+        )
+    if logical_skip_tokens < 0:
+        raise ValueError(
+            f"skip_first_n_tokens must be non-negative, got {logical_skip_tokens}"
+        )
+    if logical_tokens_per_block % subblocks_per_manager or (
+        physical_tokens_per_block % subblocks_per_manager
+    ):
+        raise ValueError("logical and physical block sizes must split exactly")
+    logical_chunk_span = logical_tokens_per_block // subblocks_per_manager
+    if logical_skip_tokens % logical_chunk_span:
+        raise ValueError(
+            f"skip_first_n_tokens {logical_skip_tokens} must align to external "
+            f"chunk span {logical_chunk_span}"
+        )
+    physical_chunk_span = physical_tokens_per_block // subblocks_per_manager
+    return logical_skip_tokens // logical_chunk_span * physical_chunk_span
 
 
 def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
@@ -496,6 +743,7 @@ class EngineDrivenTransferContext(TransferContext):
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
         self._group_states: list[_GroupState] = []
+        self._external_chunk_size = 0
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -532,7 +780,8 @@ class EngineDrivenTransferContext(TransferContext):
         window of each chunk). Works over both transports: SHM gathers into
         server-reserved slots, pickle serializes a group-major payload.
         Single-group registration keeps the legacy path (see
-        ``_single_group_block_ids``).
+        ``_single_group_block_ids``); fine sub-block geometry requires grouped
+        object metadata and is rejected for a single explicit group.
 
         Logical tokens per block can exceed the physical slot dimension for
         context-parallel/DCP caches. In that case block selection stays in
@@ -554,7 +803,6 @@ class EngineDrivenTransferContext(TransferContext):
             layout_source = {
                 layer_names[i]: kv_caches[layer_names[i]] for i in first_group_indices
             }
-
         (
             block_size,
             num_layers,
@@ -570,9 +818,18 @@ class EngineDrivenTransferContext(TransferContext):
         # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
         use_mla_flag = kv_size == 1
         chunk_tokens = blocks_in_chunk * block_size
+        self._external_chunk_size = chunk_tokens
 
         group_layouts: list[GroupLayout] = []
         group_states: list[_GroupState] = []
+        if len(engine_group_infos) == 1:
+            logical_tokens_per_block = engine_group_infos[0].tokens_per_block
+            if logical_tokens_per_block > 0 and chunk_tokens < logical_tokens_per_block:
+                raise ValueError(
+                    "single-group fine external chunks are unsupported; "
+                    "register multiple object groups or use a chunk at least as "
+                    "large as the logical manager block"
+                )
         if len(engine_group_infos) > 1:
             layer_names = list(kv_caches)
             for gid, group in enumerate(engine_group_infos):
@@ -597,31 +854,23 @@ class EngineDrivenTransferContext(TransferContext):
                 physical_block_size = (
                     g_block_size if has_explicit_group_geometry else block_size
                 )
-                if chunk_tokens % tokens_per_block != 0:
-                    raise RuntimeError(
-                        f"group {gid} tokens_per_block={tokens_per_block} does "
-                        f"not divide the chunk size ({chunk_tokens} tokens)"
-                    )
-                # Sliding-window groups store only the trailing window of each
-                # chunk. sw_size_tokens < 0 (or >= chunk) means full attention:
-                # window == chunk, so blocks_per_window == blocks_in_chunk and
-                # everything below collapses to the full-coverage behaviour.
-                sw = group.sw_size_tokens
-                logical_window_tokens = (
-                    chunk_tokens if sw < 0 or sw >= chunk_tokens else sw
+                (
+                    subblocks_per_manager,
+                    group_blocks_in_chunk,
+                    blocks_per_window,
+                    physical_window_tokens,
+                ) = resolve_external_chunk_group_geometry(
+                    external_chunk_size=chunk_tokens,
+                    logical_tokens_per_block=tokens_per_block,
+                    physical_tokens_per_block=physical_block_size,
+                    sliding_window_tokens=group.sw_size_tokens,
                 )
-                if logical_window_tokens % tokens_per_block != 0:
-                    raise RuntimeError(
-                        f"group {gid} sliding-window size ({logical_window_tokens} "
-                        f"tokens) is not a multiple of tokens_per_block "
-                        f"({tokens_per_block})"
+                if subblocks_per_manager > 1:
+                    make_external_subblock_view(
+                        subset,
+                        subblocks_per_manager=subblocks_per_manager,
+                        physical_tokens_per_block=physical_block_size,
                     )
-                blocks_per_window = logical_window_tokens // tokens_per_block
-                # ``tokens_per_block`` is the logical scheduler geometry. For
-                # DCP/context-parallel caches one logical block is sharded over
-                # ranks, so the tensor's slot dimension (``g_block_size``) is
-                # smaller. The payload contains only this rank's physical shard.
-                physical_window_tokens = blocks_per_window * physical_block_size
                 g_mla = g_kv_size == 1
                 g_shape = (
                     torch.Size([g_num_layers, physical_window_tokens, g_hidden])
@@ -641,14 +890,15 @@ class EngineDrivenTransferContext(TransferContext):
                     _GroupState(
                         layer_names=[layer_names[i] for i in group.layer_indices],
                         engine_kv_format=g_format,
-                        blocks_in_chunk=chunk_tokens // tokens_per_block,
+                        blocks_in_chunk=group_blocks_in_chunk,
                         blocks_per_window=blocks_per_window,
-                        logical_tokens_per_block=tokens_per_block,
-                        physical_tokens_per_block=physical_block_size,
                         layout_desc=MemoryLayoutDesc(
                             shapes=[g_shape],
                             dtypes=[getattr(torch, g_dtype_str)],
                         ),
+                        logical_tokens_per_block=tokens_per_block,
+                        physical_tokens_per_block=physical_block_size,
+                        subblocks_per_manager=subblocks_per_manager,
                     )
                 )
             # Group 0's layout doubles as the legacy top-level layout so
@@ -798,15 +1048,22 @@ class EngineDrivenTransferContext(TransferContext):
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
-                scatter_cpu_to_paged_kv(
-                    kv_caches,
-                    _single_group_block_ids(block_ids),
-                    src_buffers,
-                    blocks_in_chunk,
-                    skip_first_n_tokens=skip_first_n_tokens,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
+                src_buffers, single_ids, dropped = _drop_skipped_chunks(
+                    src_buffers, _single_group_block_ids(block_ids), blocks_in_chunk
                 )
+                # The single-group path has no registered chunk geometry; a
+                # dropped prefix can only carry a zero skip.
+                single_skip = 0 if dropped else skip_first_n_tokens
+                if src_buffers:
+                    scatter_cpu_to_paged_kv(
+                        kv_caches,
+                        single_ids,
+                        src_buffers,
+                        blocks_in_chunk,
+                        skip_first_n_tokens=single_skip,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=self._engine_kv_format,
+                    )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False
@@ -842,15 +1099,95 @@ class EngineDrivenTransferContext(TransferContext):
             # Backward-compatible state created by older callers/tests: no DCP
             # compression metadata means token and slot counts are identical.
             return logical_skip_tokens
-        if logical_skip_tokens % logical_block:
-            logger.error(
-                "skip_first_n_tokens (%d) is not aligned to group logical "
-                "tokens_per_block=%d; rounding down",
-                logical_skip_tokens,
-                logical_block,
+        if state.subblocks_per_manager == 1:
+            if logical_skip_tokens % logical_block:
+                logger.error(
+                    "skip_first_n_tokens (%d) is not aligned to group logical "
+                    "tokens_per_block=%d; rounding down",
+                    logical_skip_tokens,
+                    logical_block,
+                )
+            skipped_blocks = logical_skip_tokens // logical_block
+            return skipped_blocks * physical_block
+        return project_external_chunk_skip_tokens(
+            logical_skip_tokens,
+            logical_tokens_per_block=logical_block,
+            physical_tokens_per_block=physical_block,
+            subblocks_per_manager=state.subblocks_per_manager,
+        )
+
+    def _group_transfer_inputs(
+        self,
+        state: _GroupState,
+        key: Any,
+        kv_caches: dict[str, torch.Tensor],
+        manager_block_ids: list[int],
+        start_token_idx: int | None = None,
+    ) -> tuple[dict[str, torch.Tensor], list[int]]:
+        """Build zero-copy views and virtual IDs for one LMCache group.
+
+        ``start_token_idx`` overrides ``key.start`` when leading chunks of the
+        range were dropped for this group; the id list then covers
+        ``[start_token_idx, key.end)``.
+        """
+        group_kv_caches = {name: kv_caches[name] for name in state.layer_names}
+        range_start = key.start if start_token_idx is None else start_token_idx
+        geometry_registered = (
+            self._external_chunk_size > 0
+            and state.logical_tokens_per_block > 0
+            and state.physical_tokens_per_block > 0
+        )
+        if not geometry_registered:
+            # Preserve the legacy coarse identity path for callers that predate
+            # per-group geometry metadata. Fine projection must never use it.
+            if (
+                self._external_chunk_size != 0
+                or state.logical_tokens_per_block != 0
+                or state.physical_tokens_per_block != 0
+                or state.subblocks_per_manager != 1
+            ):
+                raise RuntimeError("external chunk geometry was not fully registered")
+            return group_kv_caches, list(manager_block_ids)
+
+        token_span = key.end - range_start
+        if token_span < 0 or token_span % self._external_chunk_size:
+            raise ValueError(
+                f"token range [{range_start}, {key.end}) does not align to "
+                f"external chunk size {self._external_chunk_size}"
             )
-        skipped_blocks = logical_skip_tokens // logical_block
-        return skipped_blocks * physical_block
+        expected_block_ids = (
+            token_span // self._external_chunk_size * state.blocks_in_chunk
+        )
+        if len(manager_block_ids) != expected_block_ids:
+            raise ValueError(
+                f"token range [{range_start}, {key.end}) requires "
+                f"{expected_block_ids} block IDs, got {len(manager_block_ids)}"
+            )
+        if state.subblocks_per_manager == 1:
+            return group_kv_caches, list(manager_block_ids)
+        transfer_kv_caches = make_external_subblock_view(
+            group_kv_caches,
+            subblocks_per_manager=state.subblocks_per_manager,
+            physical_tokens_per_block=state.physical_tokens_per_block,
+        )
+        transfer_block_ids, physical_tokens_per_chunk = (
+            project_external_chunk_block_ids(
+                manager_block_ids,
+                start_token_idx=range_start,
+                external_chunk_size=self._external_chunk_size,
+                logical_tokens_per_block=state.logical_tokens_per_block,
+                physical_tokens_per_block=state.physical_tokens_per_block,
+            )
+        )
+        expected_physical_tokens = (
+            state.physical_tokens_per_block // state.subblocks_per_manager
+        )
+        if physical_tokens_per_chunk != expected_physical_tokens:
+            raise RuntimeError(
+                "projected physical chunk span does not match registered view: "
+                f"{physical_tokens_per_chunk} != {expected_physical_tokens}"
+            )
+        return transfer_kv_caches, transfer_block_ids
 
     def _submit_store_multigroup(
         self,
@@ -872,6 +1209,13 @@ class EngineDrivenTransferContext(TransferContext):
             return self._submit_store_multigroup_pickle(
                 ctx, key, instance_id, kv_caches, block_ids
             )
+        # Validate and project every group's inputs before the SHM strategy
+        # reserves write slots. A projection failure after prepare would leave
+        # those slots pending because there is no store cancellation message.
+        transfer_inputs = [
+            self._group_transfer_inputs(state, key, kv_caches, block_ids[gid])
+            for gid, state in enumerate(self._group_states)
+        ]
         torch_dev.synchronize()
         result = ctx.prepare_store_grouped(key, instance_id)
         if result is None:
@@ -885,9 +1229,10 @@ class EngineDrivenTransferContext(TransferContext):
             out_g, chunks_g = self._group_slots(tensors, group_ids, gid, chunk_indices)
             if not out_g:
                 continue
+            transfer_kv_caches, transfer_block_ids = transfer_inputs[gid]
             gather_paged_kv_to_cpu(
-                {name: kv_caches[name] for name in state.layer_names},
-                block_ids[gid],
+                transfer_kv_caches,
+                transfer_block_ids,
                 state.blocks_in_chunk,
                 layout_hints=self._layout_hints,
                 engine_kv_format=state.engine_kv_format,
@@ -921,10 +1266,13 @@ class EngineDrivenTransferContext(TransferContext):
         ctx.prepare_store(key, instance_id)
         group_chunks: list[list[torch.Tensor]] = []
         for gid, state in enumerate(self._group_states):
+            transfer_kv_caches, transfer_block_ids = self._group_transfer_inputs(
+                state, key, kv_caches, block_ids[gid]
+            )
             group_chunks.append(
                 gather_paged_kv_to_cpu(
-                    {name: kv_caches[name] for name in state.layer_names},
-                    block_ids[gid],
+                    transfer_kv_caches,
+                    transfer_block_ids,
                     state.blocks_in_chunk,
                     layout_hints=self._layout_hints,
                     engine_kv_format=state.engine_kv_format,
@@ -961,9 +1309,19 @@ class EngineDrivenTransferContext(TransferContext):
         if group_chunks is not None:
             try:
                 for gid, state in enumerate(self._group_states):
-                    chunks = group_chunks[gid]
-                    group_block_ids = block_ids[gid]
-                    if skip_first_n_tokens == 0:
+                    chunks, kept_ids, dropped = _drop_skipped_chunks(
+                        group_chunks[gid], block_ids[gid], state.blocks_in_chunk
+                    )
+                    if not chunks:
+                        continue
+                    group_start = key.start + dropped * self._external_chunk_size
+                    group_skip = max(
+                        0, skip_first_n_tokens - dropped * self._external_chunk_size
+                    )
+                    transfer_kv_caches, group_block_ids = self._group_transfer_inputs(
+                        state, key, kv_caches, kept_ids, start_token_idx=group_start
+                    )
+                    if group_skip == 0:
                         compact_chunks, compact_block_ids = (
                             _collapse_chunks_for_single_destination(
                                 chunks,
@@ -982,12 +1340,12 @@ class EngineDrivenTransferContext(TransferContext):
                         chunks = compact_chunks
                         group_block_ids = compact_block_ids
                     scatter_cpu_to_paged_kv(
-                        {name: kv_caches[name] for name in state.layer_names},
+                        transfer_kv_caches,
                         group_block_ids,
                         chunks,
                         state.blocks_in_chunk,
                         skip_first_n_tokens=self._physical_skip_tokens(
-                            state, skip_first_n_tokens
+                            state, group_skip
                         ),
                         layout_hints=self._layout_hints,
                         engine_kv_format=state.engine_kv_format,
@@ -1029,8 +1387,19 @@ class EngineDrivenTransferContext(TransferContext):
             try:
                 for gid, state in enumerate(self._group_states):
                     src_g, _ = self._group_slots(tensors, group_ids, gid)
-                    group_block_ids = block_ids[gid]
-                    if skip_first_n_tokens == 0:
+                    src_g, kept_ids, dropped = _drop_skipped_chunks(
+                        src_g, block_ids[gid], state.blocks_in_chunk
+                    )
+                    if not src_g:
+                        continue
+                    group_start = key.start + dropped * self._external_chunk_size
+                    group_skip = max(
+                        0, skip_first_n_tokens - dropped * self._external_chunk_size
+                    )
+                    transfer_kv_caches, group_block_ids = self._group_transfer_inputs(
+                        state, key, kv_caches, kept_ids, start_token_idx=group_start
+                    )
+                    if group_skip == 0:
                         src_g, group_block_ids = (
                             _collapse_chunks_for_single_destination(
                                 src_g,
@@ -1040,12 +1409,12 @@ class EngineDrivenTransferContext(TransferContext):
                             )
                         )
                     scatter_cpu_to_paged_kv(
-                        {name: kv_caches[name] for name in state.layer_names},
+                        transfer_kv_caches,
                         group_block_ids,
                         src_g,
                         state.blocks_in_chunk,
                         skip_first_n_tokens=self._physical_skip_tokens(
-                            state, skip_first_n_tokens
+                            state, group_skip
                         ),
                         layout_hints=self._layout_hints,
                         engine_kv_format=state.engine_kv_format,
