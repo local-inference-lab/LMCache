@@ -41,6 +41,7 @@ class Session:
     num_chunks_processed: int = 0
     created_at: float = field(default_factory=time.time)
     lookup_ipc_key: Optional[IPCCacheServerKey] = None
+    lookup_chunk_hashes: tuple[bytes, ...] | None = None
     prefetch_hit_chunks: int = -1
     prefetch_locked_gids: tuple = ()
     prefetch_group_windows: tuple[int, ...] = ()
@@ -144,15 +145,76 @@ class Session:
         self,
         key: IPCCacheServerKey,
         group_windows: tuple[int, ...],
+        chunk_hashes: tuple[bytes, ...] | None = None,
     ) -> None:
-        """Record a new lookup and reset its per-lookup release state."""
+        """Record a new lookup and reset its per-lookup release state.
+
+        ``chunk_hashes`` retains the hashes already computed for cache lookup
+        so post-lookup engine-driven transfers need not transmit or rehash the
+        complete token sequence.
+        """
         with self._lock:
             self.lookup_ipc_key = key
+            self.lookup_chunk_hashes = chunk_hashes
             self.prefetch_hit_chunks = -1
             self.prefetch_locked_gids = ()
             self.prefetch_group_windows = group_windows
             self._lookup_generation += 1
             self._failed_retrieve_releases.clear()
+
+    def resolve_retrieve_session_reference(
+        self,
+        key: IPCCacheServerKey,
+    ) -> list[bytes]:
+        """Resolve cached chunk hashes for a token-free retrieve key.
+
+        A compact retrieve key is valid only for the active lookup with the
+        same model, cache isolation domain, worker topology, and token range.
+        The lookup owns the token sequence and its already-computed hashes.
+
+        Raises:
+            ValueError: If the key cannot be proven to refer to this lookup.
+        """
+        if key.token_ids:
+            raise ValueError("retrieve session reference must omit token IDs")
+
+        with self._lock:
+            lookup_key = self.lookup_ipc_key
+            chunk_hashes = self.lookup_chunk_hashes
+            if lookup_key is None or chunk_hashes is None:
+                raise ValueError(
+                    "retrieve session reference has no active lookup metadata"
+                )
+            if (
+                key.request_id != lookup_key.request_id
+                or key.model_name != lookup_key.model_name
+                or key.world_size != lookup_key.world_size
+                or key.cache_salt != lookup_key.cache_salt
+                or key.num_kv_readers != lookup_key.num_kv_readers
+                or key.worker_id is None
+            ):
+                raise ValueError(
+                    "retrieve session reference does not match its active lookup"
+                )
+            chunk_size = self.hasher.chunk_size
+            if (
+                key.start < lookup_key.start
+                or key.end > lookup_key.end
+                or key.start > key.end
+                or key.start % chunk_size != 0
+                or key.end % chunk_size != 0
+            ):
+                raise ValueError(
+                    "retrieve session reference has an invalid token range"
+                )
+            return list(chunk_hashes[key.start // chunk_size : key.end // chunk_size])
+
+    def get_lookup_chunk_hashes(self) -> list[bytes] | None:
+        """Return the hashes retained for the active lookup, if available."""
+        with self._lock:
+            if self.lookup_chunk_hashes is None:
+                return None
+            return list(self.lookup_chunk_hashes)
 
     def record_prefetch_result(
         self,

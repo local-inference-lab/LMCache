@@ -35,8 +35,15 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         metadata: EngineDrivenContextMetadata,
         mq_client: MessageQueueClient,
         mq_timeout: float,
+        *,
+        use_retrieve_session_reference: bool = False,
     ) -> None:
-        super().__init__(metadata, mq_client, mq_timeout)
+        super().__init__(
+            metadata,
+            mq_client,
+            mq_timeout,
+            use_retrieve_session_reference=use_retrieve_session_reference,
+        )
 
     def prepare_store(
         self, key: IPCCacheServerKey, instance_id: int
@@ -107,7 +114,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         """
         future = self.mq_client.submit_request(
             RequestType.PREPARE_RETRIEVE,
-            [key, instance_id],
+            [self.retrieve_rpc_key(key), instance_id],
             get_response_class(RequestType.PREPARE_RETRIEVE),
         )
         try:
@@ -132,7 +139,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         """Send COMMIT_RETRIEVE (no-op for pickle path)."""
         future = self.mq_client.submit_request(
             RequestType.COMMIT_RETRIEVE,
-            [key, instance_id],
+            [self.retrieve_rpc_key(key), instance_id],
             get_response_class(RequestType.COMMIT_RETRIEVE),
         )
         try:

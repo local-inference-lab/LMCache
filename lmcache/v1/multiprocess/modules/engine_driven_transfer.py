@@ -382,6 +382,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     pool_size=pool_size,
                     accepts_group_layouts=bool(payload.group_layouts),
                     accepts_store_abort=True,
+                    accepts_retrieve_session_reference=True,
                 )
 
         dtype = getattr(torch, payload.dtype_str, None)
@@ -527,6 +528,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             pool_size=pool_size,
             accepts_group_layouts=bool(payload.group_layouts),
             accepts_store_abort=True,
+            accepts_retrieve_session_reference=True,
         )
 
     def unregister_kv_cache(self, instance_id: int) -> None:
