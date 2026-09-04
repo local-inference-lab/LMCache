@@ -171,15 +171,23 @@ class EngineDrivenContext(ABC):
         metadata: EngineDrivenContextMetadata,
         mq_client: MessageQueueClient,
         mq_timeout: float,
+        use_retrieve_session_reference: bool = False,
     ) -> None:
         self.metadata = metadata
         self.mq_client = mq_client
         self.mq_timeout = mq_timeout
+        self.use_retrieve_session_reference = use_retrieve_session_reference
 
     @property
     def layout_desc(self) -> MemoryLayoutDesc:
         """The memory layout descriptor for this context."""
         return self.metadata.layout_desc
+
+    def retrieve_rpc_key(self, key: IPCCacheServerKey) -> IPCCacheServerKey:
+        """Return the server-compatible key for retrieve prepare and commit."""
+        if self.use_retrieve_session_reference:
+            return key.as_retrieve_session_reference()
+        return key
 
     @abstractmethod
     def prepare_store(
@@ -261,6 +269,7 @@ def create_engine_driven_context(
     pool_size: int,
     *,
     use_pickle: bool = False,
+    use_retrieve_session_reference: bool = False,
 ) -> EngineDrivenContext:
     """Factory that returns the appropriate :class:`EngineDrivenContext` implementation.
 
@@ -278,6 +287,8 @@ def create_engine_driven_context(
             pickle mode.
         use_pickle: Explicitly use pickle transport even when SHM info is
             available.
+        use_retrieve_session_reference: Omit token IDs from post-lookup
+            retrieve RPCs when the server advertises support.
 
     Returns:
         A concrete :class:`EngineDrivenContext` instance.
@@ -296,7 +307,12 @@ def create_engine_driven_context(
                 pool_size,
             )
             return EngineDrivenContextShm(
-                metadata, mq_client, mq_timeout, shm_name, pool_size
+                metadata,
+                mq_client,
+                mq_timeout,
+                shm_name,
+                pool_size,
+                use_retrieve_session_reference=use_retrieve_session_reference,
             )
         except Exception:
             logger.warning(
@@ -310,7 +326,12 @@ def create_engine_driven_context(
     from .pickle import EngineDrivenContextPickle
 
     logger.info("Creating EngineDrivenContextPickle (pickle transport)")
-    return EngineDrivenContextPickle(metadata, mq_client, mq_timeout)
+    return EngineDrivenContextPickle(
+        metadata,
+        mq_client,
+        mq_timeout,
+        use_retrieve_session_reference=use_retrieve_session_reference,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -392,6 +392,7 @@ def test_engine_driven_registration_response_defaults_capability_off() -> None:
 
     assert response.accepts_group_layouts is False
     assert response.accepts_store_abort is False
+    assert response.accepts_retrieve_session_reference is False
 
 
 def test_engine_driven_registration_response_is_wire_compatible() -> None:
@@ -400,6 +401,7 @@ def test_engine_driven_registration_response_is_wire_compatible() -> None:
     current = msgspec.msgpack.decode(old_wire, type=RegisterEngineDrivenContextResponse)
     assert current.accepts_group_layouts is False
     assert current.accepts_store_abort is False
+    assert current.accepts_retrieve_session_reference is False
 
     legacy_type = msgspec.defstruct(
         "LegacyRegisterEngineDrivenContextResponse",
@@ -411,6 +413,7 @@ def test_engine_driven_registration_response_is_wire_compatible() -> None:
             pool_size=8,
             accepts_group_layouts=True,
             accepts_store_abort=True,
+            accepts_retrieve_session_reference=True,
         )
     )
     legacy = msgspec.msgpack.decode(current_wire, type=legacy_type)
@@ -1898,6 +1901,7 @@ def test_server_registers_exact_hybrid_group_layouts_and_windows(
 
     assert response.accepts_group_layouts is True
     assert response.accepts_store_abort is True
+    assert response.accepts_retrieve_session_reference is True
     layouts = ctx.layout_desc_registry.find_group_layout_descs("m", 1)
     assert layouts is not None
     assert layouts[0].shapes == [torch.Size([2, 1, 8, 16])]
@@ -2332,6 +2336,42 @@ def test_server_unregister_engine_driven_context_releases_pending_shm_locks(
     mock_storage.abort_write.assert_called_once()
     mock_storage.finish_read_prefetched.assert_called_once()
 
+    # A late commit receives a terminal failure. The unregister path already
+    # released the pending read, so the rejected commit must not release it
+    # for a second time.
+    compact_key = key.as_retrieve_session_reference()
+    assert module.commit_retrieve(compact_key, 4) is False
+    mock_storage.finish_read_prefetched.assert_called_once()
+
+
+def test_server_missing_engine_context_releases_compact_prepare_locks_once(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Rejected compact prepares release one worker's lookup share once."""
+    module, mock_storage, mock_session, ctx = server_module_factory()
+    cast(Any, ctx.session_manager).get.return_value = mock_session
+    mock_session.prepare_failed_retrieve_release.return_value = (
+        1,
+        (0,),
+        (-1,),
+        9,
+    )
+    mock_session.claim_failed_retrieve_release.side_effect = [True, False]
+    compact_key = _default_key().as_retrieve_session_reference()
+
+    with patch(
+        "lmcache.v1.multiprocess.modules.engine_driven_transfer."
+        "resolve_prefetched_obj_keys",
+        return_value=["obj"],
+    ):
+        first = module.prepare_retrieve(compact_key, 404)
+        duplicate = module.prepare_retrieve(compact_key, 404)
+
+    assert first.success is False
+    assert duplicate.success is False
+    mock_storage.finish_read_prefetched.assert_called_once_with(["obj"], read_locks=1)
+
 
 def test_server_close_releases_pending_shm_locks(
     stub_lmcache_native: Any,
@@ -2613,6 +2653,56 @@ def test_server_grouped_shm_retrieve_reads_only_retained_suffix(
         ["rec-1"],
     ]
     assert response.context["group_ids"] == [0, 0, 1]
+
+
+def test_server_shm_compact_retrieves_are_request_scoped(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Equal compact cache keys retain independent per-request read locks."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(2, 1, 8, 16)
+    memory_obj.shm_offset = 0
+    memory_obj.shm_byte_length = memory_obj.tensor.numel() * 4
+    mock_storage.unsafe_read.side_effect = [
+        (["request-a-lock"], [memory_obj]),
+        (["request-b-lock"], [memory_obj]),
+    ]
+    mock_session = MagicMock()
+    mock_session.extras = {}
+    module, _, _, ctx = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_group_pool", pool_size=16384
+        ),
+        chunk_size=8,
+        mock_storage=mock_storage,
+        mock_session=mock_session,
+    )
+    module.register_kv_cache_engine_driven_context(_default_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["obj"]])
+    key_a = IPCCacheServerKey.from_token_ids(
+        "m", 1, 0, [], start=0, end=8, request_id="request-a"
+    )
+    key_b = IPCCacheServerKey.from_token_ids(
+        "m", 1, 0, [], start=0, end=8, request_id="request-b"
+    )
+    assert key_a == key_b
+
+    assert module.prepare_retrieve(key_a, 1).success is True
+    assert module.prepare_retrieve(key_b, 1).success is True
+
+    assert module.commit_retrieve(key_b, 1) is True
+    assert [
+        call.args[0] for call in mock_storage.finish_read_prefetched.call_args_list
+    ] == [["request-b-lock"]]
+    assert module.commit_retrieve(key_a, 1) is True
+    assert [
+        call.args[0] for call in mock_storage.finish_read_prefetched.call_args_list
+    ] == [["request-b-lock"], ["request-a-lock"]]
 
 
 def test_server_shm_retrieve_materializes_each_tensor_view_once(
@@ -2987,12 +3077,16 @@ def test_engine_driven_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
             assert commit_cpu_data == b""
             return _CompletedFuture(True)
         if req_type == RequestType.PREPARE_RETRIEVE:
+            retrieve_key, _ = payload
+            assert retrieve_key.token_ids == ()
             return _CompletedFuture(
                 PrepareRetrieveResponse(
                     success=True, data=b"", context={"slots": slots}
                 )
             )
         if req_type == RequestType.COMMIT_RETRIEVE:
+            retrieve_key, _ = payload
+            assert retrieve_key.token_ids == ()
             return _CompletedFuture(True)
         raise AssertionError(f"Unexpected request type: {req_type}")
 
@@ -3011,6 +3105,7 @@ def test_engine_driven_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
         mq_timeout=1.0,
         shm_name=shm_name,
         pool_size=4096,
+        use_retrieve_session_reference=True,
     )
     try:
         key = _default_key()

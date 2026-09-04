@@ -144,6 +144,25 @@ class IPCCacheServerKey:
             cache_salt=self.cache_salt,
         )
 
+    def as_retrieve_session_reference(self) -> "IPCCacheServerKey":
+        """Create a token-free reference for a post-lookup retrieve RPC.
+
+        The multiprocess server can resolve this compact key only while the
+        request session created by ``LOOKUP`` remains active. Workers must use
+        it only after the server advertises retrieve-session-reference support.
+        """
+        return IPCCacheServerKey(
+            model_name=self.model_name,
+            world_size=self.world_size,
+            worker_id=self.worker_id,
+            num_kv_readers=self.num_kv_readers,
+            token_ids=(),
+            start=self.start,
+            end=self.end,
+            request_id=self.request_id,
+            cache_salt=self.cache_salt,
+        )
+
 
 # Type exports
 KVCache = list[DeviceIPCWrapper]

@@ -106,8 +106,15 @@ class EngineDrivenContextShm(EngineDrivenContext):
         mq_timeout: float,
         shm_name: str,
         pool_size: int,
+        *,
+        use_retrieve_session_reference: bool = False,
     ) -> None:
-        super().__init__(metadata, mq_client, mq_timeout)
+        super().__init__(
+            metadata,
+            mq_client,
+            mq_timeout,
+            use_retrieve_session_reference=use_retrieve_session_reference,
+        )
         if not shm_name or pool_size <= 0:
             raise ValueError("shm_name must be non-empty and pool_size must be > 0")
 
@@ -281,7 +288,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
     ) -> list[torch.Tensor] | None:
         future = self.mq_client.submit_request(
             RequestType.PREPARE_RETRIEVE,
-            [key, instance_id],
+            [self.retrieve_rpc_key(key), instance_id],
             get_response_class(RequestType.PREPARE_RETRIEVE),
         )
         try:
@@ -299,7 +306,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
         """Map flat SHM descriptors into group-major retrieve buffers."""
         future = self.mq_client.submit_request(
             RequestType.PREPARE_RETRIEVE,
-            [key, instance_id],
+            [self.retrieve_rpc_key(key), instance_id],
             get_response_class(RequestType.PREPARE_RETRIEVE),
         )
         try:
@@ -328,7 +335,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
         future = self.mq_client.submit_request(
             RequestType.COMMIT_RETRIEVE,
-            [key, instance_id],
+            [self.retrieve_rpc_key(key), instance_id],
             get_response_class(RequestType.COMMIT_RETRIEVE),
         )
         try:

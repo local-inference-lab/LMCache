@@ -1179,6 +1179,10 @@ class EngineDrivenTransferContext(TransferContext):
                 "LMCache server does not support canceling failed SHM stores; "
                 "upgrade the server to avoid publishing partial cache objects"
             )
+        use_retrieve_session_reference = (
+            isinstance(response, RegisterEngineDrivenContextResponse)
+            and response.accepts_retrieve_session_reference
+        )
 
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,
@@ -1192,6 +1196,7 @@ class EngineDrivenTransferContext(TransferContext):
             mq_timeout,
             shm_name=shm_name,
             pool_size=pool_size,
+            use_retrieve_session_reference=use_retrieve_session_reference,
         )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
         logger.info(

@@ -295,13 +295,22 @@ class MPCacheServerContext:
         Raises:
             ValueError: If ``key.worker_id`` is ``None``.
         """
-        session = self.session_manager.get_or_create(key.request_id)
-        session.set_tokens(list(key.token_ids))
+        session = self.session_manager.get(key.request_id)
+        if not key.token_ids:
+            if session is None:
+                raise ValueError(
+                    "retrieve session reference has no active request session"
+                )
+            chunk_hashes = session.resolve_retrieve_session_reference(key)
+        else:
+            session = self.session_manager.get_or_create(key.request_id)
+            session.set_tokens(list(key.token_ids))
+            chunk_hashes = [
+                TokenHasher.hash_to_bytes(h)
+                for h in session.get_hashes(key.start, key.end)
+            ]
         if session.lookup_ipc_key is None:
             session.lookup_ipc_key = key.no_worker_id_version()
-        chunk_hashes = [
-            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
-        ]
         if key.worker_id is None:
             raise ValueError("Must resolve keys with worker_id != None")
         return ipc_key_to_object_keys(key, chunk_hashes, object_group_ids)

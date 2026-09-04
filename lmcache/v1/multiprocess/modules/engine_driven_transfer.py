@@ -38,7 +38,9 @@ from lmcache.v1.multiprocess.protocols.engine import (
 from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
 
 # Local
+from .lookup import resolve_prefetched_obj_keys
 from .server_transfer import (
+    ShmTransferKey,
     TransferStrategy,
     create_transfer_strategy,
 )
@@ -86,12 +88,8 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         # mutates them off the MQ main loop). Leaf lock, never held with
         # _pending_shm_lock.
         self._lock = threading.Lock()
-        self._pending_shm_writes: dict[
-            tuple[int, IPCCacheServerKey], list[ObjectKey]
-        ] = {}
-        self._pending_shm_reads: dict[
-            tuple[int, IPCCacheServerKey], list[ObjectKey]
-        ] = {}
+        self._pending_shm_writes: dict[ShmTransferKey, list[ObjectKey]] = {}
+        self._pending_shm_reads: dict[ShmTransferKey, list[ObjectKey]] = {}
         self._pending_shm_lock = threading.Lock()
         self._shm_pool_info: ShmPoolInfo = self._ctx.shm_pool_info
 
@@ -292,11 +290,51 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
         self._ctx.layout_desc_registry.unregister(entry.model_name, entry.world_size)
 
+    def _release_failed_prepare_retrieve_locks(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+    ) -> None:
+        """Release one worker's lookup locks after a rejected prepare.
+
+        A missing engine-driven registration means no SHM read reservation
+        exists for the worker, so unregister/reaper cleanup cannot release its
+        lookup share. The lookup session proves ownership and makes duplicate
+        rejected prepares idempotent.
+        """
+        session = self._ctx.session_manager.get(key.request_id)
+        if session is None:
+            logger.warning(
+                "Cannot release PREPARE_RETRIEVE locks for unregistered instance "
+                "%d: request %s has no lookup session",
+                instance_id,
+                key.request_id,
+            )
+            return
+
+        lock_state = session.prepare_failed_retrieve_release(key)
+        if lock_state is None:
+            return
+        hit_chunks, locked_gids, group_windows, lookup_generation = lock_state
+        obj_keys = resolve_prefetched_obj_keys(
+            self._ctx,
+            key,
+            hit_chunks,
+            locked_gids,
+            group_windows=group_windows,
+        )
+        if not session.claim_failed_retrieve_release(
+            instance_id,
+            key,
+            lookup_generation,
+        ):
+            return
+        if obj_keys:
+            self._ctx.storage_manager.finish_read_prefetched(obj_keys, read_locks=1)
+
     @staticmethod
-    def _make_transfer_key(
-        key: IPCCacheServerKey, instance_id: int
-    ) -> tuple[int, IPCCacheServerKey]:
-        return (instance_id, key)
+    def _make_transfer_key(key: IPCCacheServerKey, instance_id: int) -> ShmTransferKey:
+        return (instance_id, key.request_id, key)
 
     def _resolve_group_obj_keys(
         self, key: IPCCacheServerKey, context: EngineDrivenContextMetadata
@@ -382,6 +420,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     pool_size=pool_size,
                     accepts_group_layouts=bool(payload.group_layouts),
                     accepts_store_abort=True,
+                    accepts_retrieve_session_reference=True,
                 )
 
         dtype = getattr(torch, payload.dtype_str, None)
@@ -527,6 +566,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             pool_size=pool_size,
             accepts_group_layouts=bool(payload.group_layouts),
             accepts_store_abort=True,
+            accepts_retrieve_session_reference=True,
         )
 
     def unregister_kv_cache(self, instance_id: int) -> None:
@@ -637,11 +677,23 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             PrepareRetrieveResponse with serialized data on hit.
 
-        Raises:
-            ValueError: If no non-GPU context is registered for the given
-                instance ID.
         """
-        entry, strategy = self._resolve_for_transfer(instance_id)
+        try:
+            entry, strategy = self._resolve_for_transfer(instance_id)
+        except ValueError:
+            logger.warning(
+                "Rejecting PREPARE_RETRIEVE for unregistered non-GPU instance ID %d",
+                instance_id,
+            )
+            try:
+                self._release_failed_prepare_retrieve_locks(key, instance_id)
+            except Exception:
+                logger.exception(
+                    "Failed to release PREPARE_RETRIEVE locks for unregistered "
+                    "non-GPU instance ID %d",
+                    instance_id,
+                )
+            return PrepareRetrieveResponse(success=False, data=b"", context={})
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
@@ -666,9 +718,18 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             instance_id: Worker instance identifier (unused for pickle).
 
         Returns:
-            Always ``True``.
+            ``True`` when the pending read is finalized. ``False`` when the
+            instance was unregistered; unregister/reaper cleanup owns any
+            pending SHM read in that case.
         """
-        entry, strategy = self._resolve_for_transfer(instance_id)
+        try:
+            entry, strategy = self._resolve_for_transfer(instance_id)
+        except ValueError:
+            logger.warning(
+                "Rejecting COMMIT_RETRIEVE for unregistered non-GPU instance ID %d",
+                instance_id,
+            )
+            return False
         session = self._ctx.session_manager.get_or_create(key.request_id)
         st = session.extras.pop("retrieve_start_time", None)
         result = strategy.commit_retrieve(key=key, instance_id=instance_id)

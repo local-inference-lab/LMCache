@@ -40,6 +40,8 @@ logger = init_logger(__name__)
 
 ObjectKeyGroups = list[list[ObjectKey]]
 ResolveObjectKeyGroups = Callable[[IPCCacheServerKey], ObjectKeyGroups]
+ShmTransferKey = tuple[int, str, IPCCacheServerKey]
+ShmTransferKeyFactory = Callable[[IPCCacheServerKey, int], ShmTransferKey]
 
 
 def _dtype_to_name(dtype: torch.dtype) -> str:
@@ -124,12 +126,10 @@ def create_transfer_strategy(
     *,
     shm_name: str,
     pool_size: int,
-    pending_writes: dict[tuple[int, IPCCacheServerKey], list[ObjectKey]],
-    pending_reads: dict[tuple[int, IPCCacheServerKey], list[ObjectKey]],
+    pending_writes: dict[ShmTransferKey, list[ObjectKey]],
+    pending_reads: dict[ShmTransferKey, list[ObjectKey]],
     pending_lock: LockType,
-    transfer_key_factory: Callable[
-        [IPCCacheServerKey, int], tuple[int, IPCCacheServerKey]
-    ],
+    transfer_key_factory: ShmTransferKeyFactory,
 ) -> "TransferStrategy":
     """Create the non-GPU transfer strategy for a registered context.
 
@@ -140,8 +140,9 @@ def create_transfer_strategy(
         pending_writes: Map of pending SHM write reservations keyed by transfer key.
         pending_reads: Map of pending SHM read reservations keyed by transfer key.
         pending_lock: Lock guarding shared pending SHM reservation state.
-        transfer_key_factory: Factory that builds the `(instance_id, key)` lookup key
-            used in the pending SHM reservation maps.
+        transfer_key_factory: Factory that builds the request-scoped
+            `(instance_id, request_id, key)` lookup key used in the pending SHM
+            reservation maps.
 
     Returns:
         ``ShmTransferStrategy`` when SHM is configured with a non-empty pool name and
@@ -424,12 +425,10 @@ class ShmTransferStrategy(TransferStrategy):
     def __init__(
         self,
         storage_manager: "StorageManager",
-        pending_writes: dict[tuple[int, IPCCacheServerKey], list[ObjectKey]],
-        pending_reads: dict[tuple[int, IPCCacheServerKey], list[ObjectKey]],
+        pending_writes: dict[ShmTransferKey, list[ObjectKey]],
+        pending_reads: dict[ShmTransferKey, list[ObjectKey]],
         pending_lock: LockType,
-        transfer_key_factory: Callable[
-            [IPCCacheServerKey, int], tuple[int, IPCCacheServerKey]
-        ],
+        transfer_key_factory: ShmTransferKeyFactory,
         fallback_strategy: PickleTransferStrategy,
     ) -> None:
         """Initialize SHM transfer strategy.
@@ -439,7 +438,8 @@ class ShmTransferStrategy(TransferStrategy):
             pending_writes: Shared pending SHM write reservations map.
             pending_reads: Shared pending SHM read reservations map.
             pending_lock: Lock guarding shared pending SHM maps.
-            transfer_key_factory: Factory to build `(instance_id, key)` transfer keys.
+            transfer_key_factory: Factory that builds request-scoped
+                `(instance_id, request_id, key)` transfer keys.
             fallback_strategy: Pickle fallback for non-empty ``cpu_data`` payloads.
         """
         self._storage_manager = storage_manager

@@ -60,6 +60,7 @@ class RegisterEngineDrivenContextResponse:
     pool_size: int = 0
     accepts_group_layouts: bool = False
     accepts_store_abort: bool = False
+    accepts_retrieve_session_reference: bool = False
 
 
 # Define request names for this protocol group
