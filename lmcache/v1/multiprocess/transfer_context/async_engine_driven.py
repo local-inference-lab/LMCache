@@ -466,9 +466,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     group_out_buffers, group_chunk_indices = (
                         prepared if prepared is not None else (None, None)
                     )
-                    if group_chunk_indices is not None and not any(
-                        group_chunk_indices
-                    ):
+                    if group_chunk_indices is not None and not any(group_chunk_indices):
                         ok = True
                         return
 
