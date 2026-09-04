@@ -1015,3 +1015,15 @@ def test_successful_retrieve_marks_no_blocks_invalid(fake_adapter) -> None:
     assert finished_retrieves == {"req-1"}
     assert adapter.get_block_ids_with_load_errors() == set()
     assert adapter.retrieve_failure_count == 0
+
+
+def test_flush_inflight_overwrite_gathers_uses_narrow_fence(fake_adapter) -> None:
+    """Recurrent reuse waits on the narrow async fence, not the full gather."""
+    adapter, _send_mock, _ = fake_adapter
+    transfer_ctx = MagicMock()
+    adapter.transfer_ctx = transfer_ctx
+
+    adapter.flush_inflight_overwrite_gathers()
+
+    transfer_ctx.flush_inflight_overwrite_gathers.assert_called_once_with()
+    transfer_ctx.flush_inflight_stores.assert_not_called()

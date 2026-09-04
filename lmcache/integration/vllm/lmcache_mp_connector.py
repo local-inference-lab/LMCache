@@ -851,6 +851,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             the same.
 
         """
+        if self._has_recurrent_cache:
+            # The previous forward may still be snapshotting an in-place state
+            # page. Wait only for that group; stable attention copies continue.
+            self.worker_adapter.flush_inflight_overwrite_gathers()
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
 

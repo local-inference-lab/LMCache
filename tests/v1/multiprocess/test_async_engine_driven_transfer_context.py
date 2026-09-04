@@ -54,6 +54,26 @@ class _FakeStoreContext:
         return None
 
 
+@dataclass
+class _FakeGroupedStoreContext:
+    """Minimal SHM context for grouped async store tests."""
+
+    commit_impl: Callable[[list[torch.Tensor]], bool]
+
+    def prepare_store_grouped(
+        self, _key: object, _instance_id: int
+    ) -> tuple[list[torch.Tensor], list[int], list[int]]:
+        return [torch.zeros(1), torch.zeros(1)], [0, 0], [0, 1]
+
+    def commit_store(
+        self, _key: object, _instance_id: int, chunks: list[torch.Tensor]
+    ) -> bool:
+        return bool(self.commit_impl(chunks))
+
+    def close(self) -> None:
+        return None
+
+
 class _FakeEvent:
     def __init__(self, gate: threading.Event):
         self._gate = gate
@@ -80,13 +100,16 @@ class _FakeTorchDev:
         self._gather_gate = gather_gate
 
     def Stream(self) -> object:
-        return object()
+        return SimpleNamespace(device=0)
 
     def stream(self, stream: object) -> object:
         return nullcontext(stream)
 
     def current_stream(self) -> object:
         return self._stream
+
+    def set_device(self, _device: object) -> None:
+        return None
 
     def Event(self, interprocess: bool = False) -> _FakeEvent:
         return _FakeEvent(self._gather_gate)
@@ -457,4 +480,78 @@ def test_prepare_store_runs_on_background_thread_not_forward_thread(
     # Now release prepare_store and let the background work complete.
     prepare_gate.set()
     t.join(timeout=1)
+    ctx.close()
+
+
+def test_overwrite_fence_finishes_before_stable_group_and_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The next forward waits for recurrent bytes, not the whole async store."""
+    gather_gate = threading.Event()
+    gather_gate.set()
+    overwrite_gathered = threading.Event()
+    stable_gather_started = threading.Event()
+    release_stable_gather = threading.Event()
+
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    monkeypatch.setattr(async_engine_driven, "_ASYNC_MULTIGROUP_STORE", True)
+
+    def _gather(
+        kv_caches: dict[str, torch.Tensor],
+        _block_ids: list[int],
+        _blocks_in_chunk: int,
+        **kwargs: object,
+    ) -> list[torch.Tensor]:
+        if "overwrite" in kv_caches:
+            overwrite_gathered.set()
+        else:
+            stable_gather_started.set()
+            release_stable_gather.wait(timeout=2)
+        out = kwargs.get("out")
+        assert isinstance(out, list)
+        return out
+
+    monkeypatch.setattr(async_engine_driven, "gather_paged_kv_to_cpu", _gather)
+
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._engine_driven_context = _FakeGroupedStoreContext(  # type: ignore[assignment]
+        commit_impl=lambda _chunks: True
+    )
+    ctx._group_states = [  # type: ignore[assignment]
+        SimpleNamespace(
+            name="overwrite",
+            overwrites_in_place=True,
+            blocks_in_chunk=1,
+            blocks_per_window=1,
+            engine_kv_format=object(),
+        ),
+        SimpleNamespace(
+            name="stable",
+            overwrites_in_place=False,
+            blocks_in_chunk=1,
+            blocks_per_window=1,
+            engine_kv_format=object(),
+        ),
+    ]
+    ctx._group_transfer_inputs = (  # type: ignore[method-assign]
+        lambda state, _key, _caches, _ids: ({state.name: torch.zeros(1)}, [0])
+    )
+
+    future = ctx.submit_store(
+        "r1",
+        SimpleNamespace(start=0, end=1),
+        1,
+        {"k": torch.zeros(1)},
+        [[0], [0]],
+        _FakeEvent(gather_gate),
+        1,
+    )
+
+    assert overwrite_gathered.wait(timeout=1)
+    assert stable_gather_started.wait(timeout=1)
+    ctx.flush_inflight_overwrite_gathers()
+
+    assert not future.query(), "stable gather and commit should remain asynchronous"
+    release_stable_gather.set()
+    assert future.result(timeout=1) is True
     ctx.close()

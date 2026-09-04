@@ -1829,6 +1829,21 @@ class LMCacheMPWorkerAdapter:
         self.error_block_ids.clear()
         return errors
 
+    def flush_inflight_overwrite_gathers(self) -> None:
+        """Protect cache pages that the next forward updates in place.
+
+        Async grouped contexts expose a narrow fence after recurrent/window
+        groups reach host memory. Stable attention gathers and server commits
+        remain asynchronous. Synchronous and non-grouped contexts need no
+        additional fence.
+        """
+        if not self.is_healthy or self.transfer_ctx is None:
+            return
+        flush = getattr(self.transfer_ctx, "flush_inflight_overwrite_gathers", None)
+        if flush is None:
+            flush = self.transfer_ctx.flush_inflight_stores
+        flush()
+
     def handle_preemptions(self, need_flush_before_forward: bool) -> None:
         """Handle worker-side preemption hints from connector metadata.
 

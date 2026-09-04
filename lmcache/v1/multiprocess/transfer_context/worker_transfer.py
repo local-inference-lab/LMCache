@@ -246,6 +246,9 @@ class _GroupState:
             one group block ID.
         physical_tokens_per_block: Rank-local tensor slots held by that block.
             This can be smaller than ``logical_tokens_per_block`` under DCP.
+        overwrites_in_place: Whether a later forward can update the same
+            physical cache page. Async stores must finish snapshotting these
+            groups before the next forward starts.
         layout_desc: Chunk layout for this group's objects.
         subblocks_per_manager: Number of fine external objects projected from
             one logical manager block.
@@ -259,6 +262,7 @@ class _GroupState:
     logical_tokens_per_block: int = 0
     physical_tokens_per_block: int = 0
     subblocks_per_manager: int = 1
+    overwrites_in_place: bool = False
 
 
 def resolve_external_chunk_group_geometry(
@@ -865,6 +869,7 @@ class EngineDrivenTransferContext(TransferContext):
                         logical_tokens_per_block=tokens_per_block,
                         physical_tokens_per_block=physical_block_size,
                         subblocks_per_manager=subblocks_per_manager,
+                        overwrites_in_place=group.sw_size_tokens >= 0,
                     )
                 )
             # Group 0's layout doubles as the legacy top-level layout so

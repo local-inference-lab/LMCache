@@ -4,6 +4,7 @@
 # Standard
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+import os
 import threading
 
 # Third Party
@@ -14,17 +15,16 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+from lmcache.v1.multiprocess.transfer_context.pickle import (
+    EngineDrivenContextPickle,
+)
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
     _single_group_block_ids,
 )
-import os  # kimi-k3-async-multigroup-store
-from lmcache.v1.multiprocess.transfer_context.pickle import (  # kimi-k3-async-multigroup-store
-    EngineDrivenContextPickle,
-)
 
-_ASYNC_MULTIGROUP_STORE = os.environ.get("LMCACHE_ASYNC_MULTIGROUP_STORE", "1") == "1"  # kimi-k3-async-multigroup-store
+_ASYNC_MULTIGROUP_STORE = os.environ.get("LMCACHE_ASYNC_MULTIGROUP_STORE", "1") == "1"
 
 logger = init_logger(__name__)
 
@@ -90,12 +90,17 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         )
         self._inflight_lock = threading.Lock()
         self._inflight_gather_events: set[Any] = set()
+        self._inflight_overwrite_gather_events: set[Any] = set()
         # Tracks gather tasks that have been submitted to _commit_executor but
         # have not yet recorded their CUDA event. flush_inflight_stores waits
         # on all of these before synchronizing _inflight_gather_events, closing
         # the window where preemption could overwrite paged KV blocks before an
         # in-flight gather has had a chance to record its CUDA event.
         self._pending_stores: set[threading.Event] = set()
+        # Recurrent and sliding-window groups can update a physical page in the
+        # next forward. Publish their marker/event before stable paged-attention
+        # groups finish copying so only the true source hazard blocks compute.
+        self._pending_overwrite_stores: set[threading.Event] = set()
         # Serializes commit_store calls across worker threads, since the
         # underlying ZMQ socket is not thread-safe and commit_workers defaults
         # to >1.
@@ -197,8 +202,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 "Call register() before submit_store()."
             )
         if self._group_states:
-            # kimi-k3-async-multigroup-store: multi-group stores run the same three-phase background
-            # pipeline as single-group stores unless disabled by env.
+            # Multi-group stores run the same three-phase background pipeline
+            # as single-group stores unless disabled by env.
             if _ASYNC_MULTIGROUP_STORE and not isinstance(
                 self._engine_driven_context, EngineDrivenContextPickle
             ):
@@ -341,7 +346,6 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
 
         return completion
 
-    # kimi-k3-async-multigroup-store: begin
     def _submit_store_multigroup_async(
         self,
         _request_id: str,
@@ -376,17 +380,30 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             for gid, state in enumerate(self._group_states)
         ]
         group_states = list(self._group_states)
+        overwrite_group_ids = [
+            gid for gid, state in enumerate(group_states) if state.overwrites_in_place
+        ]
+        stable_group_ids = [
+            gid
+            for gid, state in enumerate(group_states)
+            if not state.overwrites_in_place
+        ]
         gather_launched = threading.Event()
+        overwrite_gather_launched = threading.Event()
         try:
             with self._inflight_lock:
                 if self._is_closing:
                     completion.set_result(False)
                     return completion
                 self._pending_stores.add(gather_launched)
+                if overwrite_group_ids:
+                    self._pending_overwrite_stores.add(overwrite_gather_launched)
 
             def _prepare_gather_and_commit_grouped() -> None:
                 gather_done: Any | None = None
                 ok = False
+                overwrite_gather_done: Any | None = None
+                overwrite_gather_started = False
                 try:
                     # Executor threads start on CUDA device 0; pin this thread to
                     # the worker's device so the stream context never creates
@@ -401,15 +418,18 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     if not tensors:
                         ok = True
                         return
-                    with torch.inference_mode(), torch_dev.stream(self._copy_stream):
-                        _event.wait(stream=self._copy_stream)
-                        for gid, state in enumerate(group_states):
+
+                    def _gather_groups(group_ids_to_gather: list[int]) -> None:
+                        for gid in group_ids_to_gather:
+                            state = group_states[gid]
                             out_g, chunks_g = self._group_slots(
                                 tensors, group_ids, gid, chunk_indices
                             )
                             if not out_g:
                                 continue
-                            transfer_kv_caches, transfer_block_ids = transfer_inputs[gid]
+                            transfer_kv_caches, transfer_block_ids = transfer_inputs[
+                                gid
+                            ]
                             gather_paged_kv_to_cpu(
                                 transfer_kv_caches,
                                 transfer_block_ids,
@@ -420,6 +440,23 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                 chunk_indices=chunks_g,
                                 blocks_per_window=state.blocks_per_window,
                             )
+
+                    with torch.inference_mode(), torch_dev.stream(self._copy_stream):
+                        _event.wait(stream=self._copy_stream)
+                        overwrite_gather_started = bool(overwrite_group_ids)
+                        _gather_groups(overwrite_group_ids)
+                        if overwrite_group_ids:
+                            overwrite_gather_done = torch_dev.Event()
+                            overwrite_gather_done.record(self._copy_stream)
+                            with self._inflight_lock:
+                                self._inflight_overwrite_gather_events.add(
+                                    overwrite_gather_done
+                                )
+                                self._pending_overwrite_stores.discard(
+                                    overwrite_gather_launched
+                                )
+                            overwrite_gather_launched.set()
+                        _gather_groups(stable_group_ids)
                         gather_done = torch_dev.Event()
                         gather_done.record(self._copy_stream)
                     with self._inflight_lock:
@@ -441,11 +478,26 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     )
                     ok = False
                 finally:
+                    if overwrite_gather_started and overwrite_gather_done is None:
+                        try:
+                            torch_dev.synchronize()
+                        except Exception:
+                            logger.exception(
+                                "Failed to drain an incomplete overwrite gather"
+                            )
                     with self._inflight_lock:
                         if gather_done is not None:
                             self._inflight_gather_events.discard(gather_done)
+                        if overwrite_gather_done is not None:
+                            self._inflight_overwrite_gather_events.discard(
+                                overwrite_gather_done
+                            )
                         self._pending_stores.discard(gather_launched)
+                        self._pending_overwrite_stores.discard(
+                            overwrite_gather_launched
+                        )
                     gather_launched.set()
+                    overwrite_gather_launched.set()
                     completion.set_result(ok)
 
             self._commit_executor.submit(_prepare_gather_and_commit_grouped)
@@ -453,11 +505,12 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             logger.exception("Failed to submit async grouped engine-driven store")
             with self._inflight_lock:
                 self._pending_stores.discard(gather_launched)
+                self._pending_overwrite_stores.discard(overwrite_gather_launched)
             gather_launched.set()
+            overwrite_gather_launched.set()
             completion.set_result(False)
             return completion
         return completion
-    # kimi-k3-async-multigroup-store: end
 
     def flush_inflight_stores(self) -> None:
         """Synchronize all in-flight gather (GPU->CPU) events.
@@ -475,6 +528,26 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         for ev in pending:
             ev.wait()
         self._sync_gather_events(suppress_errors=False)
+
+    def flush_inflight_overwrite_gathers(self) -> None:
+        """Wait for snapshots whose source pages can be overwritten in place.
+
+        Grouped stores publish this fence after recurrent/window groups reach
+        host memory but before stable attention groups or the server commit
+        necessarily finish. A next-forward boundary can call this method to
+        protect in-place state without disabling asynchronous stores.
+        """
+        with self._inflight_lock:
+            pending = list(self._pending_overwrite_stores)
+        for marker in pending:
+            marker.wait()
+        if not self._group_states:
+            self.flush_inflight_stores()
+            return
+        with self._inflight_lock:
+            events = list(self._inflight_overwrite_gather_events)
+        for event in events:
+            event.synchronize()
 
     def close(self) -> None:
         """Drain in-flight gather/commit work before closing the base context."""
