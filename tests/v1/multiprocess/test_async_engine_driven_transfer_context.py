@@ -3,7 +3,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable
+from typing import Callable, cast
 from unittest.mock import MagicMock
 import threading
 import time
@@ -20,6 +20,7 @@ from lmcache.v1.multiprocess.transfer_context import (
 from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
     AsyncEngineDrivenTransferContext,
 )
+from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
 )
@@ -49,6 +50,60 @@ class _FakeStoreContext:
         self, _key: object, _instance_id: int, chunks: list[torch.Tensor]
     ) -> bool:
         return bool(self.commit_impl(chunks))
+
+    def close(self) -> None:
+        return None
+
+
+@dataclass
+class _FakeGroupedStoreContext:
+    """Minimal shared-memory context for async hybrid-KV store tests."""
+
+    commit_impl: Callable[[list[torch.Tensor]], bool]
+    prepare_result: tuple[list[torch.Tensor], list[int], list[int]] | None
+    prepare_impl: Callable[[], None] | None = None
+
+    def prepare_store_grouped(
+        self, _key: object, _instance_id: int
+    ) -> tuple[list[torch.Tensor], list[int], list[int]] | None:
+        if self.prepare_impl is not None:
+            self.prepare_impl()
+        return self.prepare_result
+
+    def commit_store(
+        self, _key: object, _instance_id: int, chunks: list[torch.Tensor]
+    ) -> bool:
+        return bool(self.commit_impl(chunks))
+
+    def close(self) -> None:
+        return None
+
+
+class _FakePickleGroupedStoreContext(EngineDrivenContextPickle):
+    """Pickle context test double without a message-queue dependency."""
+
+    def __init__(
+        self,
+        commit_impl: Callable[[list[list[torch.Tensor]]], bool],
+        prepare_impl: Callable[[], None] | None = None,
+    ) -> None:
+        self._commit_impl = commit_impl
+        self._prepare_impl = prepare_impl
+
+    def prepare_store(
+        self, _key: object, _instance_id: int
+    ) -> tuple[list[torch.Tensor], list[int]] | None:
+        if self._prepare_impl is not None:
+            self._prepare_impl()
+        return None
+
+    def commit_store(  # type: ignore[override]
+        self,
+        _key: object,
+        _instance_id: int,
+        chunks: list[list[torch.Tensor]],
+    ) -> bool:
+        return bool(self._commit_impl(chunks))
 
     def close(self) -> None:
         return None
@@ -129,6 +184,27 @@ def _new_context(
         _FakeStoreContext(commit_impl=commit_impl)  # type: ignore[assignment]
     )
     return ctx
+
+
+def _install_two_group_state(ctx: AsyncEngineDrivenTransferContext) -> None:
+    """Install two minimal hybrid-KV group descriptors on a test context."""
+    ctx._group_states = cast(
+        "list[worker_transfer._GroupState]",
+        [
+            SimpleNamespace(
+                layer_names=["layer_0"],
+                engine_kv_format=object(),
+                blocks_in_chunk=1,
+                blocks_per_window=1,
+            ),
+            SimpleNamespace(
+                layer_names=["layer_1"],
+                engine_kv_format=object(),
+                blocks_in_chunk=2,
+                blocks_per_window=1,
+            ),
+        ],
+    )
 
 
 def test_submit_store_returns_pending_future_until_gather_and_commit(
@@ -457,4 +533,246 @@ def test_prepare_store_runs_on_background_thread_not_forward_thread(
     # Now release prepare_store and let the background work complete.
     prepare_gate.set()
     t.join(timeout=1)
+    ctx.close()
+
+
+def test_multigroup_shm_store_runs_prepare_and_gather_in_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid-KV SHM stores must not block the model forward thread."""
+    gather_gate = threading.Event()
+    prepare_started = threading.Event()
+    prepare_gate = threading.Event()
+    gather_calls: list[tuple[list[str], list[int], int, list[int] | None]] = []
+    committed = threading.Event()
+
+    def _prepare() -> None:
+        prepare_started.set()
+        prepare_gate.wait(timeout=2)
+
+    def _gather(
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[int],
+        blocks_in_chunk: int,
+        **kwargs: object,
+    ) -> list[torch.Tensor]:
+        out = kwargs["out"]
+        assert isinstance(out, list)
+        chunk_indices = kwargs.get("chunk_indices")
+        assert chunk_indices is None or isinstance(chunk_indices, list)
+        gather_calls.append(
+            (list(kv_caches), block_ids, blocks_in_chunk, chunk_indices)
+        )
+        for tensor in out:
+            tensor.fill_(float(len(gather_calls)))
+        return out
+
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    monkeypatch.setattr(async_engine_driven, "gather_paged_kv_to_cpu", _gather)
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+
+    def _commit(chunks: list[torch.Tensor]) -> bool:
+        committed.set()
+        return chunks == []
+
+    ctx._engine_driven_context = _FakeGroupedStoreContext(  # type: ignore[assignment]
+        commit_impl=_commit,
+        prepare_result=(
+            [torch.zeros(1), torch.zeros(1)],
+            [3, 4],
+            [0, 1],
+        ),
+        prepare_impl=_prepare,
+    )
+    _install_two_group_state(ctx)
+
+    future = ctx.submit_store(
+        "hybrid-request",
+        object(),
+        1,
+        {"layer_0": torch.zeros(1), "layer_1": torch.zeros(1)},
+        [[10], [20, 21]],
+        _FakeEvent(gather_gate),
+        1,
+    )
+
+    assert prepare_started.wait(timeout=1)
+    assert not future.query()
+    prepare_gate.set()
+    assert not committed.wait(timeout=0.05)
+    gather_gate.set()
+    assert future.result(timeout=1) is True
+    assert gather_calls == [
+        (["layer_0"], [10], 1, [3]),
+        (["layer_1"], [20, 21], 2, [4]),
+    ]
+    assert committed.is_set()
+    ctx.close()
+
+
+def test_multigroup_pickle_store_commits_group_major_payload_in_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid-KV pickle stores preserve group boundaries off the forward thread."""
+    gather_gate = threading.Event()
+    prepare_started = threading.Event()
+    prepare_gate = threading.Event()
+    committed_payload: list[list[list[torch.Tensor]]] = []
+
+    def _prepare() -> None:
+        prepare_started.set()
+        prepare_gate.wait(timeout=2)
+
+    def _gather(
+        kv_caches: dict[str, torch.Tensor],
+        _block_ids: list[int],
+        _blocks_in_chunk: int,
+        **_kwargs: object,
+    ) -> list[torch.Tensor]:
+        value = 1.0 if "layer_0" in kv_caches else 2.0
+        return [torch.full((1,), value)]
+
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    monkeypatch.setattr(async_engine_driven, "gather_paged_kv_to_cpu", _gather)
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+
+    def _commit(chunks: list[list[torch.Tensor]]) -> bool:
+        committed_payload.append(chunks)
+        return True
+
+    ctx._engine_driven_context = _FakePickleGroupedStoreContext(  # type: ignore[assignment]
+        commit_impl=_commit,
+        prepare_impl=_prepare,
+    )
+    _install_two_group_state(ctx)
+
+    future = ctx.submit_store(
+        "hybrid-pickle-request",
+        object(),
+        1,
+        {"layer_0": torch.zeros(1), "layer_1": torch.zeros(1)},
+        [[10], [20, 21]],
+        _FakeEvent(gather_gate),
+        1,
+    )
+
+    assert prepare_started.wait(timeout=1)
+    assert not future.query()
+    prepare_gate.set()
+    assert not future.query()
+    gather_gate.set()
+    assert future.result(timeout=1) is True
+    assert len(committed_payload) == 1
+    assert [group[0].item() for group in committed_payload[0]] == [1.0, 2.0]
+    ctx.close()
+
+
+def test_multigroup_store_rejects_mismatched_block_id_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every registered hybrid-KV group requires one block-ID sequence."""
+    gather_gate = threading.Event()
+    gather_gate.set()
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._engine_driven_context = _FakeGroupedStoreContext(  # type: ignore[assignment]
+        commit_impl=lambda _chunks: True,
+        prepare_result=([], [], []),
+    )
+    _install_two_group_state(ctx)
+
+    with pytest.raises(ValueError, match="1 block-id lists.*2 registered groups"):
+        ctx.submit_store(
+            "hybrid-request",
+            object(),
+            1,
+            {"layer_0": torch.zeros(1), "layer_1": torch.zeros(1)},
+            [[10]],
+            _FakeEvent(gather_gate),
+            1,
+        )
+    ctx.close()
+
+
+def test_multigroup_shm_store_skips_gather_and_commit_on_full_hit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-reported full hit requires no worker data transfer."""
+    gather_gate = threading.Event()
+    gather_gate.set()
+    gather = MagicMock()
+    commit = MagicMock(return_value=True)
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    monkeypatch.setattr(async_engine_driven, "gather_paged_kv_to_cpu", gather)
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._engine_driven_context = _FakeGroupedStoreContext(  # type: ignore[assignment]
+        commit_impl=commit,
+        prepare_result=([], [], []),
+    )
+    _install_two_group_state(ctx)
+
+    future = ctx.submit_store(
+        "hybrid-hit",
+        object(),
+        1,
+        {"layer_0": torch.zeros(1), "layer_1": torch.zeros(1)},
+        [[10], [20, 21]],
+        _FakeEvent(gather_gate),
+        1,
+    )
+
+    assert future.result(timeout=1) is True
+    gather.assert_not_called()
+    commit.assert_not_called()
+    ctx.close()
+
+
+def test_multigroup_flush_waits_until_gather_event_is_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preemption cannot reuse hybrid-KV blocks before gather is protected."""
+    gather_gate = threading.Event()
+    gather_started = threading.Event()
+    flush_returned = threading.Event()
+
+    class _BlockingFakeTorchDev(_FakeTorchDev):
+        def stream(self, stream: object) -> object:
+            gather_started.set()
+            gather_gate.wait(timeout=2)
+            return super().stream(stream)
+
+    monkeypatch.setattr(
+        async_engine_driven, "torch_dev", _BlockingFakeTorchDev(gather_gate)
+    )
+    _install_fake_gather(monkeypatch)
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._engine_driven_context = _FakeGroupedStoreContext(  # type: ignore[assignment]
+        commit_impl=lambda chunks: chunks == [],
+        prepare_result=([torch.zeros(1), torch.zeros(1)], [0, 0], [0, 1]),
+    )
+    _install_two_group_state(ctx)
+
+    future = ctx.submit_store(
+        "hybrid-preemption",
+        object(),
+        1,
+        {"layer_0": torch.zeros(1), "layer_1": torch.zeros(1)},
+        [[10], [20, 21]],
+        _FakeEvent(gather_gate),
+        1,
+    )
+    assert gather_started.wait(timeout=1)
+
+    def _flush() -> None:
+        ctx.flush_inflight_stores()
+        flush_returned.set()
+
+    thread = threading.Thread(target=_flush, daemon=True)
+    thread.start()
+    assert not flush_returned.wait(timeout=0.05)
+
+    gather_gate.set()
+    thread.join(timeout=2)
+    assert flush_returned.is_set()
+    assert future.result(timeout=1) is True
     ctx.close()
