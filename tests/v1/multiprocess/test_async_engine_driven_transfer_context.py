@@ -558,7 +558,7 @@ def test_multigroup_shm_store_runs_prepare_and_gather_in_background(
         commit_impl=_commit,
         prepare_result=(
             [[torch.zeros(1)], [torch.zeros(1)]],
-            [[3], [4]],
+            [[0], [0]],
         ),
         prepare_impl=_prepare,
     )
@@ -581,8 +581,8 @@ def test_multigroup_shm_store_runs_prepare_and_gather_in_background(
     gather_gate.set()
     assert future.result(timeout=1) is True
     assert gather_calls == [
-        (["layer_0"], [10], 1, [3]),
-        (["layer_1"], [20, 21], 2, [4]),
+        (["layer_0"], [10], 1, [0]),
+        (["layer_1"], [20, 21], 2, [0]),
     ]
     assert committed.is_set()
     ctx.close()
