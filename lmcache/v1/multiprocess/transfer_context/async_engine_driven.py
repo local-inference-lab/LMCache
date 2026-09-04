@@ -194,18 +194,13 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 "Call register() before submit_store()."
             )
         if self._worker_groups:
-            # The async staging pool is single-layout. Hybrid groups may have
-            # distinct shapes and partial SHM reservations, so use the proven
-            # synchronous grouped path until a group-aware async scheduler is
-            # introduced.
-            return super().submit_store(
+            return self._submit_store_multigroup_async(
                 _request_id,
                 key,
                 instance_id,
                 kv_caches,
                 block_ids,
                 _event,
-                blocks_in_chunk,
             )
         completion: MessagingFuture[bool] = MessagingFuture()
         engine_driven_context = self._engine_driven_context
@@ -403,3 +398,150 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 if not suppress_errors:
                     raise
                 logger.exception("Failed while draining gather events")
+
+    def _submit_store_multigroup_async(
+        self,
+        request_id: str,
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        event: IPCEvent,
+    ) -> MessagingFuture:
+        """Submit a hybrid-KV store without blocking the forward thread.
+
+        Every registered KV group is gathered on the context's copy stream
+        after ``event`` establishes that model writes are complete. Named
+        shared-memory transport writes directly into server-reserved slots;
+        pickle transport gathers a group-major payload. The returned future
+        resolves only after all groups have been committed.
+
+        Args:
+            request_id: External request identifier used in diagnostics.
+            key: LMCache key for the stored token range.
+            instance_id: Worker process instance identifier.
+            kv_caches: Worker KV cache tensors keyed by layer name.
+            block_ids: Per-group vLLM block IDs for the stored token range.
+            event: CUDA event recorded after the model has written the blocks.
+
+        Returns:
+            A future resolving to ``True`` after every group is committed, or
+            ``False`` if preparation, gather, or commit fails.
+
+        Raises:
+            RuntimeError: If the transfer context is not registered.
+            ValueError: If ``block_ids`` does not match the registered groups.
+        """
+        engine_driven_context = self._engine_driven_context
+        if engine_driven_context is None:
+            raise RuntimeError(
+                "Engine-driven transfer context is not registered. "
+                "Call register() before submit_store()."
+            )
+        if len(block_ids) != len(self._worker_groups):
+            raise ValueError(
+                f"got {len(block_ids)} block-id lists for "
+                f"{len(self._worker_groups)} registered groups"
+            )
+
+        completion: MessagingFuture[bool] = MessagingFuture()
+        gather_launched = threading.Event()
+        try:
+            with self._inflight_lock:
+                if self._is_closing:
+                    completion.set_result(False)
+                    return completion
+                self._pending_stores.add(gather_launched)
+
+            def _prepare_gather_and_commit() -> None:
+                gather_done: Any | None = None
+                ok = False
+                prepared_store = False
+                group_out_buffers: list[list[torch.Tensor]] | None = None
+                try:
+                    prepared = engine_driven_context.prepare_store_grouped(
+                        key, instance_id
+                    )
+                    prepared_store = True
+                    group_out_buffers, group_chunk_indices = (
+                        prepared if prepared is not None else (None, None)
+                    )
+                    if group_chunk_indices is not None and not any(
+                        group_chunk_indices
+                    ):
+                        ok = True
+                        return
+
+                    with torch.inference_mode(), torch_dev.stream(self._copy_stream):
+                        event.wait(stream=self._copy_stream)
+                        gathered_groups = self._gather_group_payloads(
+                            kv_caches,
+                            block_ids,
+                            out_buffers=group_out_buffers,
+                            group_chunk_indices=group_chunk_indices,
+                        )
+                        gather_done = torch_dev.Event()
+                        gather_done.record(self._copy_stream)
+
+                    with self._inflight_lock:
+                        self._inflight_gather_events.add(gather_done)
+                        self._pending_stores.discard(gather_launched)
+                    gather_launched.set()
+                    gather_done.synchronize()
+
+                    # SHM payload tensors are already written in place; pickle
+                    # transport serializes the group-major gathered tensors.
+                    commit_payload = (
+                        gathered_groups if group_out_buffers is None else []
+                    )
+                    with self._commit_lock:
+                        ok = engine_driven_context.commit_store_grouped(
+                            key, instance_id, commit_payload
+                        )
+                    if not ok:
+                        with self._commit_lock:
+                            self._abort_store_safely(key, instance_id)
+                        logger.error(
+                            "Async multi-group engine-driven commit failed "
+                            "for request_id=%s",
+                            request_id,
+                        )
+                except StoreAdmissionRejected as exc:
+                    logger.warning(
+                        "Skipping async engine-driven hybrid cache store for "
+                        "request_id=%s: reason=%s",
+                        request_id,
+                        exc.reason,
+                    )
+                    ok = False
+                except Exception:
+                    logger.exception(
+                        "Async multi-group engine-driven store failed "
+                        "for request_id=%s",
+                        request_id,
+                    )
+                    if group_out_buffers is not None:
+                        # A failed gather can leave writes targeting reserved
+                        # SHM slots. Drain them before releasing reservations.
+                        torch_dev.synchronize()
+                    if prepared_store:
+                        with self._commit_lock:
+                            self._abort_store_safely(key, instance_id)
+                    ok = False
+                finally:
+                    with self._inflight_lock:
+                        if gather_done is not None:
+                            self._inflight_gather_events.discard(gather_done)
+                        self._pending_stores.discard(gather_launched)
+                    gather_launched.set()
+                    completion.set_result(ok)
+
+            self._commit_executor.submit(_prepare_gather_and_commit)
+        except Exception:
+            logger.exception("Failed to submit async multi-group engine-driven store")
+            with self._inflight_lock:
+                self._pending_stores.discard(gather_launched)
+            gather_launched.set()
+            completion.set_result(False)
+
+        return completion
