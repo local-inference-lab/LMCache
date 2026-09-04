@@ -2218,6 +2218,42 @@ def test_server_unregister_engine_driven_context_releases_pending_shm_locks(
     mock_storage.abort_write.assert_called_once()
     mock_storage.finish_read_prefetched.assert_called_once()
 
+    # A late commit receives a terminal failure. The unregister path already
+    # released the pending read, so the rejected commit must not release it
+    # for a second time.
+    compact_key = key.as_retrieve_session_reference()
+    assert module.commit_retrieve(compact_key, 4) is False
+    mock_storage.finish_read_prefetched.assert_called_once()
+
+
+def test_server_missing_engine_context_releases_compact_prepare_locks_once(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Rejected compact prepares release one worker's lookup share once."""
+    module, mock_storage, mock_session, ctx = server_module_factory()
+    ctx.session_manager.get.return_value = mock_session
+    mock_session.prepare_failed_retrieve_release.return_value = (
+        1,
+        (0,),
+        (-1,),
+        9,
+    )
+    mock_session.claim_failed_retrieve_release.side_effect = [True, False]
+    compact_key = _default_key().as_retrieve_session_reference()
+
+    with patch(
+        "lmcache.v1.multiprocess.modules.engine_driven_transfer."
+        "resolve_prefetched_obj_keys",
+        return_value=["obj"],
+    ):
+        first = module.prepare_retrieve(compact_key, 404)
+        duplicate = module.prepare_retrieve(compact_key, 404)
+
+    assert first.success is False
+    assert duplicate.success is False
+    mock_storage.finish_read_prefetched.assert_called_once_with(["obj"], read_locks=1)
+
 
 def test_server_close_releases_pending_shm_locks(
     stub_lmcache_native: Any,

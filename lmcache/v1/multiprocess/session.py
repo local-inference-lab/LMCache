@@ -185,29 +185,48 @@ class Session:
                 raise ValueError(
                     "retrieve session reference has no active lookup metadata"
                 )
-            if (
-                key.request_id != lookup_key.request_id
-                or key.model_name != lookup_key.model_name
-                or key.world_size != lookup_key.world_size
-                or key.cache_salt != lookup_key.cache_salt
-                or key.num_kv_readers != lookup_key.num_kv_readers
-                or key.worker_id is None
+            if not self._matches_active_lookup(
+                key,
+                lookup_key,
+                accept_token_free_reference=True,
             ):
                 raise ValueError(
                     "retrieve session reference does not match its active lookup"
                 )
             chunk_size = self.hasher.chunk_size
-            if (
-                key.start < lookup_key.start
-                or key.end > lookup_key.end
-                or key.start > key.end
-                or key.start % chunk_size != 0
-                or key.end % chunk_size != 0
-            ):
-                raise ValueError(
-                    "retrieve session reference has an invalid token range"
-                )
             return list(chunk_hashes[key.start // chunk_size : key.end // chunk_size])
+
+    def _matches_active_lookup(
+        self,
+        key: IPCCacheServerKey,
+        lookup_key: IPCCacheServerKey,
+        *,
+        accept_token_free_reference: bool,
+    ) -> bool:
+        """Validate that a worker key belongs to the active lookup.
+
+        Token-free keys are accepted only when the caller explicitly enables
+        the compact engine-driven retrieve protocol. All isolation, topology,
+        reader-count, worker, and aligned-range checks remain mandatory.
+        """
+        tokens_match = key.token_ids == lookup_key.token_ids
+        if accept_token_free_reference and not key.token_ids:
+            tokens_match = True
+        chunk_size = self.hasher.chunk_size
+        return (
+            key.request_id == lookup_key.request_id == self.request_id
+            and key.model_name == lookup_key.model_name
+            and key.world_size == lookup_key.world_size
+            and key.cache_salt == lookup_key.cache_salt
+            and key.num_kv_readers == lookup_key.num_kv_readers
+            and key.worker_id is not None
+            and tokens_match
+            and key.start >= lookup_key.start
+            and key.end <= lookup_key.end
+            and key.start <= key.end
+            and key.start % chunk_size == 0
+            and key.end % chunk_size == 0
+        )
 
     def get_lookup_chunk_hashes(self) -> list[bytes] | None:
         """Return the hashes retained for the active lookup, if available."""
@@ -240,13 +259,10 @@ class Session:
             if lookup_key is None or hit_chunks < 0:
                 return None
 
-            same_lookup = (
-                key.model_name == lookup_key.model_name
-                and key.world_size == lookup_key.world_size
-                and key.token_ids == lookup_key.token_ids
-                and key.cache_salt == lookup_key.cache_salt
-                and key.start >= lookup_key.start
-                and key.end <= lookup_key.end
+            same_lookup = self._matches_active_lookup(
+                key,
+                lookup_key,
+                accept_token_free_reference=True,
             )
             if not same_lookup:
                 return None
@@ -285,13 +301,10 @@ class Session:
             if lookup_key is None or lookup_generation != self._lookup_generation:
                 return False
 
-            same_lookup = (
-                key.model_name == lookup_key.model_name
-                and key.world_size == lookup_key.world_size
-                and key.token_ids == lookup_key.token_ids
-                and key.cache_salt == lookup_key.cache_salt
-                and key.start >= lookup_key.start
-                and key.end <= lookup_key.end
+            same_lookup = self._matches_active_lookup(
+                key,
+                lookup_key,
+                accept_token_free_reference=True,
             )
             if not same_lookup:
                 return False
