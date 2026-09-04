@@ -417,8 +417,7 @@ void multi_layer_block_kv_transfer_templated(
   // full 32-thread row per head is not always a legal launch configuration.
   // warp_copy already walks the head payload with blockDim.x as its stride;
   // reducing the row width therefore preserves coverage and ordering.
-  int thread_dim_x =
-      std::min({elements_per_head, 32, 1024 / shape_desc.nh});
+  int thread_dim_x = std::min({elements_per_head, 32, 1024 / shape_desc.nh});
   int thread_dim_y = shape_desc.nh;
   int thread_dim_z =
       std::min(shape_desc.bs, 1024 / (thread_dim_x * thread_dim_y));
