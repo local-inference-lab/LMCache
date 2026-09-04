@@ -647,6 +647,98 @@ def test_multigroup_pickle_store_commits_group_major_payload_in_background(
     ctx.close()
 
 
+def test_single_group_pickle_gather_failure_drains_enqueued_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed pickle gather cannot release staging while a copy uses it."""
+    gather_gate = threading.Event()
+    gather_gate.set()
+    synchronized = threading.Event()
+
+    class _RecordingTorchDev(_FakeTorchDev):
+        def synchronize(self) -> None:
+            synchronized.set()
+
+    def _failing_gather(*_args: object, **_kwargs: object) -> list[torch.Tensor]:
+        raise RuntimeError("copy enqueued before failure")
+
+    monkeypatch.setattr(
+        async_engine_driven, "torch_dev", _RecordingTorchDev(gather_gate)
+    )
+    monkeypatch.setattr(async_engine_driven, "gather_paged_kv_to_cpu", _failing_gather)
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._engine_driven_context = _FakeStoreContext(  # type: ignore[assignment]
+        commit_impl=lambda _chunks: True
+    )
+
+    future = ctx.submit_store(
+        "pickle-failure",
+        object(),
+        1,
+        {"layer_0": torch.zeros(1)},
+        [[10]],
+        _FakeEvent(gather_gate),
+        1,
+    )
+
+    assert future.result(timeout=1) is False
+    assert synchronized.is_set()
+    ctx.close()
+
+
+def test_multigroup_pickle_partial_gather_drains_enqueued_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later group failure drains copies enqueued by earlier groups."""
+    gather_gate = threading.Event()
+    gather_gate.set()
+    synchronized = threading.Event()
+    gather_calls = 0
+    commit = MagicMock(return_value=True)
+
+    class _RecordingTorchDev(_FakeTorchDev):
+        def synchronize(self) -> None:
+            synchronized.set()
+
+    def _partially_failing_gather(
+        *_args: object, **_kwargs: object
+    ) -> list[torch.Tensor]:
+        nonlocal gather_calls
+        gather_calls += 1
+        if gather_calls == 2:
+            raise RuntimeError("second group failed after first copy")
+        return [torch.ones(1)]
+
+    monkeypatch.setattr(
+        async_engine_driven, "torch_dev", _RecordingTorchDev(gather_gate)
+    )
+    monkeypatch.setattr(
+        worker_transfer, "gather_paged_kv_to_cpu", _partially_failing_gather
+    )
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._engine_driven_context = _FakeGroupedStoreContext(  # type: ignore[assignment]
+        commit_impl=commit,
+        prepare_result=None,
+    )
+    _install_two_group_state(ctx)
+
+    future = ctx.submit_store(
+        "hybrid-pickle-failure",
+        object(),
+        1,
+        {"layer_0": torch.zeros(1), "layer_1": torch.zeros(1)},
+        [[10], [20, 21]],
+        _FakeEvent(gather_gate),
+        1,
+    )
+
+    assert future.result(timeout=1) is False
+    assert gather_calls == 2
+    assert synchronized.is_set()
+    commit.assert_not_called()
+    ctx.close()
+
+
 def test_multigroup_store_rejects_mismatched_block_id_groups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

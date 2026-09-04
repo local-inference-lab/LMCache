@@ -220,6 +220,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
 
             def _prepare_gather_and_commit() -> None:
                 gather_done: Any | None = None
+                gather_may_be_inflight = False
                 ok = False
                 # Whether we gathered directly into SHM views (True) or into
                 # pinned staging buffers that need to be released later (False).
@@ -274,6 +275,10 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     with torch.inference_mode(), torch_dev.stream(self._copy_stream):
                         _event.wait(stream=self._copy_stream)
 
+                        # The gather helper can enqueue copies before raising.
+                        # Keep source blocks and staging buffers alive until a
+                        # device-wide drain proves that no copy still uses them.
+                        gather_may_be_inflight = True
                         gather_paged_kv_to_cpu(
                             kv_caches,
                             full_block_ids,
@@ -295,6 +300,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
 
                     if gather_done is not None:
                         gather_done.synchronize()
+                    gather_may_be_inflight = False
 
                     # --- Phase 3: commit ---
                     with self._commit_lock:
@@ -322,9 +328,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         "Async engine-driven store failed for request_id=%s",
                         _request_id,
                     )
-                    if used_shm_direct:
-                        # Drain any partially enqueued SHM writes before their
-                        # server-side reservations are released.
+                    if gather_may_be_inflight:
+                        # Drain partially enqueued copies before releasing SHM
+                        # reservations, staging buffers, or source KV blocks.
                         torch_dev.synchronize()
                     if prepared_store:
                         with self._commit_lock:
@@ -455,6 +461,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
 
             def _prepare_gather_and_commit() -> None:
                 gather_done: Any | None = None
+                gather_may_be_inflight = False
                 ok = False
                 prepared_store = False
                 group_out_buffers: list[list[torch.Tensor]] | None = None
@@ -472,6 +479,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
 
                     with torch.inference_mode(), torch_dev.stream(self._copy_stream):
                         event.wait(stream=self._copy_stream)
+                        # A later group can fail after an earlier group has
+                        # already enqueued a device-to-host copy.
+                        gather_may_be_inflight = True
                         gathered_groups = self._gather_group_payloads(
                             kv_caches,
                             block_ids,
@@ -486,6 +496,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         self._pending_stores.discard(gather_launched)
                     gather_launched.set()
                     gather_done.synchronize()
+                    gather_may_be_inflight = False
 
                     # SHM payload tensors are already written in place; pickle
                     # transport serializes the group-major gathered tensors.
@@ -518,9 +529,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         "for request_id=%s",
                         request_id,
                     )
-                    if group_out_buffers is not None:
-                        # A failed gather can leave writes targeting reserved
-                        # SHM slots. Drain them before releasing reservations.
+                    if gather_may_be_inflight:
+                        # Drain partially enqueued copies for both SHM and
+                        # pickle transport before releasing their storage.
                         torch_dev.synchronize()
                     if prepared_store:
                         with self._commit_lock:
