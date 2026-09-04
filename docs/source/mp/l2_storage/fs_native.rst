@@ -22,9 +22,43 @@ I/O queue depth on a single Python thread.
   ``O_DIRECT``.  Required to measure real disk bandwidth.  See alignment
   caveat below.
 - ``read_ahead_size`` (int, optional): Trigger filesystem readahead by
-  issuing a warm-up read of this many bytes at open time.
+  issuing a warm-up read of this many bytes at open time.  This is skipped
+  for reads that use ``O_DIRECT`` because direct I/O bypasses the page cache.
 - ``max_capacity_gb`` (float, default ``0``): Maximum L2 capacity in GB
-  for client-side usage tracking.  Default ``0`` disables tracking.
+  for client-side usage enforcement and global eviction. Default ``0``
+  leaves capacity unlimited; resident-byte accounting remains available.
+
+Restart recovery
+----------------
+
+At construction, ``fs_native`` inventories complete ``.data`` files already
+present directly under ``base_path``. Their sizes seed capacity accounting and
+their modification times reconstruct a deterministic, best-effort LRU order
+(oldest first), so restart does not temporarily treat a populated cache as
+empty. This scan happens before request-serving controllers can use the adapter.
+
+Only positive-size regular files whose names decode with the current
+``ObjectKey`` filename format are restored. Temporary files, subdirectories,
+symlinks, unrecognized legacy/foreign names, and empty files are ignored; a
+bounded warning identifies ignored ``.data`` files. Missing files caused by a
+concurrent cleanup are tolerated, but other scan or stat errors fail startup to
+avoid silently undercounting capacity.
+
+For exact accounting, give one server exclusive ownership of ``base_path`` (or
+otherwise keep it quiescent) during startup. Modification time is only a restart
+ordering approximation; runtime accesses continue to update the normal LRU.
+
+Atomic publication
+------------------
+
+Both filesystem adapters write each store into a writer-owned temporary inode
+opened with create-exclusive semantics. After the write is closed, a hard link
+publishes that complete inode only if the final key does not already exist.
+Concurrent or cross-process duplicate stores therefore succeed without sharing
+writable storage or replacing an established value; readers see either no key
+or one complete value. Temporary files live under ``base_path`` (or its
+``relative_tmp_dir`` child) so publication remains on one filesystem, and each
+writer removes its temporary link after winning or losing the publish race.
 
 .. important::
 
@@ -46,10 +80,10 @@ I/O queue depth on a single Python thread.
       also be aligned (typically to 4096 bytes on local disks, or to the
       FS block size on parallel filesystems).  This is controlled by
       ``--l1-align-bytes`` (default ``4096``) -- raise it to match the
-      FS block size when running on a filesystem with larger blocks.  If
-      the buffer is misaligned, the underlying ``read``/``write`` syscall
-      returns ``EINVAL`` (this is **not** caught by the length-fallback
-      path above and will surface as a runtime error).
+      FS block size when running on a filesystem with larger blocks. If the
+      buffer is misaligned, the connector falls back to buffered I/O for that
+      operation. Correctness is preserved, but a real-disk benchmark must
+      align both length and address to guarantee direct I/O.
 
    If unsure, start with ``use_odirect: false`` and confirm correctness
    before enabling ``O_DIRECT``.

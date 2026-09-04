@@ -39,6 +39,10 @@ class _FakeSM:
         self.calls.append(("reserve_write", kw))
         return {}
 
+    def reserve_write_detailed(self, **kw: Any) -> dict[Any, Any]:
+        self.calls.append(("reserve_write_detailed", kw))
+        return {}
+
     def finish_write(self, **kw: Any) -> None:
         self.calls.append(("finish_write", kw))
 
@@ -99,6 +103,7 @@ class TestDefaultDispatcher:
         d = build_default_dispatcher()
         expected = {
             f"{_SM_PREFIX}.reserve_write",
+            f"{_SM_PREFIX}.reserve_write_detailed",
             f"{_SM_PREFIX}.finish_write",
             f"{_SM_PREFIX}.submit_prefetch_task",
             f"{_SM_PREFIX}.finish_read_prefetched",
@@ -122,6 +127,16 @@ class TestDefaultDispatcher:
                 {"keys": [_key(1)], "layout_desc": "LAYOUT", "mode": "new"},
             ),
         ]
+
+    def test_detailed_reservation_forwarded_with_kwargs(self):
+        sm = _FakeSM()
+        ctx = ReplayContext(sm=sm)
+        d = build_default_dispatcher()
+        args = {"keys": [_key(1)], "layout_desc": "LAYOUT", "mode": "new"}
+
+        d.dispatch(f"{_SM_PREFIX}.reserve_write_detailed", ctx, args)
+
+        assert sm.calls == [("reserve_write_detailed", args)]
 
     def test_read_prefetched_enter_exit_fifo(self):
         """Two overlapping contexts with identical keys exit in FIFO order."""

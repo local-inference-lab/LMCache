@@ -14,6 +14,8 @@ import zmq
 # First Party
 from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
+from lmcache.usage_telemetry.l1_usage import InitializeL1Usage
+from lmcache.usage_telemetry.l2_usage import InitializeL2ConnectorUsage
 from lmcache.usage_telemetry.mp import InitializeMPUsageContext
 from lmcache.usage_telemetry.mp_continuous import InitializeMPContinuousUsage
 from lmcache.v1.distributed.config import (
@@ -27,6 +29,10 @@ from lmcache.v1.mp_observability.config import (
     add_observability_args,
     init_observability,
     parse_args_to_observability_config,
+)
+from lmcache.v1.mp_observability.gc_monitor import (
+    init_gc_monitor,
+    shutdown_gc_monitor,
 )
 from lmcache.v1.mp_observability.trace import maybe_initialize_trace_recorder
 from lmcache.v1.multiprocess.config import (
@@ -48,6 +54,8 @@ from lmcache.v1.multiprocess.engine_module import (
 from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
     EngineDrivenTransferModule,
 )
+from lmcache.v1.multiprocess.modules.experimental import EXPERIMENTAL_TRANSFER
+from lmcache.v1.multiprocess.modules.experimental.qstore import QStoreModule
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
 )
@@ -61,6 +69,7 @@ from lmcache.v1.multiprocess.protocol import (
     get_payload_classes,
 )
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
+from lmcache.v1.platform.isolated_ipc import set_isolated_ipc
 
 logger = init_logger(__name__)
 
@@ -211,33 +220,18 @@ def _build_modules(
     logger.info("Supported transfer mode: %s", mp_config.supported_transfer_mode)
 
     # Targets the reaper scans (and reap-notifies). The transfer modules own
-    # per-instance liveness; BlendV3Module is appended below as a state mirror.
+    # per-instance liveness; BlendModule is appended below as a state mirror.
     liveness_targets: list[InstanceLivenessTarget] = [
         m
         for m in transfer_modules
         if isinstance(m, (LMCacheDrivenTransferModule, EngineDrivenTransferModule))
     ]
 
-    # At most one blend module is ever built (engine_type selects one).
     blend_module: EngineModule | None = None
-
-    if mp_config.engine_type == "blend_legacy":
-        if mp_config.supported_transfer_mode == "engine_driven":
-            raise ValueError(
-                "Legacy blend engine requires supported_transfer_mode to be "
-                f"'lmcache_driven' or 'auto', got "
-                f"'{mp_config.supported_transfer_mode}'"
-            )
-        # First Party
-        from lmcache.v1.multiprocess.modules.blend import BlendModule
-
-        blend_module = BlendModule(ctx)
-
-    # "blend" selects CacheBlend V3 (the current implementation).
     if mp_config.engine_type == "blend":
         if mp_config.supported_transfer_mode == "engine_driven":
             raise ValueError(
-                "blend (V3) engine requires supported_transfer_mode "
+                "blend engine requires supported_transfer_mode "
                 f"'lmcache_driven' or 'auto', got "
                 f"'{mp_config.supported_transfer_mode}'"
             )
@@ -245,7 +239,7 @@ def _build_modules(
         from lmcache.v1.mp_coordinator.blend_client import (
             BlendCoordinatorClient,
         )
-        from lmcache.v1.multiprocess.modules.blend_v3 import BlendV3Module
+        from lmcache.v1.multiprocess.modules.blend import BlendModule
 
         transfer_module = next(
             m for m in transfer_modules if isinstance(m, LMCacheDrivenTransferModule)
@@ -253,23 +247,63 @@ def _build_modules(
         # Opt-in: enabled when a coordinator URL is configured (flag or
         # LMCACHE_COORDINATOR_URL, resolved at config parsing); otherwise
         # None and the blend module matches purely locally.
-        coordinator = BlendCoordinatorClient.maybe_create(coordinator_config.url)
-        blend_v3 = BlendV3Module(
+        #
+        # Fleet matching also needs cache-event reporting on: the blend
+        # index it queries is built from that stream.
+        if coordinator_config.url and not coordinator_config.event_reporting:
+            logger.warning(
+                "Coordinator URL is set but cache-event reporting is off, so "
+                "the coordinator has no cache state to match against: fleet "
+                "CacheBlend matching is disabled and blend will match "
+                "locally only. Pass --coordinator-event-reporting (or set "
+                "LMCACHE_COORDINATOR_EVENT_REPORTING=true) to enable it."
+            )
+        coordinator = BlendCoordinatorClient.maybe_create(
+            coordinator_config.url if coordinator_config.event_reporting else "",
+            timeout=coordinator_config.blend_timeout,
+            match_concurrency=coordinator_config.blend_match_concurrency,
+        )
+        blend = BlendModule(
             ctx,
             transfer_module,
             coordinator=coordinator,
             enable_segmented_prefix=mp_config.enable_segmented_prefix,
+            enable_dedup_content=mp_config.enable_dedup_content,
         )
-        blend_module = blend_v3
-        # blend_v3 mirrors per-instance CB rope state, so the reaper must
-        # notify it via drop_instance_state when an instance is reaped.
-        liveness_targets.append(blend_v3)
+        blend_module = blend
+        # The blend module mirrors per-instance CB rope state, so the reaper
+        # must notify it via drop_instance_state when an instance is reaped.
+        liveness_targets.append(blend)
+
+    # Experimental intermediate tensor transfer modules
+    lmcache_driven_module = next(
+        (m for m in transfer_modules if isinstance(m, LMCacheDrivenTransferModule)),
+        None,
+    )
+    enabled_modules = set(mp_config.enable)
+    experimental_transfer: list[str] = []
+    experimental_modules: list[EngineModule] = []
+    for enabled_module in enabled_modules:
+        if enabled_module not in EXPERIMENTAL_TRANSFER:
+            raise ValueError(
+                f"Unknown --enable experimental module '{enabled_module}'."
+            )
+        if lmcache_driven_module is None:
+            raise ValueError(
+                f"Experimental module '{enabled_module}' requires "
+                "supported_transfer_mode='lmcache_driven' or 'auto'."
+            )
+        module = QStoreModule(ctx)
+        experimental_modules.append(module)
+        liveness_targets.append(module)
+        experimental_transfer.append(enabled_module)
 
     management = ManagementModule(
         ctx,
         liveness_targets=liveness_targets,
         worker_reap_timeout_seconds=mp_config.worker_reap_timeout_seconds,
         worker_registration_grace_seconds=mp_config.worker_registration_grace_seconds,
+        experimental_transfer=experimental_transfer,
     )
 
     # ManagementModule precedes the transfer/blend modules so close() stops
@@ -281,6 +315,7 @@ def _build_modules(
         p2p_controller,
         management,
         *transfer_modules,
+        *experimental_modules,
         *blend_modules,
     ]
 
@@ -312,6 +347,10 @@ def run_cache_server(
         If return_engine is True: tuple of (MessageQueueServer, MPCacheServer).
         If return_engine is False: None (blocks until interrupted).
     """
+    # Before any event IPC backend is resolved (KV-cache registration), so
+    # the setting is observed by every resolver in this process.
+    set_isolated_ipc(mp_config.isolated_ipc)
+
     # mp_config.instance_id is this server's single source of identity (set via
     # --instance-id, else a random UUID v4). Project it onto the OTel
     # service.instance.id unless observability set that attribute explicitly, so
@@ -322,6 +361,8 @@ def run_cache_server(
     event_bus = init_observability(
         obs_config, start_prometheus_http_server=start_prometheus_http_server
     )
+
+    init_gc_monitor(obs_config.gc_monitor)
 
     maybe_initialize_trace_recorder(event_bus, obs_config, storage_manager_config)
 
@@ -350,14 +391,17 @@ def run_cache_server(
                 )
                 mem_cfg.shm_name = ""
 
-    # blend engine: single object group + full per-chunk SWA KV
+    # blend engine: full per-chunk SWA KV (blended chunks reuse at arbitrary
+    # positions). full_sw_kv widens attention groups only; recurrent groups
+    # keep their one-block restore window, so a blend server also serves
+    # stock hybrid clients.
     is_blend = mp_config.engine_type == "blend"
 
     ctx = MPCacheServerContext(
         storage_manager_config=storage_manager_config,
         chunk_size=mp_config.chunk_size,
         hash_algorithm=mp_config.hash_algorithm,
-        separate_object_groups=mp_config.separate_object_groups and not is_blend,
+        separate_object_groups=mp_config.separate_object_groups,
         full_sw_kv=is_blend,
     )
 
@@ -366,6 +410,8 @@ def run_cache_server(
 
     InitializeMPUsageContext(mp_config, storage_manager_config)
     InitializeMPContinuousUsage(event_bus, mp_config.chunk_size)
+    InitializeL2ConnectorUsage(event_bus, ctx.storage_manager)
+    InitializeL1Usage(event_bus, ctx.storage_manager)
 
     zmq_context = zmq.Context.instance()
     server = MessageQueueServer(
@@ -423,6 +469,8 @@ def run_cache_server(
         event_bus.stop()
         server.close()
         engine.close()
+    finally:
+        shutdown_gc_monitor()
     return None
 
 

@@ -21,13 +21,14 @@ single-gap repros.
 from __future__ import annotations
 
 # Standard
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 import hashlib
 import threading
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.native_storage_ops import Bitmap
+    from lmcache.lmcache_native import Bitmap
     from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
     from lmcache.v1.distributed.internal_api import L1MemoryDesc
     from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
@@ -309,10 +310,10 @@ class FaultInjectL2Adapter(L2AdapterInterface):
     # -- lookup and lock (pure delegation) ------------------------------------
 
     def submit_lookup_and_lock_task(
-        self, keys: list[ObjectKey], layout_desc: MemoryLayoutDesc
+        self, keys: list[ObjectKey], group_layout_descs: dict[int, MemoryLayoutDesc]
     ) -> L2TaskId:
         """Delegate the lookup-and-lock task to the inner adapter (not faulted)."""
-        return self._inner.submit_lookup_and_lock_task(keys, layout_desc)
+        return self._inner.submit_lookup_and_lock_task(keys, group_layout_descs)
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
         """Delegate to the inner adapter; lookup results are passed through.
@@ -384,6 +385,11 @@ class FaultInjectL2Adapter(L2AdapterInterface):
         """Forward the listener registration to the inner adapter."""
         self._inner.register_listener(listener)
 
+    def set_backend_identity(self, name: str, shared: bool = False) -> None:
+        """Forward the event-tagging identity to the inner adapter (which
+        owns the listener-notify funnel that tags cache events)."""
+        self._inner.set_backend_identity(name, shared)
+
     def delete(self, keys: list[ObjectKey]) -> None:
         """Delegate the delete to the inner adapter."""
         self._inner.delete(keys)
@@ -391,6 +397,10 @@ class FaultInjectL2Adapter(L2AdapterInterface):
     def get_usage(self) -> AdapterUsage:
         """Return the inner adapter's usage; this layer holds no data of its own."""
         return self._inner.get_usage()
+
+    def get_existing_key_sizes(self) -> Mapping[ObjectKey, int]:
+        """Forward the persistent inventory owned by the inner adapter."""
+        return self._inner.get_existing_key_sizes()
 
     @property
     def supports_global_eviction(self) -> bool:

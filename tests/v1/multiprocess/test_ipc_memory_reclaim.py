@@ -17,9 +17,14 @@ module (``torch_dev``).
 # Standard
 # Standard Library
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
+import threading
 import time
 import weakref
+
+# Third Party
+import pytest
 
 # First Party
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
@@ -109,6 +114,100 @@ def test_unregister_reclaims_ipc_memory(monkeypatch) -> None:
     ctx.close.assert_called_once()
     assert dev.calls == ["empty_cache", "ipc_collect"]
     assert module.context_entries_snapshot() == {}
+
+
+def test_unregister_then_reregister_in_same_server(monkeypatch) -> None:
+    """A server process can replace a mapping while retaining its contexts."""
+    dev = _FakeTorchDev()
+    monkeypatch.setattr(gpu_mod, "torch_dev", dev)
+    module = _module(monkeypatch)
+    first = _register(module, monkeypatch, 7)
+
+    module.unregister_kv_cache(7)
+    second = _register(module, monkeypatch, 7)
+
+    first.close.assert_called_once()
+    second.close.assert_not_called()
+    assert list(module.context_entries_snapshot()) == [7]
+    assert dev.calls == ["empty_cache", "ipc_collect"]
+    assert not hasattr(dev, "device_reset")
+
+
+@pytest.mark.parametrize("cleanup_kind", ["unregister", "reap"])
+def test_cleanup_waits_for_active_store(
+    monkeypatch: pytest.MonkeyPatch, cleanup_kind: str
+) -> None:
+    """Unregister and reaping drain a STORE before closing its cache context."""
+    dev = _FakeTorchDev()
+    monkeypatch.setattr(gpu_mod, "torch_dev", dev)
+    module = _module(monkeypatch)
+    cache_context = _register(module, monkeypatch, 7)
+    operation_started = threading.Event()
+    allow_operation_to_finish = threading.Event()
+    operation_errors: list[BaseException] = []
+    cleanup_errors: list[BaseException] = []
+    cleanup_finished = threading.Event()
+
+    def block_resolve(*_args: object, **_kwargs: object) -> list[list[object]]:
+        operation_started.set()
+        if not allow_operation_to_finish.wait(timeout=5.0):
+            raise TimeoutError("active STORE was not released")
+        raise RuntimeError("stop after lifetime check")
+
+    cast(MagicMock, module.context.resolve_obj_keys).side_effect = block_resolve
+
+    def run_store() -> None:
+        try:
+            module.store(MagicMock(), 7, [[1]], b"event")
+        except BaseException as exc:
+            operation_errors.append(exc)
+
+    def run_cleanup() -> None:
+        try:
+            if cleanup_kind == "unregister":
+                module.unregister_kv_cache(7)
+            else:
+                module.reap_stale_instances(-1.0, -1.0)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        finally:
+            cleanup_finished.set()
+
+    operation = threading.Thread(target=run_store)
+    operation.start()
+    assert operation_started.wait(timeout=5.0)
+    cleanup = threading.Thread(target=run_cleanup)
+    cleanup.start()
+    try:
+        assert not cleanup_finished.wait(timeout=0.1)
+        cache_context.close.assert_not_called()
+    finally:
+        allow_operation_to_finish.set()
+        operation.join(timeout=5.0)
+        cleanup.join(timeout=5.0)
+
+    assert not operation.is_alive()
+    assert not cleanup.is_alive()
+    assert len(operation_errors) == 1
+    assert cleanup_errors == []
+    cache_context.close.assert_called_once_with()
+
+
+def test_failed_unregister_is_not_reinserted_and_can_reregister(monkeypatch) -> None:
+    """Destructive cleanup failure leaves no active entry and permits replacement."""
+    dev = _FakeTorchDev()
+    monkeypatch.setattr(gpu_mod, "torch_dev", dev)
+    module = _module(monkeypatch)
+    failed = _register(module, monkeypatch, 7)
+    failed.close.side_effect = RuntimeError("injected close failure")
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        module.unregister_kv_cache(7)
+
+    assert module.context_entries_snapshot() == {}
+    replacement = _register(module, monkeypatch, 7)
+    assert replacement is not failed
+    assert list(module.context_entries_snapshot()) == [7]
 
 
 def test_unregister_unknown_instance_does_not_reclaim(monkeypatch) -> None:

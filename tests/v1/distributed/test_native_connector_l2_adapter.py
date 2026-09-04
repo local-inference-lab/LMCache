@@ -10,6 +10,7 @@ C++ IStorageConnector interface, so no Redis or C++ build is needed.
 import ctypes
 import select
 import threading
+import time
 
 # Third Party
 import pytest
@@ -17,9 +18,13 @@ import torch
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.config import EvictionConfig
 from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
     NativeConnectorL2Adapter,
     _object_key_to_string,
+)
+from lmcache.v1.distributed.storage_controllers.eviction_controller import (
+    L2AdapterEvictionState,
 )
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -56,23 +61,53 @@ class MockNativeConnector:
         self._completions: list[tuple[int, bool, str, list[bool] | None]] = []
         self._lock = threading.Lock()
         self._closed = False
+        self.fail_set_keys: set[str] = set()
+        self.report_set_per_key_results = False
+        self.suppress_set_completion = False
+        self.raise_set_submit = False
+        self._suppressed_set_completions: list[
+            tuple[int, bool, str, list[bool] | None]
+        ] = []
 
     def event_fd(self) -> int:
         return self._efd.fileno()
 
     def submit_batch_set(self, keys: list[str], memoryviews: list) -> int:
+        if self.raise_set_submit:
+            raise RuntimeError("injected submit failure")
         with self._lock:
             fid = self._next_id
             self._next_id += 1
 
         try:
+            results: list[bool] = []
             for key, mv in zip(keys, memoryviews, strict=False):
+                if key in self.fail_set_keys:
+                    results.append(False)
+                    continue
                 self._store[key] = bytes(mv)
-            self._push_completion(fid, True, "", None)
+                results.append(True)
+            ok = all(results)
+            completion = (
+                fid,
+                ok,
+                "" if ok else "injected set failure",
+                results if self.report_set_per_key_results else None,
+            )
+            if self.suppress_set_completion:
+                self._suppressed_set_completions.append(completion)
+            else:
+                self._push_completion(*completion)
         except Exception as e:
             self._push_completion(fid, False, str(e), None)
 
         return fid
+
+    def complete_suppressed_sets(self) -> None:
+        completions = self._suppressed_set_completions
+        self._suppressed_set_completions = []
+        for completion in completions:
+            self._push_completion(*completion)
 
     def submit_batch_get(self, keys: list[str], memoryviews: list) -> int:
         with self._lock:
@@ -155,6 +190,27 @@ class MockNativeConnector:
             pass
 
 
+class DeferredExistsConnector(MockNativeConnector):
+    """Hold EXISTS completion to expose the submit-to-lock race window."""
+
+    def __init__(self):
+        super().__init__()
+        self.pending_exists: tuple[int, list[str]] | None = None
+
+    def submit_batch_exists(self, keys: list[str]) -> int:
+        with self._lock:
+            fid = self._next_id
+            self._next_id += 1
+        self.pending_exists = (fid, list(keys))
+        return fid
+
+    def complete_exists(self) -> None:
+        assert self.pending_exists is not None
+        fid, keys = self.pending_exists
+        self.pending_exists = None
+        self._push_completion(fid, True, "", [key in self._store for key in keys])
+
+
 # =============================================================================
 # Test Fixtures
 # =============================================================================
@@ -200,6 +256,14 @@ def adapter():
     mock_client = MockNativeConnector()
     adp = NativeConnectorL2Adapter(mock_client)
     yield adp
+    adp.close()
+
+
+@pytest.fixture
+def adapter_and_mock():
+    mock_client = MockNativeConnector()
+    adp = NativeConnectorL2Adapter(mock_client)
+    yield adp, mock_client
     adp.close()
 
 
@@ -500,7 +564,7 @@ class TestLookupAndLockInterface:
         key = create_object_key(999)
         lookup_fd = adapter.get_lookup_and_lock_event_fd()
 
-        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+        task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         assert wait_for_event_fd(lookup_fd, timeout=5.0)
 
         bitmap = adapter.query_lookup_and_lock_result(task_id)
@@ -519,7 +583,7 @@ class TestLookupAndLockInterface:
         adapter.pop_completed_store_tasks()
 
         # Lookup
-        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+        task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         assert wait_for_event_fd(lookup_fd, timeout=5.0)
 
         bitmap = adapter.query_lookup_and_lock_result(task_id)
@@ -538,7 +602,7 @@ class TestLookupAndLockInterface:
         adapter.pop_completed_store_tasks()
 
         task_id = adapter.submit_lookup_and_lock_task(
-            [existing, missing], _EMPTY_LAYOUT
+            [existing, missing], {0: _EMPTY_LAYOUT}
         )
         assert wait_for_event_fd(lookup_fd, timeout=5.0)
 
@@ -551,7 +615,7 @@ class TestLookupAndLockInterface:
         key = create_object_key(1)
         lookup_fd = adapter.get_lookup_and_lock_event_fd()
 
-        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+        task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         wait_for_event_fd(lookup_fd, timeout=5.0)
 
         result1 = adapter.query_lookup_and_lock_result(task_id)
@@ -584,7 +648,7 @@ class TestUnlockInterface:
         wait_for_event_fd(store_fd, timeout=5.0)
         adapter.pop_completed_store_tasks()
 
-        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+        task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         wait_for_event_fd(lookup_fd, timeout=5.0)
         adapter.query_lookup_and_lock_result(task_id)
 
@@ -686,7 +750,7 @@ class TestEndToEndWorkflow:
         assert adapter.pop_completed_store_tasks()[store_tid].is_successful()
 
         # Lookup
-        lookup_tid = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+        lookup_tid = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         assert wait_for_event_fd(lookup_fd, timeout=5.0)
         bitmap = adapter.query_lookup_and_lock_result(lookup_tid)
         assert bitmap.test(0) is True
@@ -719,7 +783,7 @@ class TestEndToEndWorkflow:
         assert adapter.pop_completed_store_tasks()[store_tid].is_successful()
 
         # Lookup all
-        lookup_tid = adapter.submit_lookup_and_lock_task(keys, _EMPTY_LAYOUT)
+        lookup_tid = adapter.submit_lookup_and_lock_task(keys, {0: _EMPTY_LAYOUT})
         assert wait_for_event_fd(lookup_fd, timeout=5.0)
         bitmap = adapter.query_lookup_and_lock_result(lookup_tid)
         for i in range(n):
@@ -1160,7 +1224,7 @@ class TestDeleteInterface:
         adapter.pop_completed_store_tasks()
 
         # Verify exists
-        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+        task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         wait_for_event_fd(lookup_fd, timeout=5.0)
         bitmap = adapter.query_lookup_and_lock_result(task_id)
         assert bitmap.test(0) is True
@@ -1170,7 +1234,7 @@ class TestDeleteInterface:
         adapter.delete([key])
 
         # Verify gone
-        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+        task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         wait_for_event_fd(lookup_fd, timeout=5.0)
         bitmap = adapter.query_lookup_and_lock_result(task_id)
         assert bitmap.test(0) is False
@@ -1181,6 +1245,70 @@ class TestDeleteInterface:
 
     def test_delete_empty_keys(self, adapter):
         adapter.delete([])  # should not raise
+
+    def test_delete_skips_lookup_locked_keys(self, adapter):
+        keys = [create_object_key(i) for i in range(2)]
+        objects = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+        adapter.submit_store_task(keys, objects)
+        assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+        adapter.pop_completed_store_tasks()
+
+        task_id = adapter.submit_lookup_and_lock_task([keys[0]], {0: _EMPTY_LAYOUT})
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
+        assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
+
+        adapter.delete(keys)
+
+        task_id = adapter.submit_lookup_and_lock_task(keys, {0: _EMPTY_LAYOUT})
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
+        bitmap = adapter.query_lookup_and_lock_result(task_id)
+        assert bitmap.test(0) is True
+        assert bitmap.test(1) is False
+
+        # The second lookup took another lock on keys[0]. Release both before
+        # proving the formerly protected key becomes deletable again.
+        adapter.submit_unlock([keys[0]])
+        adapter.submit_unlock([keys[0]])
+        adapter.delete([keys[0]])
+        task_id = adapter.submit_lookup_and_lock_task([keys[0]], {0: _EMPTY_LAYOUT})
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
+        assert adapter.query_lookup_and_lock_result(task_id).test(0) is False
+
+    def test_delete_all_locked_keys_is_noop(self, adapter):
+        key = create_object_key(1)
+        adapter.submit_store_task([key], [create_memory_obj()])
+        assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+        adapter.pop_completed_store_tasks()
+
+        task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
+        assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
+
+        adapter.delete([key])
+        assert _object_key_to_string(key) in adapter._client._store
+        adapter.submit_unlock([key])
+
+    def test_delete_skips_lookup_that_has_not_completed(self):
+        client = DeferredExistsConnector()
+        adapter = NativeConnectorL2Adapter(client)
+        key = create_object_key(1)
+        try:
+            adapter.submit_store_task([key], [create_memory_obj()])
+            assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+            adapter.pop_completed_store_tasks()
+
+            task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
+            adapter.delete([key])
+            assert _object_key_to_string(key) in client._store
+
+            client.complete_exists()
+            assert wait_for_event_fd(
+                adapter.get_lookup_and_lock_event_fd(), timeout=5.0
+            )
+            assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
+            adapter.submit_unlock([key])
+        finally:
+            adapter.close()
 
     def test_delete_batch(self, adapter):
         keys = [create_object_key(i) for i in range(5)]
@@ -1197,7 +1325,7 @@ class TestDeleteInterface:
         adapter.delete(keys[:3])
 
         # Verify: first 3 gone, last 2 remain
-        task_id = adapter.submit_lookup_and_lock_task(keys, _EMPTY_LAYOUT)
+        task_id = adapter.submit_lookup_and_lock_task(keys, {0: _EMPTY_LAYOUT})
         wait_for_event_fd(lookup_fd, timeout=5.0)
         bitmap = adapter.query_lookup_and_lock_result(task_id)
         for i in range(3):
@@ -1279,6 +1407,64 @@ class TestUsageTracking:
         assert usage.usage_fraction == 0.0
         assert usage.total_bytes_used == 0
 
+    def test_restart_inventory_seeds_usage_and_preserves_lru_order(self):
+        oldest = create_object_key(1)
+        newest = ObjectKey(
+            chunk_hash=ObjectKey.IntHash2Bytes(2),
+            model_name="test_model",
+            kv_rank=0,
+            cache_salt="tenant-a",
+        )
+        client = MockNativeConnector()
+        adapter = NativeConnectorL2Adapter(
+            client,
+            max_capacity_gb=1_000 / (1024**3),
+            initial_key_sizes={oldest: 300, newest: 400},
+        )
+        try:
+            usage = adapter.get_usage()
+            assert usage.total_bytes_used == 700
+            assert usage.usage_fraction == pytest.approx(0.7)
+            assert usage.bytes_by_cache_salt == {"": 300, "tenant-a": 400}
+
+            rejected = adapter.submit_store_task(
+                [create_object_key(3)], [create_memory_obj(size=100)]
+            )
+            assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=1.0)
+            result = adapter.pop_completed_store_tasks()[rejected]
+            assert result.is_successful() is False
+            assert adapter.get_usage().total_bytes_used == 700
+
+            state = L2AdapterEvictionState(
+                adapter_id=0,
+                adapter=adapter,
+                eviction_config=EvictionConfig(
+                    eviction_policy="LRU",
+                    trigger_watermark=0.5,
+                    eviction_ratio=0.5,
+                ),
+            )
+            actions = state.eviction_policy.get_eviction_actions(0.5)
+            assert len(actions) == 1
+            assert actions[0].keys == [oldest]
+        finally:
+            adapter.close()
+
+    def test_restart_inventory_snapshot_is_immutable_and_detached(self):
+        key = create_object_key(1)
+        source = {key: 300}
+        adapter = NativeConnectorL2Adapter(
+            MockNativeConnector(), initial_key_sizes=source
+        )
+        try:
+            snapshot = adapter.get_existing_key_sizes()
+            source[key] = 999
+            assert snapshot == {key: 300}
+            with pytest.raises(TypeError):
+                snapshot[key] = 1  # type: ignore[index]
+        finally:
+            adapter.close()
+
     def test_get_usage_after_store(self, adapter_with_capacity):
         adp = adapter_with_capacity
         store_fd = adp.get_store_event_fd()
@@ -1358,3 +1544,258 @@ class TestUsageTracking:
         usage = adp.get_usage()
         assert usage.usage_fraction == pytest.approx(0.2)
         assert usage.total_bytes_used == 400
+
+    def test_partial_store_accounts_only_successful_keys(self, adapter_with_capacity):
+        adp = adapter_with_capacity
+        mock_client = adp._client
+        mock_client.report_set_per_key_results = True
+        keys = [create_object_key(i) for i in range(3)]
+        objects = [create_memory_obj(size=100, fill_value=float(i)) for i in range(3)]
+        mock_client.fail_set_keys = {_object_key_to_string(keys[1])}
+
+        task_id = adp.submit_store_task(keys, objects)
+        assert wait_for_event_fd(adp.get_store_event_fd(), timeout=5.0)
+
+        result = adp.pop_completed_store_tasks()[task_id]
+        assert result.is_successful() is False
+        assert adp.get_usage().total_bytes_used == 800
+        assert set(mock_client._store) == {
+            _object_key_to_string(keys[0]),
+            _object_key_to_string(keys[2]),
+        }
+
+
+class _BlockingStoreListener:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def on_l2_keys_stored(self, keys, sizes) -> None:
+        self.entered.set()
+        assert self.release.wait(timeout=5.0)
+
+
+def _wait_until(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class TestStoreObjectsSync:
+    def test_success_uses_private_completion(self, adapter):
+        keys = [create_object_key(i) for i in range(2)]
+        objects = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+
+        ok, persisted, bytes_written = adapter.store_objects_sync(keys, objects)
+
+        assert ok is True
+        assert persisted == 2
+        assert bytes_written == sum(obj.get_size() for obj in objects)
+        assert adapter.get_usage().total_bytes_used == bytes_written
+        assert adapter.pop_completed_store_tasks() == {}
+
+    def test_partial_failure_accounts_only_persisted_keys(self, adapter_and_mock):
+        adapter, mock_client = adapter_and_mock
+        mock_client.report_set_per_key_results = True
+        keys = [create_object_key(i) for i in range(2)]
+        objects = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+        mock_client.fail_set_keys = {_object_key_to_string(keys[1])}
+
+        ok, persisted, bytes_written = adapter.store_objects_sync(keys, objects)
+
+        assert ok is False
+        assert persisted == 1
+        assert bytes_written == objects[0].get_size()
+        assert adapter.get_usage().total_bytes_used == objects[0].get_size()
+
+    def test_batch_fallback_without_per_key_results(self, adapter_and_mock):
+        adapter, mock_client = adapter_and_mock
+        mock_client.report_set_per_key_results = False
+        keys = [create_object_key(i) for i in range(2)]
+        objects = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+
+        assert adapter.store_objects_sync(keys, objects) == (
+            True,
+            2,
+            sum(obj.get_size() for obj in objects),
+        )
+
+    def test_restore_reports_transferred_bytes_without_double_accounting(self, adapter):
+        key = create_object_key(1)
+        obj = create_memory_obj(size=100)
+        assert adapter.store_objects_sync([key], [obj]) == (True, 1, obj.get_size())
+
+        assert adapter.store_objects_sync([key], [obj]) == (True, 1, obj.get_size())
+        assert adapter.get_usage().total_bytes_used == obj.get_size()
+
+    def test_validates_inputs(self, adapter):
+        with pytest.raises(ValueError, match="length mismatch"):
+            adapter.store_objects_sync([create_object_key(1)], [])
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            adapter.store_objects_sync(
+                [create_object_key(1)], [create_memory_obj()], timeout=0
+            )
+        assert adapter.store_objects_sync([], []) == (True, 0, 0)
+
+    def test_timeout_retains_buffers_and_reservation_until_late_completion(self):
+        mock_client = MockNativeConnector()
+        mock_client.suppress_set_completion = True
+        obj = create_memory_obj(size=100)
+        adapter = NativeConnectorL2Adapter(
+            mock_client,
+            max_capacity_gb=obj.get_size() / (1024**3),
+        )
+        try:
+            result = adapter.store_objects_sync(
+                [create_object_key(1)], [obj], timeout=0.02
+            )
+
+            assert result == (False, 0, 0)
+            assert adapter.get_reserved_store_bytes() == obj.get_size()
+            assert adapter.has_inflight_store_for_keys([create_object_key(1)])
+            with adapter._lock:
+                pending = next(iter(adapter._pending_store_sizes.values()))
+                assert pending.buffer_owners == [obj]
+
+            mock_client.complete_suppressed_sets()
+            assert _wait_until(lambda: adapter.get_reserved_store_bytes() == 0)
+            assert not adapter.has_inflight_store_for_keys([create_object_key(1)])
+            assert adapter.get_usage().total_bytes_used == obj.get_size()
+            assert adapter._pending_store_sizes == {}
+        finally:
+            adapter.close()
+
+    def test_completion_does_not_wait_for_observer(self, adapter):
+        listener = _BlockingStoreListener()
+        adapter.register_listener(listener)
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                adapter.store_objects_sync(
+                    [create_object_key(1)],
+                    [create_memory_obj()],
+                    timeout=0.05,
+                )
+            )
+        )
+        worker.start()
+        assert listener.entered.wait(timeout=5.0)
+        worker.join(timeout=0.5)
+        assert not worker.is_alive()
+        assert result[0][0] is True
+        assert adapter.get_usage().total_bytes_used == result[0][2]
+
+        listener.release.set()
+
+    def test_close_unblocks_waiter_and_releases_reservation(self):
+        mock_client = MockNativeConnector()
+        mock_client.suppress_set_completion = True
+        adapter = NativeConnectorL2Adapter(mock_client, max_capacity_gb=1)
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                adapter.store_objects_sync(
+                    [create_object_key(1)], [create_memory_obj()], timeout=10.0
+                )
+            )
+        )
+        worker.start()
+        assert _wait_until(lambda: adapter.get_reserved_store_bytes() > 0)
+
+        adapter.close()
+        worker.join(timeout=5.0)
+
+        assert not worker.is_alive()
+        assert result == [(False, 0, 0)]
+        assert adapter.get_reserved_store_bytes() == 0
+
+
+class TestStoreCapacityReservation:
+    def test_inflight_stores_cannot_exceed_capacity(self):
+        mock_client = MockNativeConnector()
+        mock_client.suppress_set_completion = True
+        capacity = 800
+        adapter = NativeConnectorL2Adapter(
+            mock_client,
+            max_capacity_gb=capacity / (1024**3),
+        )
+        try:
+            obj = create_memory_obj(size=100)  # 400 bytes
+            first = adapter.submit_store_task([create_object_key(1)], [obj])
+            second = adapter.submit_store_task([create_object_key(2)], [obj])
+            rejected = adapter.submit_store_task([create_object_key(3)], [obj])
+
+            assert first != second != rejected
+            assert adapter.get_reserved_store_bytes() == capacity
+            assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=1.0)
+            result = adapter.pop_completed_store_tasks()[rejected]
+            assert result.is_successful() is False
+            assert result.bytes_transferred() == 0
+        finally:
+            adapter.close()
+
+    def test_failed_store_releases_capacity_reservation(self):
+        mock_client = MockNativeConnector()
+        mock_client.report_set_per_key_results = True
+        capacity = 400
+        adapter = NativeConnectorL2Adapter(
+            mock_client,
+            max_capacity_gb=capacity / (1024**3),
+        )
+        try:
+            first_key = create_object_key(1)
+            mock_client.fail_set_keys = {_object_key_to_string(first_key)}
+            first = adapter.submit_store_task(
+                [first_key], [create_memory_obj(size=100)]
+            )
+            assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=1.0)
+            assert adapter.pop_completed_store_tasks()[first].is_successful() is False
+            assert adapter.get_reserved_store_bytes() == 0
+
+            mock_client.fail_set_keys.clear()
+            second = adapter.submit_store_task(
+                [create_object_key(2)], [create_memory_obj(size=100)]
+            )
+            assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=1.0)
+            assert adapter.pop_completed_store_tasks()[second].is_successful() is True
+            assert adapter.get_usage().total_bytes_used == capacity
+        finally:
+            adapter.close()
+
+    def test_submit_exception_releases_capacity_reservation(self):
+        mock_client = MockNativeConnector()
+        mock_client.raise_set_submit = True
+        adapter = NativeConnectorL2Adapter(mock_client, max_capacity_gb=1)
+        try:
+            with pytest.raises(RuntimeError, match="injected submit failure"):
+                adapter.submit_store_task(
+                    [create_object_key(1)], [create_memory_obj(size=100)]
+                )
+            assert adapter.get_reserved_store_bytes() == 0
+        finally:
+            adapter.close()
+
+    def test_synchronous_store_respects_capacity(self):
+        mock_client = MockNativeConnector()
+        capacity = 400
+        adapter = NativeConnectorL2Adapter(
+            mock_client,
+            max_capacity_gb=capacity / (1024**3),
+        )
+        try:
+            first = adapter.store_objects_sync(
+                [create_object_key(1)], [create_memory_obj(size=100)]
+            )
+            rejected = adapter.store_objects_sync(
+                [create_object_key(2)], [create_memory_obj(size=100)]
+            )
+
+            assert first == (True, 1, capacity)
+            assert rejected == (False, 0, 0)
+            assert len(mock_client._store) == 1
+            assert adapter.get_usage().total_bytes_used == capacity
+        finally:
+            adapter.close()

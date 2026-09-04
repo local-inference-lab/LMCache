@@ -24,6 +24,7 @@ from .worker_transfer import (
     MPTransferMode,
     TransferContext,
     create_transfer_context,
+    resolve_transfer_mode,
 )
 
 __all__ = [
@@ -41,5 +42,6 @@ __all__ = [
     "create_engine_driven_context",
     "create_transfer_context",
     "gather_paged_kv_to_cpu",
+    "resolve_transfer_mode",
     "scatter_cpu_to_paged_kv",
 ]

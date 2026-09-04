@@ -15,13 +15,15 @@ import threading
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.native_storage_ops import Bitmap
+    from lmcache.lmcache_native import Bitmap
     from lmcache.v1.distributed.api import KeyListPage, MemoryLayoutDesc, ObjectKey
     from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
     from lmcache.v1.memory_management import MemoryObj
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import get_event_bus
 
 logger = init_logger(__name__)
 
@@ -29,6 +31,7 @@ L2TaskId = int
 
 
 _EMPTY_BY_CACHE_SALT: Mapping[str, int] = MappingProxyType({})
+_EMPTY_KEY_SIZES: Mapping[ObjectKey, int] = MappingProxyType({})
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,9 @@ class L2AdapterInterface(ABC):
                 per-bucket byte counts regardless of this value.
         """
         self._listeners: list[L2AdapterListener] = []
+        self._backend_name: str = ""
+        self._shared: bool = False
+        self._event_bus = get_event_bus()
 
         # Centralized byte accounting. Subclasses pass ``sizes`` to
         # ``_notify_keys_stored`` / ``_notify_keys_deleted`` and the base
@@ -135,7 +141,9 @@ class L2AdapterInterface(ABC):
         # every adapter exposes the same shape via ``get_usage()``.
         self._max_capacity_bytes: int = max_capacity_bytes
         self._total_bytes_used: int = 0
+        self._reserved_store_bytes: int = 0
         self._bytes_by_cache_salt: dict[str, int] = {}
+        self._usage_initialized: bool = False
         self._usage_lock = threading.Lock()
 
     #####################
@@ -239,7 +247,7 @@ class L2AdapterInterface(ABC):
     def submit_lookup_and_lock_task(
         self,
         keys: list[ObjectKey],
-        layout_desc: MemoryLayoutDesc,
+        group_layout_descs: dict[int, MemoryLayoutDesc],
     ) -> L2TaskId:
         """
         Submit a lookup and lock task to look up and lock a batch of objects
@@ -247,9 +255,10 @@ class L2AdapterInterface(ABC):
 
         Args:
             keys (list[ObjectKey]): the list of keys to be looked up and locked.
-            layout_desc (MemoryLayoutDesc): the memory layout of the objects.
-                This is an advisory hint; most adapters ignore it. The P2P
-                adapter forwards it to the peer cache server.
+            group_layout_descs (dict[int, MemoryLayoutDesc]): maps
+                object_group_id to that group's memory layout. This is an
+                advisory hint; most adapters ignore it. The P2P adapter
+                forwards it to the peer cache server.
 
         Returns:
             L2TaskId: the task id of the submitted lookup and lock task.
@@ -354,13 +363,31 @@ class L2AdapterInterface(ABC):
         """Register a listener to receive L2 adapter events."""
         self._listeners.append(listener)
 
-    def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
-        """Update byte accounting and notify listeners that ``keys`` were
-        stored. ``sizes[i]`` is the byte size of ``keys[i]``.
+    def set_backend_identity(self, name: str, shared: bool = False) -> None:
+        """Set the identity used to tag this adapter's cache events.
 
-        Accounting is held under ``_usage_lock``; listener callbacks fire
-        outside the lock so a slow listener cannot stall further notifies.
+        Called by the storage manager right after construction (initial
+        and runtime-added adapters alike).
+
+        Args:
+            name: The registered adapter type name (e.g. ``"fs"``;
+                non-empty).
+            shared: Whether the adapter mounts a fleet-shared pool (see
+                ``L2AdapterConfigBase.shared``).
+
+        Raises:
+            ValueError: If ``name`` is empty.
         """
+        if not name:
+            raise ValueError("backend name must be non-empty")
+        self._backend_name = name
+        self._shared = shared
+
+    @staticmethod
+    def _stored_byte_deltas(
+        keys: list[ObjectKey], sizes: list[int]
+    ) -> tuple[int, dict[str, int]]:
+        """Aggregate stored bytes globally and by cache salt."""
         # Aggregate per-salt deltas before touching
         # ``_bytes_by_cache_salt`` — one dict read/write per unique
         # salt instead of one per key. This matters when the registry is
@@ -370,21 +397,118 @@ class L2AdapterInterface(ABC):
         for key, size in zip(keys, sizes, strict=True):
             delta[key.cache_salt] = delta.get(key.cache_salt, 0) + size
             total_delta += size
+        return total_delta, delta
+
+    def _apply_stored_byte_deltas(
+        self, total_delta: int, delta: dict[str, int]
+    ) -> None:
+        """Apply pre-aggregated stored-byte deltas under ``_usage_lock``."""
+        self._total_bytes_used += total_delta
+        for salt, size in delta.items():
+            self._bytes_by_cache_salt[salt] = (
+                self._bytes_by_cache_salt.get(salt, 0) + size
+            )
+
+    def _account_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        """Apply stored-key byte accounting without notifying observers."""
+        total_delta, delta = self._stored_byte_deltas(keys, sizes)
 
         with self._usage_lock:
-            self._total_bytes_used += total_delta
-            for salt, d in delta.items():
-                self._bytes_by_cache_salt[salt] = (
-                    self._bytes_by_cache_salt.get(salt, 0) + d
-                )
+            self._apply_stored_byte_deltas(total_delta, delta)
+
+    def _notify_keys_stored_observers(
+        self, keys: list[ObjectKey], sizes: list[int]
+    ) -> None:
+        """Notify stored-key listeners and observability subscribers."""
         for listener in self._listeners:
             listener.on_l2_keys_stored(keys, sizes)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L2_KEYS_STORED,
+                metadata={
+                    "keys": keys,
+                    "sizes": sizes,
+                    "backend": self._backend_name,
+                    "shared": self._shared,
+                },
+            )
+        )
+
+    def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        """Update byte accounting and notify observers that ``keys`` stored.
+
+        Accounting is committed under ``_usage_lock`` before callbacks fire.
+        Splitting these phases lets durability-sensitive adapters release a
+        synchronous caller after persistence and accounting without making a
+        slow listener part of the caller's storage deadline.
+        """
+        self._account_keys_stored(keys, sizes)
+        self._notify_keys_stored_observers(keys, sizes)
+
+    def _try_reserve_store_bytes(self, size: int) -> bool:
+        """Reserve capacity before an asynchronous L2 store is submitted."""
+        if size < 0:
+            raise ValueError("store reservation size must be non-negative")
+        with self._usage_lock:
+            projected = self._total_bytes_used + self._reserved_store_bytes + size
+            if self._max_capacity_bytes > 0 and projected > self._max_capacity_bytes:
+                return False
+            self._reserved_store_bytes += size
+            return True
+
+    def _settle_store_reservation(
+        self,
+        reserved_bytes: int,
+        keys: list[ObjectKey],
+        sizes: list[int],
+    ) -> None:
+        """Atomically release a reservation and account successfully stored keys."""
+        if reserved_bytes < 0:
+            raise ValueError("reserved_bytes must be non-negative")
+        total_delta, delta = self._stored_byte_deltas(keys, sizes)
+        with self._usage_lock:
+            if reserved_bytes > self._reserved_store_bytes:
+                raise RuntimeError(
+                    "store reservation accounting underflow: "
+                    f"settling {reserved_bytes} bytes with only "
+                    f"{self._reserved_store_bytes} reserved"
+                )
+            self._reserved_store_bytes -= reserved_bytes
+            self._apply_stored_byte_deltas(total_delta, delta)
+
+    def _release_store_reservation(self, reserved_bytes: int) -> None:
+        """Release capacity for a store that cannot produce a completion."""
+        if reserved_bytes < 0:
+            raise ValueError("reserved_bytes must be non-negative")
+        with self._usage_lock:
+            if reserved_bytes > self._reserved_store_bytes:
+                raise RuntimeError(
+                    "store reservation accounting underflow: "
+                    f"releasing {reserved_bytes} bytes with only "
+                    f"{self._reserved_store_bytes} reserved"
+                )
+            self._reserved_store_bytes -= reserved_bytes
+
+    def get_reserved_store_bytes(self) -> int:
+        """Return bytes reserved by stores awaiting native completion."""
+        with self._usage_lock:
+            return self._reserved_store_bytes
 
     def _notify_keys_accessed(self, keys: list[ObjectKey]) -> None:
         # ``_notify_keys_accessed`` carries no byte impact — only LRU
         # bookkeeping cares about it, so no accounting is needed here.
         for listener in self._listeners:
             listener.on_l2_keys_accessed(keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L2_KEYS_ACCESSED,
+                metadata={
+                    "keys": keys,
+                    "backend": self._backend_name,
+                    "shared": self._shared,
+                },
+            )
+        )
 
     def _notify_keys_deleted(self, keys: list[ObjectKey], sizes: list[int]) -> None:
         """Update byte accounting and notify listeners that ``keys`` were
@@ -431,6 +555,16 @@ class L2AdapterInterface(ABC):
                     self._bytes_by_cache_salt[salt] = new_total
         for listener in self._listeners:
             listener.on_l2_keys_deleted(keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L2_KEYS_DELETED,
+                metadata={
+                    "keys": keys,
+                    "backend": self._backend_name,
+                    "shared": self._shared,
+                },
+            )
+        )
 
     #####################
     # Eviction Interface
@@ -522,6 +656,47 @@ class L2AdapterInterface(ABC):
                 # view is fully detached from the adapter's live state.
                 bytes_by_cache_salt=MappingProxyType(per_salt_snapshot),
             )
+
+    def get_existing_key_sizes(self) -> Mapping[ObjectKey, int]:
+        """Return a detached, immutable snapshot of resident keys and sizes.
+
+        Persistent adapters override this to let a newly constructed eviction
+        policy rebuild its key set after process restart. Iteration order should
+        be least-recently-used to most-recently-used when the backend can recover
+        that information. Adapters without a persistent inventory return an
+        empty mapping.
+        """
+        return _EMPTY_KEY_SIZES
+
+    def _initialize_usage(self, key_sizes: Mapping[ObjectKey, int]) -> None:
+        """Seed byte accounting before the adapter accepts operations.
+
+        This is deliberately separate from ``_notify_keys_stored``: restoring
+        persistent state must not emit synthetic runtime store events. It may be
+        called once, while the adapter is quiescent, and rejects invalid sizes or
+        previously initialized accounting.
+        """
+        total_bytes_used = 0
+        bytes_by_cache_salt: dict[str, int] = {}
+        for key, size in key_sizes.items():
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise ValueError("existing object sizes must be positive integers")
+            total_bytes_used += size
+            bytes_by_cache_salt[key.cache_salt] = (
+                bytes_by_cache_salt.get(key.cache_salt, 0) + size
+            )
+
+        with self._usage_lock:
+            if (
+                self._usage_initialized
+                or self._total_bytes_used
+                or self._reserved_store_bytes
+                or self._bytes_by_cache_salt
+            ):
+                raise RuntimeError("L2 adapter usage has already been initialized")
+            self._total_bytes_used = total_bytes_used
+            self._bytes_by_cache_salt = bytes_by_cache_salt
+            self._usage_initialized = True
 
     #####################
     # Cleanup Interface

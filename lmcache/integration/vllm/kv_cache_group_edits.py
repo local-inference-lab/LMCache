@@ -101,8 +101,9 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
     Rejected, with one aggregated error listing every offending group:
 
     - ``CrossAttentionSpec`` (encoder-decoder caches).
-    - Mamba groups with ``mamba_cache_mode != "align"``: other modes keep no
-      reusable per-block state snapshots.
+    - Mamba groups with ``mamba_cache_mode`` other than ``"align"`` or
+      ``"all"``: the remaining mode (``"none"``) keeps no reusable per-block
+      state snapshots.
 
     Specs declaring slot compression (``compress_ratio > 1`` /
     ``tq_slot_size > 0``, e.g. DeepSeek-V4) are NOT rejected: they are served
@@ -124,14 +125,13 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
             kind = get_kv_cache_spec_kind(spec)
             if kind == KVCacheSpecKind.CROSS_ATTENTION:
                 unsupported.append(f"group {group_idx}: CrossAttentionSpec")
-            elif (
-                kind == KVCacheSpecKind.MAMBA
-                and getattr(spec, "mamba_cache_mode", "none") != "align"
-            ):
+            elif kind == KVCacheSpecKind.MAMBA and getattr(
+                spec, "mamba_cache_mode", "none"
+            ) not in ("align", "all"):
                 unsupported.append(
                     f"group {group_idx}: MambaSpec with mamba_cache_mode="
                     f"'{getattr(spec, 'mamba_cache_mode', 'none')}' "
-                    f"(only 'align' keeps reusable state snapshots)"
+                    f"(only 'align' and 'all' keep reusable state snapshots)"
                 )
     if unsupported:
         raise ValueError(
@@ -162,6 +162,38 @@ def _synthetic_attention_shape(elems_per_page: int, block_size: int) -> tuple[in
             f"(2, block_size={block_size}, num_heads={_SYNTHETIC_NUM_HEADS}, head_size)"
         )
     return _SYNTHETIC_NUM_HEADS, elems_per_page // denom
+
+
+def _complete_kernel_pages(
+    kv_cache: torch.Tensor,
+    logical_to_kernel_ratio: int,
+) -> tuple[torch.Tensor, int]:
+    """Return the view covered by complete logical cache pages.
+
+    HMA allocates a shared pool in kernel-page units, so the natural profiled
+    capacity need not be an exact multiple of a larger logical cache page.
+    vLLM can allocate only the complete logical pages in that pool; exclude the
+    unusable tail from LMCache registration instead of rejecting the cache.
+
+    Args:
+        kv_cache: Contiguous tensor whose first dimension is kernel pages.
+        logical_to_kernel_ratio: Kernel pages in one logical cache page.
+
+    Returns:
+        The zero-copy prefix containing complete logical pages and its logical
+        page count.
+
+    Raises:
+        ValueError: If the pool cannot hold one complete logical page.
+    """
+    logical_pages = kv_cache.shape[0] // logical_to_kernel_ratio
+    if logical_pages == 0:
+        raise ValueError(
+            f"kernel page count {kv_cache.shape[0]} cannot hold one logical "
+            f"page requiring {logical_to_kernel_ratio} kernel pages"
+        )
+    complete_kernel_pages = logical_pages * logical_to_kernel_ratio
+    return kv_cache[:complete_kernel_pages], logical_pages
 
 
 class KVCacheGroupEdit(ABC):
@@ -319,7 +351,7 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
 
         Raises:
             ValueError: If the layout is not the expected kernel-paged shape,
-                the sizes do not divide evenly, or the kernel pages of one
+                one logical page cannot be formed, or the kernel pages of one
                 logical block do not tile its page bytes exactly (which would
                 indicate an undeclared packed layout that must not be edited).
         """
@@ -342,12 +374,6 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
             )
         ratio = logical_block_size // kernel_block_size
 
-        num_kernel_pages = kv_cache.shape[0]
-        if num_kernel_pages % ratio != 0:
-            raise ValueError(
-                f"kernel page count {num_kernel_pages} is not a multiple of "
-                f"the logical/kernel block ratio {ratio}"
-            )
         kernel_page_bytes = kv_cache.shape[1:].numel() * kv_cache.element_size()
         if kernel_page_bytes * ratio != spec.page_size_bytes:
             raise ValueError(
@@ -360,12 +386,14 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
                 "re-view as logical pages"
             )
 
-        num_blocks = num_kernel_pages // ratio
+        complete_cache, num_blocks = _complete_kernel_pages(kv_cache, ratio)
         elems_per_page = spec.page_size_bytes // kv_cache.element_size()
         num_heads, head_size = _synthetic_attention_shape(
             elems_per_page, logical_block_size
         )
-        return kv_cache.view(num_blocks, 2, logical_block_size, num_heads, head_size)
+        return complete_cache.view(
+            num_blocks, 2, logical_block_size, num_heads, head_size
+        )
 
 
 ######################
@@ -374,17 +402,14 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
 
 
 class _MambaUnifiedViewEdit(KVCacheGroupEdit):
-    """Re-view mamba's unified state as a single attention tensor
+    """Re-view Mamba's unified state as an opaque rank-3 page tensor.
 
-    This is for vLLM >= 0.26.0, where the unified KV cache layout is implemented.
+    For vLLM >= 0.26.0, where the unified KV cache layout is implemented.
 
-    In this case, Mamba's KV layer will be a single tensor with the shape of:
-    - [num_blocks, 1, 1, context_size]
-    Where the context size equals to vllm_block_size * ``head_size''
-
-
-    What we do here is to convert the shape to
-    - [num_blocks, 1, vllm_block_size, head_size]
+    Rank 3 deliberately selects LMCache's ``NL_X_NB_BS_HS`` format: it is the
+    block-axis format whose transfer path carries the authoritative dim-0
+    stride. This is required for vLLM's blocks-first HMA pools, where sibling
+    layer pages pad the gap between consecutive blocks.
     """
 
     name = "mamba-unified-view"
@@ -403,25 +428,170 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
         self,
         spec: KVCacheSpec,
         kv_cache: RegisteredKVCache,
-        layout_hints: LayoutHints,
+        _layout_hints: LayoutHints,
     ) -> torch.Tensor:
-        """
-        Convert [num_blocks, 1, 1, context_size] to
-        [num_blocks, 1, vllm_block_size, head_size] for HND layout, or
-        [num_blocks, vllm_block_size, 1, head_size] for NHD layout.
+        """Re-view the per-block state row as block_size tokens.
+
+        Input: [num_blocks, 1, 1, row] with strides (S, row, row, 1),
+        where the row is this layer's state and S >= row (the page
+        padding, and any sibling layers on a shared pool, live between
+        row and S).
+
+        Output: [num_blocks, block_size, head_size] with strides
+        (S, head_size, 1). The rank-3 opaque format preserves the input's
+        block stride so it can continue spanning sibling layers and object
+        groups in the shared pool.
+
+        head_size = ceil(row / block_size), rounded up to the kernels'
+        vector alignment.  If the page has enough padding, block_size *
+        head_size may exceed the semantic row while remaining inside this
+        layer's declared page.  Some exact-fit pages cannot be split into
+        vector-aligned token rows (GLM-5.3-Flash DCP1 is 4096 * 265 bytes).
+        Those pages use one opaque physical slot instead; the adapter carries
+        block_size independently as tokens_per_block, so logical scheduling
+        and cache keys remain unchanged.
         """
         assert isinstance(kv_cache, torch.Tensor), (
             "single-layer KV cache must be a torch.Tensor"
         )
-        kv_layout = layout_hints.get("kv_layout", "none")
-        if kv_layout == "NHD":
-            return kv_cache.view(kv_cache.shape[0], spec.block_size, 1, -1)
-        elif kv_layout == "HND":
-            return kv_cache.view(kv_cache.shape[0], 1, spec.block_size, -1)
-        else:
+        if tuple(kv_cache.shape[1:3]) != (1, 1):
             raise ValueError(
-                f"Unsupported kv_layout: {kv_layout}. Only NHD and HND are supported."
+                "unified Mamba cache must have singleton head and token axes, "
+                f"got shape {tuple(kv_cache.shape)}"
             )
+        num_blocks = kv_cache.shape[0]
+        row = kv_cache[0].numel()
+        block_size = spec.block_size
+        elem = kv_cache.element_size()
+        block_step = kv_cache.stride(0)
+        base = -(-row // block_size)
+        # The transfer kernels vectorize by token width, so round it up to
+        # the widest alignment that divides the block step. The spill must
+        # stay inside this layer's own padded page -- on a shared pool
+        # stride(0) spans sibling layers, so it is not the bound.
+        page_bytes = spec.page_size_bytes
+        head_size = 0
+        for align_bytes in (16, 8, 4, 2):
+            if align_bytes % elem != 0 or (block_step * elem) % align_bytes != 0:
+                continue
+            step = align_bytes // elem
+            candidate = -(-base // step) * step
+            if candidate * block_size * elem <= page_bytes:
+                head_size = candidate
+                break
+        if head_size != 0:
+            return kv_cache.as_strided(
+                (num_blocks, block_size, head_size),
+                (kv_cache.stride(0), head_size, 1),
+            )
+
+        # The semantic row is still a valid opaque page even when it cannot
+        # be factored into vector-aligned per-token rows.  Preserve the whole
+        # declared page as one physical slot.  EngineGroupInfo retains the
+        # logical block_size, and KVLayerGroupsManager therefore maps the one
+        # slot back to exactly one engine block ID.
+        if page_bytes % elem:
+            raise ValueError(
+                f"declared Mamba page size {page_bytes} bytes is not aligned "
+                f"to tensor element size {elem}"
+            )
+        page_elems = page_bytes // elem
+        if page_elems < row:
+            raise ValueError(
+                f"declared Mamba page has {page_elems} elements but the state "
+                f"row requires {row}"
+            )
+        if page_elems > block_step:
+            raise ValueError(
+                f"declared Mamba page has {page_elems} elements but the "
+                f"physical block stride is only {block_step}"
+            )
+        return kv_cache.as_strided(
+            (num_blocks, 1, page_elems),
+            (kv_cache.stride(0), page_elems, 1),
+        )
+
+
+class _PaddedAttentionPageViewEdit(KVCacheGroupEdit):
+    """Canonicalize a padded attention layer as an opaque rank-3 page.
+
+    Current vLLM HMA layouts expose MLA as ``[B, H=1, N, C]`` and a replicated
+    DFlash page as e.g. ``[B, H=2, N=16, C=256]``. The semantic inner page is
+    tightly packed, while the declared physical page can also append opaque
+    model-owned state before sibling pages create the remaining gap between
+    dim-0 rows. LMCache's opaque ``[B, N, C]`` format supports that
+    authoritative padded block stride. The complete declared page is exposed
+    as a zero-copy view, preserving both semantic KV and any opaque page tail;
+    the resulting dimensions are addressing metadata, not semantic K/V axes.
+
+    Ordinary pages retain one physical slot per token. Packed pages whose byte
+    count cannot be factored over the logical block size (for example GLM-5.3
+    NVFP4 KV, whose per-page scale/tail records are not token-uniform) use one
+    physical slot for the whole page. ``EngineGroupInfo.tokens_per_block``
+    independently retains the logical token count, so LMCache's compressed
+    geometry maps one block ID to one complete opaque page.
+    """
+
+    name = "padded-attention-page-view"
+
+    def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
+        kind = get_kv_cache_spec_kind(spec)
+        return (
+            (
+                kind == KVCacheSpecKind.MLA_ATTENTION
+                or kind in _SUBPAGEABLE_ATTENTION_KINDS
+            )
+            and not _declares_slot_compression(spec)
+            and isinstance(kv_cache, torch.Tensor)
+            and kv_cache.ndim == 4
+            and kv_cache[0].is_contiguous()
+            and kv_cache.stride(0) > kv_cache.shape[1:].numel()
+        )
+
+    def apply(
+        self,
+        spec: KVCacheSpec,
+        kv_cache: RegisteredKVCache,
+        _layout_hints: LayoutHints,
+    ) -> torch.Tensor:
+        """Return a padded-stride-preserving opaque ``[B, slots, width]`` view.
+
+        Raises:
+            ValueError: If the declared page is not element-aligned, is smaller
+                than the semantic tensor page, or exceeds the physical dim-0
+                stride.
+        """
+        assert isinstance(kv_cache, torch.Tensor)
+        element_size = kv_cache.element_size()
+        page_bytes = spec.page_size_bytes
+        if page_bytes % element_size:
+            raise ValueError(
+                f"declared attention page size {page_bytes} bytes is not aligned "
+                f"to tensor element size {element_size}"
+            )
+        page_elems = page_bytes // element_size
+        semantic_page_elems = kv_cache.shape[1:].numel()
+        if page_elems < semantic_page_elems:
+            raise ValueError(
+                f"declared attention page has {page_elems} elements but the "
+                f"semantic tensor page requires {semantic_page_elems}"
+            )
+        if page_elems > kv_cache.stride(0):
+            raise ValueError(
+                f"declared attention page has {page_elems} elements but the "
+                f"physical block stride is only {kv_cache.stride(0)}"
+            )
+        # A packed page need not have a uniform byte width per logical token.
+        # Treat such a page as one opaque physical slot.  The vLLM adapter
+        # carries spec.block_size separately as tokens_per_block, so the group
+        # manager derives the correct compression ratio and still consumes one
+        # engine block ID per logical page.
+        physical_slots = spec.block_size if page_elems % spec.block_size == 0 else 1
+        hidden_size = page_elems // physical_slots
+        return kv_cache.as_strided(
+            (kv_cache.shape[0], physical_slots, hidden_size),
+            (kv_cache.stride(0), hidden_size, 1),
+        )
 
 
 class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
@@ -460,7 +630,7 @@ class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
 
         Raises:
             ValueError: If the layout is not the expected kernel-paged shape,
-                the sizes do not divide evenly, or the kernel pages of one
+                one logical page cannot be formed, or the kernel pages of one
                 logical block do not tile its page bytes exactly (which would
                 indicate an undeclared packed layout that must not be edited).
         """
@@ -474,12 +644,6 @@ class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
             )
         ratio = logical_block_size // kernel_block_size
 
-        num_kernel_pages = kv_cache.shape[0]
-        if num_kernel_pages % ratio != 0:
-            raise ValueError(
-                f"kernel page count {num_kernel_pages} is not a multiple of "
-                f"the logical/kernel block ratio {ratio}"
-            )
         kernel_page_bytes = kv_cache.shape[1:].numel() * kv_cache.element_size()
         if kernel_page_bytes * ratio != spec.page_size_bytes:
             raise ValueError(
@@ -492,13 +656,15 @@ class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
                 "re-view as logical pages"
             )
 
-        return kv_cache.view(num_kernel_pages // ratio, logical_block_size, -1)
+        complete_cache, num_blocks = _complete_kernel_pages(kv_cache, ratio)
+        return complete_cache.view(num_blocks, logical_block_size, -1)
 
 
 # Rule registry, in match priority order.
 _EDITS: tuple[KVCacheGroupEdit, ...] = (
     _MambaUnifiedViewEdit(),
     _MambaPageViewEdit(),
+    _PaddedAttentionPageViewEdit(),
     _SubpagedMLAAttentionViewEdit(),
     _SubpagedAttentionViewEdit(),
 )

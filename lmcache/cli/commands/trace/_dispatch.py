@@ -143,7 +143,7 @@ def _call_sm_method(method_name: str) -> Handler:
 
     The returned callable invokes ``getattr(ctx.sm, method_name)(**args)``
     and discards the result.  Used for every "plain" traced method on
-    StorageManager — ``reserve_write``, ``finish_write``,
+    StorageManager — ``reserve_write``, ``reserve_write_detailed``, ``finish_write``,
     ``submit_prefetch_task``, ``finish_read_prefetched``.
 
     Args:
@@ -217,6 +217,7 @@ def build_default_dispatcher() -> CallDispatcher:
     Covers every qualname the storage-level recorder emits:
 
     * ``StorageManager.reserve_write``
+    * ``StorageManager.reserve_write_detailed``
     * ``StorageManager.finish_write``
     * ``StorageManager.submit_prefetch_task``
     * ``StorageManager.finish_read_prefetched``
@@ -230,6 +231,7 @@ def build_default_dispatcher() -> CallDispatcher:
     dispatcher = CallDispatcher()
     for method_name in (
         "reserve_write",
+        "reserve_write_detailed",
         "finish_write",
         "submit_prefetch_task",
         "finish_read_prefetched",

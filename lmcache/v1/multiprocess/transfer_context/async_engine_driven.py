@@ -13,7 +13,10 @@ import torch
 from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+from lmcache.v1.multiprocess.transfer_context.base import (
+    StoreAdmissionRejected,
+    gather_paged_kv_to_cpu,
+)
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
@@ -190,6 +193,20 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 "Engine-driven transfer context is not registered. "
                 "Call register() before submit_store()."
             )
+        if self._worker_groups:
+            # The async staging pool is single-layout. Hybrid groups may have
+            # distinct shapes and partial SHM reservations, so use the proven
+            # synchronous grouped path until a group-aware async scheduler is
+            # introduced.
+            return super().submit_store(
+                _request_id,
+                key,
+                instance_id,
+                kv_caches,
+                block_ids,
+                _event,
+                blocks_in_chunk,
+            )
         completion: MessagingFuture[bool] = MessagingFuture()
         engine_driven_context = self._engine_driven_context
         commit_executor = self._commit_executor
@@ -212,12 +229,14 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 # Whether we gathered directly into SHM views (True) or into
                 # pinned staging buffers that need to be released later (False).
                 used_shm_direct = False
+                prepared_store = False
                 staged_chunks: list[torch.Tensor] = []
                 try:
                     # --- Phase 1: prepare_store ---
                     # In pickle mode this is the costliest step (sync RPC
                     # round-trip).  Running it here keeps the forward thread free.
                     result = engine_driven_context.prepare_store(key, instance_id)
+                    prepared_store = True
                     out_buffers, chunk_indices = (
                         result if result is not None else (None, None)
                     )
@@ -289,15 +308,32 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         )
 
                     if not ok:
+                        with self._commit_lock:
+                            self._abort_store_safely(key, instance_id)
                         logger.error(
                             "Async engine-driven commit_store failed for request_id=%s",
                             _request_id,
                         )
+                except StoreAdmissionRejected as exc:
+                    logger.warning(
+                        "Skipping async engine-driven cache store for "
+                        "request_id=%s: reason=%s",
+                        _request_id,
+                        exc.reason,
+                    )
+                    ok = False
                 except Exception:
                     logger.exception(
                         "Async engine-driven store failed for request_id=%s",
                         _request_id,
                     )
+                    if used_shm_direct:
+                        # Drain any partially enqueued SHM writes before their
+                        # server-side reservations are released.
+                        torch_dev.synchronize()
+                    if prepared_store:
+                        with self._commit_lock:
+                            self._abort_store_safely(key, instance_id)
                     ok = False
                 finally:
                     if not used_shm_direct:

@@ -353,9 +353,44 @@ class GPUCacheContext(BaseCacheContext):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
-        separate_object_groups: bool = True,
+        separate_object_groups: bool = False,
         full_sw_kv: bool = False,
     ):
+        # Kept for close(): CUDA wrappers hold driver-level mappings that pin
+        # exporter memory until explicitly closed.
+        self._kv_wrappers: KVCache = list(kv_caches)
+        self._closed = False
+        self._gds_registered = False
+        try:
+            self._init_impl(
+                kv_caches,
+                lmcache_tokens_per_chunk,
+                layout_hints,
+                engine_group_infos,
+                engine_type,
+                separate_object_groups,
+                full_sw_kv,
+            )
+        except BaseException:
+            # Partial construction may have imported some mappings
+            # already; roll them back so a failed registration does not
+            # pin the worker's KV pool.
+            self._close_kv_wrappers()
+            raise
+
+    def _init_impl(
+        self,
+        kv_caches: KVCache,
+        lmcache_tokens_per_chunk: int,
+        layout_hints: LayoutHints | None,
+        engine_group_infos: Sequence[EngineGroupInfo],
+        engine_type: EngineType,
+        separate_object_groups: bool,
+        full_sw_kv: bool,
+    ) -> None:
+        """Body of ``__init__``; split out so the constructor can roll
+        back partially imported KV mappings on failure.
+        """
         unwrapped = unwrap_kv_cache_tensors(kv_caches)
         kv_caches_norm, engine_kv_formats = normalize_and_discover_per_layer_formats(
             unwrapped,
@@ -417,6 +452,7 @@ class GPUCacheContext(BaseCacheContext):
         # context's CUDA stream.
         with torch_dev.stream(self.cuda_stream_):
             get_gds_context().register_gpu_buffer(self._temp_buffer.buffer)
+        self._gds_registered = True
 
         # Third Party
         import cupy
@@ -434,11 +470,57 @@ class GPUCacheContext(BaseCacheContext):
         )
 
     def close(self) -> None:
+        """Release staging resources and imported mappings without device reset.
+
+        The stream is drained before aliases are dropped and imported CUDA
+        allocations are unmapped. CUDA contexts remain alive for safe
+        re-registration in the same sidecar process.
+
+        Raises:
+            RuntimeError: If one or more resources fail to close. Failed
+                wrapper references remain retained so cleanup can be retried.
         """
-        Deregister this context's GDS staging buffer (reverse of __init__).
-        """
-        with torch_dev.stream(self.cuda_stream_):
-            get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
+        if self._closed:
+            return
+        close_errors: list[BaseException] = []
+        if self._gds_registered:
+            try:
+                self.cuda_stream_.synchronize()
+                with torch_dev.stream(self.cuda_stream_):
+                    get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
+            except BaseException as exc:
+                close_errors.append(exc)
+            else:
+                self._gds_registered = False
+
+        # Drop every context-owned tensor alias before the final wrapper
+        # reference can unmap its allocation.
+        self.kv_caches_.clear()
+        self.group_kv_pointers_.clear()
+
+        remaining_wrappers: KVCache = []
+        for wrapper in self._kv_wrappers:
+            try:
+                wrapper.close()
+            except BaseException as exc:
+                close_errors.append(exc)
+                remaining_wrappers.append(wrapper)
+        self._kv_wrappers = remaining_wrappers
+        self._closed = not self._gds_registered and not self._kv_wrappers
+        if close_errors:
+            raise RuntimeError(
+                f"GPU cache context cleanup failed with "
+                f"{len(close_errors)} cleanup error(s)"
+            ) from close_errors[0]
+
+    def _close_kv_wrappers(self) -> None:
+        """Best-effort close wrappers during failed construction."""
+        for wrapper in self._kv_wrappers:
+            try:
+                wrapper.close()
+            except Exception:
+                logger.warning("KV wrapper close failed", exc_info=True)
+        self._kv_wrappers = []
 
     @property
     def stream(self) -> Any:
@@ -529,100 +611,3 @@ class GPUCacheContext(BaseCacheContext):
         from integer division is acceptable.
         """
         return self._temp_buffer.get_cache_size_per_token()
-
-
-class PlainGPUCacheContext:
-    """
-    A plain GPU cache context that have a single contiguous 2LTD buffer
-    """
-
-    def __init__(self, kv_caches: KVCache, lmcache_tokens_per_chunk: int = 256):
-        assert len(kv_caches) == 1, (
-            "PlainGPUCacheContext only supports a single KV cache tensor"
-        )
-
-        # KV cache basics
-        self._kv_cache = unwrap_kv_cache_tensors(kv_caches)[0]
-        self._device = self._kv_cache.device
-
-        # Shape related
-        shape = self._kv_cache.shape
-        assert len(shape) == 4, "Expected [2, L, T, D] for plain GPU cache"
-
-        self._num_layers = shape[1]
-        self._num_tokens = shape[2]
-        self._hidden_dim_size = shape[3]
-
-        # Temporary buffer
-        tmp_buffer_shape = self.get_kv_buffer_shape(lmcache_tokens_per_chunk)
-        self._tmp_gpu_buffer = torch.empty(
-            tmp_buffer_shape, dtype=self.dtype, device=self.device
-        )
-
-        # GPU streams
-        self._cuda_stream = torch_dev.Stream(device=self._device)
-        # Third Party
-        import cupy
-
-        self._cupy_stream: "cupy.cuda.Stream" = cupy.cuda.ExternalStream(
-            self._cuda_stream.cuda_stream, self._device.index
-        )
-
-        # Extra initialization
-        self._cupy_stream.launch_host_func(
-            lambda logger: logger.info(
-                "Initialized cuda stream on device %s", str(self._device)
-            ),
-            logger,
-        )
-
-    def get_kv_buffer_shape(self, num_tokens: int) -> torch.Size:
-        """
-        Returns the shape of the KV buffer for the given number of tokens
-        """
-        return torch.Size((2, self._num_layers, num_tokens, self._hidden_dim_size))
-
-    def get_tmp_gpu_buffer(self, num_tokens: int) -> torch.Tensor:
-        """
-        Returns the temporary GPU buffer for transfers
-        """
-        return self._tmp_gpu_buffer[:, :, :num_tokens, :]
-
-    def slice_kv_cache_on_tokens(self, start: int, end: int) -> torch.Tensor:
-        """
-        Slices the KV cache tensor on the token dimension
-        """
-        return self._kv_cache[:, :, start:end, :]
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self._kv_cache.dtype
-
-    @property
-    def device(self) -> torch.device:
-        return self._device
-
-    @property
-    def stream(self) -> Any:
-        """Returns the device-specific GPU stream (e.g., torch_dev.Stream)."""
-        return self._cuda_stream
-
-    @property
-    def cupy_stream(self) -> "cupy.cuda.Stream":
-        return self._cupy_stream
-
-    @property
-    def num_layers(self) -> int:
-        return self._num_layers
-
-    @property
-    def num_tokens(self) -> int:
-        return self._num_tokens
-
-    @property
-    def hidden_dim_size(self) -> int:
-        return self._hidden_dim_size
-
-    @property
-    def kv_cache_tensor(self) -> torch.Tensor:
-        return self._kv_cache

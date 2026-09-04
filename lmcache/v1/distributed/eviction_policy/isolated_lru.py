@@ -18,7 +18,8 @@ from __future__ import annotations
 
 # Standard
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import cast
 import threading
 
 # First Party
@@ -28,6 +29,11 @@ from lmcache.v1.distributed.internal_api import (
     EvictionAction,
     EvictionDestination,
 )
+from lmcache.v1.mp_coordinator.persistence.durable_component import PersistenceType
+from lmcache.v1.mp_coordinator.utils.encoding import decode_key, encode_key
+
+# Local
+from ._selection import ChunkFamilyTopology, select_chunk_coherent_victims
 
 
 class IsolatedLRUEvictionPolicy(EvictionPolicy):
@@ -53,6 +59,7 @@ class IsolatedLRUEvictionPolicy(EvictionPolicy):
         self._lock = threading.Lock()
         # cache_salt -> ordered {ObjectKey: None} (oldest first).
         self._per_salt_order: dict[str, OrderedDict[ObjectKey, None]] = {}
+        self._family_topology = ChunkFamilyTopology()
         # Registered destinations (first one wins if any are registered,
         # matching LRUEvictionPolicy semantics).
         self._destinations: list[EvictionDestination] = []
@@ -79,6 +86,7 @@ class IsolatedLRUEvictionPolicy(EvictionPolicy):
                     order.move_to_end(key)
                 else:
                     order[key] = None
+            self._family_topology.observe(keys)
 
     def on_keys_touched(self, keys: list[ObjectKey]) -> None:
         if not keys:
@@ -143,25 +151,22 @@ class IsolatedLRUEvictionPolicy(EvictionPolicy):
             )
         with self._lock:
             order = self._per_salt_order.get(cache_salt)
-            pool = list(order.keys()) if order else []
-
-            if not pool:
+            if not order:
                 return []
 
             expected_ratio = max(0.0, min(1.0, expected_ratio))
-            target_count = int(len(pool) * expected_ratio)
+            target_count = int(len(order) * expected_ratio)
             if expected_ratio > 0 and target_count == 0:
                 target_count = 1
             if target_count == 0:
                 return []
 
-            keys_to_evict: list[ObjectKey] = []
-            for key in pool:
-                if key_eligible_filter is not None and not key_eligible_filter(key):
-                    continue
-                keys_to_evict.append(key)
-                if len(keys_to_evict) >= target_count:
-                    break
+            keys_to_evict = select_chunk_coherent_victims(
+                order,
+                target_count,
+                self._family_topology,
+                key_eligible_filter,
+            )
 
             if not keys_to_evict:
                 return []
@@ -189,3 +194,57 @@ class IsolatedLRUEvictionPolicy(EvictionPolicy):
         """Return the set of cache_salts with at least one tracked key."""
         with self._lock:
             return list(self._per_salt_order.keys())
+
+    @property
+    def persistence_type(self) -> PersistenceType:
+        """The ordering is derived from the event stream, so it rides with
+        the directory checkpoint."""
+        return PersistenceType.CHECKPOINT
+
+    @property
+    def name(self) -> str:
+        """Name of this policy's section in a durable checkpoint."""
+        return "lru_order"
+
+    def capture(self) -> Mapping[str, object]:
+        """Return each bucket's eviction order, least-recently-used first.
+
+        The ordering *is* the state: recency lives in position, not in a
+        timestamp, so nothing outside this policy can reconstruct it.
+
+        Returns:
+            ``{"buckets": {cache_salt: [key, ...]}}``, each list in
+            eviction order.
+        """
+        with self._lock:
+            return {
+                "buckets": {
+                    cache_salt: [encode_key(key) for key in order]
+                    for cache_salt, order in self._per_salt_order.items()
+                }
+            }
+
+    def restore(self, state: Mapping[str, object]) -> None:
+        """Replace every bucket's ordering with a captured one.
+
+        Call once at startup, after whatever rebuilt the keys themselves —
+        this replaces their ordering rather than merging into it.
+
+        Args:
+            state: A :meth:`capture` value, as decoded from the
+                checkpoint holding it.
+        """
+        buckets = cast("Mapping[str, list[object]]", state["buckets"])
+        with self._lock:
+            self._per_salt_order = {
+                cache_salt: OrderedDict(
+                    (decode_key(encoded), None) for encoded in ordered
+                )
+                for cache_salt, ordered in buckets.items()
+            }
+            self._family_topology = ChunkFamilyTopology()
+            for order in self._per_salt_order.values():
+                self._family_topology.observe(order)
+
+
+# -- Internals ----------------------------------------------------------------

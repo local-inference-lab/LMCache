@@ -41,6 +41,20 @@ LMCache ships several L2 storage backends, grouped by medium under
 :doc:`Supported Backends <supported_storages>`. Select one or more with the
 ``--l2-adapter`` flag.
 
+Every adapter accepts, alongside its type-specific keys, the common
+``"shared": true`` option. Set it when the adapter mounts a storage
+domain that several LMCache instances share (one S3 bucket, one NFS
+export): with :doc:`coordinator event reporting <../coordinator>`
+enabled, the coordinator's key directory then identifies the pool by
+the adapter's type name — keep **one pool per adapter type** across the
+fleet — deduplicates its placements across instances, and keeps them
+across instance restarts (the bytes outlive any single reporter).
+Storage private to the instance (the default, ``false``) needs nothing.
+
+.. code-block:: bash
+
+    --l2-adapter '{"type": "fs", "base_path": "/mnt/nfs/lmcache", "shared": true}'
+
 .. toctree::
    :maxdepth: 2
 
@@ -189,6 +203,18 @@ policy evicts a fraction of the least-recently-used keys.
    * - ``--eviction-ratio``
      - ``0.2``
      - Fraction of currently allocated L1 memory to evict per cycle.
+   * - ``--write-back-on-evict``
+     - disabled
+     - Synchronously persist an eviction batch to a capable L2 adapter before
+       deleting it from L1. Persistence failure preserves the L1 copy.
+   * - ``--periodic-flush-interval``
+     - ``0`` (disabled)
+     - Seconds between bounded backup scans below the L1 eviction watermark.
+       Backups add an L2 copy without deleting the L1 object.
+   * - ``--emergency-evict-for-prefetch``
+     - disabled
+     - Permit non-warm L2 restores to make room by synchronously writing back
+       and evicting LRU objects. Requires ``--write-back-on-evict``.
 
 **Example:**
 
@@ -196,7 +222,57 @@ policy evicts a fraction of the least-recently-used keys.
 
     --eviction-policy LRU \
     --eviction-trigger-watermark 0.8 \
-    --eviction-ratio 0.2
+    --eviction-ratio 0.2 \
+    --write-back-on-evict
+
+Without ``--write-back-on-evict``, L1 eviction keeps its existing discard
+behavior. With the option enabled, the policy always targets L2, including
+when no compatible adapter is available, so loss of the persistence path
+cannot silently degrade to discard. Objects are read-locked, persisted in
+bounded batches, unlocked, and deleted only when one adapter reports every
+readable object durable. Partial stores, exceptions, adapter removal, and
+concurrent locks preserve the affected L1 objects. Repeated failures use a
+bounded exponential backoff.
+
+The option currently requires at least one configured L2 adapter that exposes
+the synchronous ``store_objects_sync()`` durability contract, such as the
+native filesystem adapter. Incompatible adapters are ignored and reported in
+the controller status and logs.
+
+Periodic Backup
+~~~~~~~~~~~~~~~
+
+``--periodic-flush-interval SECONDS`` independently enables bounded backup
+scans while L1 usage is below the eviction watermark. Each pass advances a
+rotating cursor through at most 128 currently evictable objects, persists one
+read-locked batch, and retains every L1 copy. It does not change ordinary L1
+eviction behavior; use ``--write-back-on-evict`` separately when capacity
+evictions must be durable.
+
+Periodic backup accepts only adapters whose ``store_objects_sync()`` contract
+supports a timeout. This bounds controller shutdown and runtime adapter
+replacement when an L2 backend is unhealthy. Missing, partial, timed-out, or
+failed backup stores leave L1 unchanged and are retried on a later scan.
+
+Emergency Prefetch Pressure
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``--emergency-evict-for-prefetch`` lets a non-warm L2 restore request bounded
+L1 space before allocation and retry only its out-of-memory reservations once.
+Victims follow the normal LRU order and are deleted only after complete L2
+durability. Hybrid restores calculate the request from each object group's own
+layout rather than assuming that every group has the first group's size.
+With ``IsolatedLRU``, emergency victims are restricted to the restoring
+request's ``cache_salt``; a missing salt fails closed without eviction.
+
+The synchronous eviction is capped at 60 percent of total L1 capacity for one
+restore and has a one-second persistence deadline. Deadline exhaustion keeps
+the remaining L1 objects and does not trip the normal backend-failure circuit
+breaker. Native buffers from a timed-out store remain ineligible for eviction
+until that store completes, preventing allocator reuse while the backend may
+still read them. Warm-up requests never evict other sessions. Runtime adapter removal
+disconnects the emergency path before closing the last bounded synchronous
+backend, and a later compatible adapter reconnects it.
 
 L2 Eviction
 ~~~~~~~~~~~

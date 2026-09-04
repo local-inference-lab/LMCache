@@ -2,13 +2,14 @@
 # Standard
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
 from unittest.mock import MagicMock, PropertyMock, patch
 import os
 import pickle
 import sys
 
 # Third Party
+import msgspec
 import pytest
 import torch
 
@@ -33,6 +34,7 @@ from lmcache.v1.multiprocess.transfer_context.base import (
 )
 from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
 from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
+import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
     # First Party
@@ -181,6 +183,85 @@ def _make_fused_nhd_kv_caches(
     return kv_caches
 
 
+def _install_strided_block_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Install a CPU transfer double that addresses blocks from the descriptor."""
+    # First Party
+    from lmcache import device_ops
+    from lmcache.v1.multiprocess.transfer_context import base
+
+    def _transfer(
+        paged_buffer_ptrs_tensor: list[torch.Tensor],
+        lmcache_objects_ptrs: list[torch.Tensor],
+        block_ids: list[int],
+        _device: torch.device,
+        direction: lmcache_native.TransferDirection,
+        shape_desc: Any,
+        lmcache_chunk_size: int,
+        _engine_kv_format: lmcache_native.EngineKVFormat,
+        _skip_prefix_n_blocks: int,
+    ) -> None:
+        blocks_per_object = lmcache_chunk_size // shape_desc.bs
+        tight_stride = shape_desc.bs * shape_desc.nh * shape_desc.hs
+        block_stride = shape_desc.block_stride_elems or tight_stride
+        paged_layers = [
+            layer.as_strided(
+                (shape_desc.nb, shape_desc.bs, shape_desc.nh, shape_desc.hs),
+                (
+                    block_stride,
+                    shape_desc.nh * shape_desc.hs,
+                    shape_desc.hs,
+                    1,
+                ),
+            )
+            for layer in paged_buffer_ptrs_tensor
+        ]
+        for object_idx, chunk in enumerate(lmcache_objects_ptrs):
+            for block_offset in range(blocks_per_object):
+                block_id = block_ids[object_idx * blocks_per_object + block_offset]
+                token_slice = slice(
+                    block_offset * shape_desc.bs,
+                    (block_offset + 1) * shape_desc.bs,
+                )
+                for layer_idx, paged_layer in enumerate(paged_layers):
+                    flat_block = paged_layer[block_id].reshape(shape_desc.bs, -1)
+                    if direction == lmcache_native.TransferDirection.D2H:
+                        chunk[layer_idx, token_slice].copy_(flat_block)
+                    else:
+                        flat_block.copy_(chunk[layer_idx, token_slice])
+
+    monkeypatch.setattr(base, "_LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR", True)
+    monkeypatch.setattr(device_ops, "multi_layer_block_kv_transfer", _transfer)
+
+
+def _make_padded_group_views() -> tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
+    """Build two layer groups sharing one padded blocks-first allocation."""
+    num_blocks = 3
+    block_size = 2
+    content_size = 4
+    group_widths = (2, 2)
+    layer_elems = block_size * content_size
+    block_stride = sum(group_widths) * layer_elems + 7
+    backing = torch.arange(num_blocks * block_stride, dtype=torch.float32).reshape(
+        num_blocks, block_stride
+    )
+    groups: list[dict[str, torch.Tensor]] = []
+    layer_offset = 0
+    for group_idx, num_layers in enumerate(group_widths):
+        group: dict[str, torch.Tensor] = {}
+        for local_layer_idx in range(num_layers):
+            offset = (layer_offset + local_layer_idx) * layer_elems
+            group[f"group_{group_idx}_layer_{local_layer_idx}"] = backing.as_strided(
+                (num_blocks, block_size, 1, content_size),
+                (block_stride, content_size, content_size, 1),
+                storage_offset=offset,
+            )
+        groups.append(group)
+        layer_offset += num_layers
+    return backing, groups
+
+
 def _make_storage_manager_config(
     *,
     shm_name: str = "",
@@ -233,6 +314,109 @@ def _default_register_payload(
         dtype_str="float32",
         use_mla=False,
     )
+
+
+def _grouped_register_payload(
+    instance_id: int = 20,
+) -> "RegisterEngineDrivenContextPayload":
+    """Build a two-group registration with different planes and windows."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        EngineDrivenGroupLayout,
+        RegisterEngineDrivenContextPayload,
+    )
+
+    return RegisterEngineDrivenContextPayload(
+        instance_id=instance_id,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=1,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        group_layouts=(
+            EngineDrivenGroupLayout(
+                object_group_id=0,
+                engine_group_idx=1,
+                layer_indices=(0,),
+                tokens_per_block=4,
+                blocks_per_chunk=2,
+                shape=(2, 1, 8, 16),
+                dtype_str="float32",
+                blocks_per_window=2,
+                group_kind="attention",
+                num_chunks_in_window=-1,
+            ),
+            EngineDrivenGroupLayout(
+                object_group_id=1,
+                engine_group_idx=0,
+                layer_indices=(1,),
+                tokens_per_block=2,
+                blocks_per_chunk=4,
+                shape=(1, 2, 8),
+                dtype_str="float32",
+                blocks_per_window=1,
+                group_kind="recurrent",
+                num_chunks_in_window=1,
+            ),
+        ),
+    )
+
+
+def test_engine_driven_registration_payload_decodes_legacy_wire_shape() -> None:
+    """The trailing group field must not break an old eight-field payload."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+
+    encoded = msgspec.msgpack.encode(
+        {
+            "instance_id": 1,
+            "model_name": "m",
+            "world_size": 1,
+            "block_size": 4,
+            "num_layers": 2,
+            "hidden_dim_size": 16,
+            "dtype_str": "float32",
+            "use_mla": False,
+        }
+    )
+    payload = msgspec.msgpack.decode(encoded, type=RegisterEngineDrivenContextPayload)
+
+    assert payload.group_layouts == ()
+
+
+def test_engine_driven_registration_response_defaults_capability_off() -> None:
+    """Omitted server capabilities default to fail-closed values."""
+    response = RegisterEngineDrivenContextResponse(shm_name="pool", pool_size=8)
+
+    assert response.accepts_group_layouts is False
+    assert response.accepts_store_abort is False
+
+
+def test_engine_driven_registration_response_is_wire_compatible() -> None:
+    """Old and new response maps decode safely in both directions."""
+    old_wire = msgspec.msgpack.encode({"shm_name": "pool", "pool_size": 8})
+    current = msgspec.msgpack.decode(old_wire, type=RegisterEngineDrivenContextResponse)
+    assert current.accepts_group_layouts is False
+    assert current.accepts_store_abort is False
+
+    legacy_type = msgspec.defstruct(
+        "LegacyRegisterEngineDrivenContextResponse",
+        [("shm_name", str, ""), ("pool_size", int, 0)],
+    )
+    current_wire = msgspec.msgpack.encode(
+        RegisterEngineDrivenContextResponse(
+            shm_name="pool",
+            pool_size=8,
+            accepts_group_layouts=True,
+            accepts_store_abort=True,
+        )
+    )
+    legacy = msgspec.msgpack.decode(current_wire, type=legacy_type)
+    legacy_any = cast(Any, legacy)
+    assert legacy_any.shm_name == "pool"
+    assert legacy_any.pool_size == 8
 
 
 def _default_key(tokens: int = 8) -> "IPCCacheServerKey":
@@ -388,6 +572,85 @@ def test_create_transfer_context_force_lmcache_driven_mode() -> None:
     assert isinstance(context, LMCacheDrivenTransferContext)
 
 
+def test_lmcache_driven_preemption_retains_each_store_event_and_waits() -> None:
+    """Two stores for one request retain both events until remote completion."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        LMCacheDrivenTransferContext,
+        worker_transfer,
+    )
+
+    context = LMCacheDrivenTransferContext()
+    registration_future = MagicMock(name="registration_future")
+    raw_store_futures = [
+        MagicMock(name="raw_store_future_1"),
+        MagicMock(name="raw_store_future_2"),
+    ]
+    pending = [
+        MagicMock(name="pending_store_future_1"),
+        MagicMock(name="pending_store_future_2"),
+    ]
+    for pending_future in pending:
+        pending_future.query.return_value = False
+    for raw_future, pending_future in zip(raw_store_futures, pending, strict=True):
+        raw_future.to_device_future.return_value = pending_future
+    send_request = MagicMock(
+        name="send_request", side_effect=[registration_future, *raw_store_futures]
+    )
+    event_backend = MagicMock(name="event_backend")
+    event_backend.export_event.side_effect = [b"event-1", b"event-2"]
+    events = [MagicMock(name="event_1"), MagicMock(name="event_2")]
+
+    with (
+        patch.object(
+            worker_transfer,
+            "get_event_ipc_backend",
+            return_value=event_backend,
+        ),
+        patch.object(worker_transfer, "wrap_kv_caches", return_value=[]),
+    ):
+        context.register(
+            instance_id=1,
+            kv_caches={"layer_0": torch.zeros(1)},
+            model_name="model",
+            world_size=1,
+            _blocks_in_chunk=1,
+            mq_client=MagicMock(name="mq_client"),
+            mq_timeout=2.5,
+            send_request=send_request,
+        )
+        for index, event in enumerate(events):
+            context.submit_store(
+                _request_id="request",
+                key=f"key-{index}",
+                instance_id=1,
+                kv_caches={},
+                block_ids=[[index]],
+                event=event,
+                _blocks_in_chunk=1,
+            )
+
+    pending[0].retain_reference.assert_called_once_with(events[0])
+    pending[1].retain_reference.assert_called_once_with(events[1])
+
+    context.flush_inflight_stores()
+
+    for pending_future in pending:
+        pending_future.result.assert_called_once_with(timeout=2.5)
+    context.flush_inflight_stores()
+    for pending_future in pending:
+        pending_future.result.assert_called_once()
+
+
+def test_lmcache_driven_preemption_without_stores_is_noop() -> None:
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import LMCacheDrivenTransferContext
+
+    context = LMCacheDrivenTransferContext()
+
+    context.flush_inflight_stores()
+
+
 def test_create_transfer_context_force_engine_driven_mode_on_cpu() -> None:
     """``mode='engine_driven'`` on CPU returns EngineDrivenTransferContext
     (data path; no wrapper-factory capability check is performed)."""
@@ -434,6 +697,7 @@ def test_create_transfer_context_handle_mode_unsupported_device_raises(
         create_transfer_context({"layer_0": torch.randn(2, 2)}, mode="lmcache_driven")
 
 
+@pytest.mark.musa
 def test_musa_data_context_keeps_layout_validation_device_agnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -443,7 +707,6 @@ def test_musa_data_context_keeps_layout_validation_device_agnostic(
         EngineDrivenTransferContext,
         worker_transfer,
     )
-    import lmcache.c_ops as lmc_ops
 
     def _fake_compute_kv_layout(
         *_args: Any, **_kwargs: Any
@@ -453,7 +716,7 @@ def test_musa_data_context_keeps_layout_validation_device_agnostic(
             2,
             16,
             "float32",
-            lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+            lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
             2,
         )
 
@@ -479,6 +742,240 @@ def test_musa_data_context_keeps_layout_validation_device_agnostic(
     )
 
 
+def test_engine_driven_hybrid_registration_requires_server_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new hybrid worker must fail closed against an old server response."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            1,
+            16,
+            "float32",
+            lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            2,
+        ),
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+
+    with pytest.raises(RuntimeError, match="did not acknowledge"):
+        EngineDrivenTransferContext().register(
+            instance_id=1,
+            kv_caches=_make_kv_caches(num_layers=2),
+            model_name="m",
+            world_size=1,
+            blocks_in_chunk=2,
+            mq_client=MagicMock(),
+            mq_timeout=1.0,
+            send_request=MagicMock(return_value=future),
+            engine_group_infos=(
+                EngineGroupInfo(engine_group_id=1, layer_indices=(0,)),
+                EngineGroupInfo(engine_group_id=0, layer_indices=(1,)),
+            ),
+        )
+
+
+def test_engine_driven_shm_registration_requires_abort_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new worker must not use SHM that cannot cancel failed gathers."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            2,
+            16,
+            "float32",
+            lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            2,
+        ),
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse(
+        shm_name="pool", pool_size=8
+    )
+
+    with pytest.raises(RuntimeError, match="canceling failed SHM stores"):
+        EngineDrivenTransferContext().register(
+            instance_id=1,
+            kv_caches=_make_kv_caches(),
+            model_name="m",
+            world_size=1,
+            blocks_in_chunk=2,
+            mq_client=MagicMock(),
+            mq_timeout=1.0,
+            send_request=MagicMock(return_value=future),
+        )
+
+
+def test_engine_driven_hybrid_registration_preserves_group_order_and_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid wire layouts use exact per-group planes, windows, and order."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    split_format = lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
+    fused_format = lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS
+
+    def _fake_layout(
+        caches: dict[str, torch.Tensor], **_kwargs: Any
+    ) -> tuple[int, int, int, str, Any, int]:
+        name = next(iter(caches))
+        if name == "layer_1":
+            return 2, 1, 8, "float32", fused_format, 1
+        return 4, 1, 16, "float32", split_format, 2
+
+    monkeypatch.setattr(worker_transfer, "compute_kv_layout", _fake_layout)
+    engine_context = MagicMock()
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        MagicMock(return_value=engine_context),
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse(
+        accepts_group_layouts=True
+    )
+    send_request = MagicMock(return_value=future)
+    ctx = EngineDrivenTransferContext()
+
+    ctx.register(
+        instance_id=1,
+        kv_caches=_make_kv_caches(num_layers=2),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=send_request,
+        engine_group_infos=(
+            EngineGroupInfo(
+                engine_group_id=1,
+                layer_indices=(0,),
+                tokens_per_block=4,
+            ),
+            EngineGroupInfo(
+                engine_group_id=0,
+                layer_indices=(1,),
+                tokens_per_block=2,
+                sw_size_tokens=2,
+                recurrent_state=True,
+            ),
+        ),
+    )
+
+    payload = send_request.call_args.args[2][0]
+    assert [group.engine_group_idx for group in payload.group_layouts] == [1, 0]
+    assert [group.blocks_per_chunk for group in payload.group_layouts] == [2, 4]
+    assert [group.blocks_per_window for group in payload.group_layouts] == [2, 1]
+    assert [group.shape for group in payload.group_layouts] == [
+        (2, 1, 8, 16),
+        (1, 2, 8),
+    ]
+    assert [group.group_kind for group in payload.group_layouts] == [
+        "attention",
+        "recurrent",
+    ]
+
+    gathered_ids: list[list[int]] = []
+
+    def _capture_gather(
+        _caches: dict[str, torch.Tensor], ids: list[int], *_args: Any, **_kwargs: Any
+    ) -> list[torch.Tensor]:
+        gathered_ids.append(ids)
+        return [torch.zeros(1)]
+
+    monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _capture_gather)
+    ctx._gather_group_payloads(  # noqa: SLF001 - focused protocol-order test
+        _make_kv_caches(num_layers=2),
+        [[10, 11], [20, 21, 22, 23]],
+    )
+    assert gathered_ids == [[10, 11], [20, 21, 22, 23]]
+
+
+def test_engine_driven_hybrid_registration_uses_explicit_chunk_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Physical page size cannot inflate a hybrid LMCache chunk."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    def _fake_layout(
+        caches: dict[str, torch.Tensor], **_kwargs: Any
+    ) -> tuple[int, int, int, str, Any, int]:
+        block_size = 8 if "layer_0" in caches else 1
+        return (
+            block_size,
+            1,
+            4,
+            "float32",
+            lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
+            1,
+        )
+
+    monkeypatch.setattr(worker_transfer, "compute_kv_layout", _fake_layout)
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        MagicMock(return_value=MagicMock()),
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse(
+        accepts_group_layouts=True
+    )
+    send_request = MagicMock(return_value=future)
+
+    EngineDrivenTransferContext().register(
+        instance_id=1,
+        kv_caches={
+            "layer_0": torch.zeros(4, 8, 4),
+            "layer_1": torch.zeros(4, 1, 4),
+        },
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=8,
+        tokens_per_chunk=8,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=send_request,
+        engine_group_infos=(
+            EngineGroupInfo(0, (0,), tokens_per_block=8),
+            EngineGroupInfo(1, (1,), tokens_per_block=8),
+        ),
+    )
+
+    payload = send_request.call_args.args[2][0]
+    assert [group.blocks_per_chunk for group in payload.group_layouts] == [1, 1]
+    assert [group.shape[-2] for group in payload.group_layouts] == [8, 1]
+
+
+@pytest.mark.musa
 def test_musa_data_context_store_uses_device_agnostic_gather(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -488,7 +985,6 @@ def test_musa_data_context_store_uses_device_agnostic_gather(
         EngineDrivenTransferContext,
         worker_transfer,
     )
-    import lmcache.c_ops as lmc_ops
 
     class _FakeEngineDrivenContext:
         def prepare_store(self, *_args: Any, **_kwargs: Any) -> None:
@@ -511,7 +1007,7 @@ def test_musa_data_context_store_uses_device_agnostic_gather(
             2,
             16,
             "float32",
-            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
             2,
         ),
     )
@@ -552,6 +1048,7 @@ def test_musa_data_context_store_uses_device_agnostic_gather(
     assert "prefer_musa_native" not in captured_kwargs
 
 
+@pytest.mark.musa
 def test_musa_data_context_retrieve_uses_device_agnostic_scatter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -561,7 +1058,6 @@ def test_musa_data_context_retrieve_uses_device_agnostic_scatter(
         EngineDrivenTransferContext,
         worker_transfer,
     )
-    import lmcache.c_ops as lmc_ops
 
     class _FakeEngineDrivenContext:
         def prepare_retrieve(self, *_args: Any, **_kwargs: Any) -> list[torch.Tensor]:
@@ -584,7 +1080,7 @@ def test_musa_data_context_retrieve_uses_device_agnostic_scatter(
             2,
             16,
             "float32",
-            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
             2,
         ),
     )
@@ -761,6 +1257,101 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip(
             assert torch.allclose(source[name][1], destination[name][5])
 
 
+def test_grouped_padded_block_views_round_trip_without_touching_canaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Grouped D2H/H2D uses the shared allocation's physical block stride."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    _install_strided_block_transfer(monkeypatch)
+    backing, groups = _make_padded_group_views()
+    expected = backing.clone()
+    layout_hints: LayoutHints = {"kv_layout": "BLNHC"}
+    engine_format = lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS
+    payloads = [
+        gather_paged_kv_to_cpu(
+            group,
+            block_ids=[0, 1, 2],
+            blocks_per_chunk=3,
+            layout_hints=layout_hints,
+            engine_kv_format=engine_format,
+        )
+        for group in groups
+    ]
+
+    for group in groups:
+        for layer in group.values():
+            layer.fill_(-1)
+    for group, payload in zip(groups, payloads, strict=True):
+        scatter_cpu_to_paged_kv(
+            group,
+            block_ids=[0, 1, 2],
+            chunks=payload,
+            blocks_per_chunk=3,
+            layout_hints=layout_hints,
+            engine_kv_format=engine_format,
+        )
+
+    assert torch.equal(backing.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_engine_driven_tight_layout_keeps_descriptor_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-block-axis tight layouts retain the descriptor's tight fallback."""
+    # First Party
+    from lmcache import device_ops
+    from lmcache.v1.multiprocess.transfer_context import base
+    from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+
+    transfer = MagicMock()
+    monkeypatch.setattr(base, "_LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR", True)
+    monkeypatch.setattr(device_ops, "multi_layer_block_kv_transfer", transfer)
+
+    gather_paged_kv_to_cpu(
+        _make_kv_caches(num_layers=2, num_blocks=2),
+        block_ids=[0, 1],
+        blocks_per_chunk=2,
+    )
+
+    assert transfer.call_args.args[5].block_stride_elems == 0
+
+
+def test_engine_driven_rejects_mismatched_layer_block_strides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group whose normalized layers disagree on block stride fails closed."""
+    # First Party
+    from lmcache import device_ops
+    from lmcache.v1.multiprocess.transfer_context import base
+    from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+
+    compact = torch.zeros(3, 2, 1, 4)
+    padded_backing = torch.zeros(3, 11)
+    padded = padded_backing.as_strided(
+        (3, 2, 1, 4),
+        (11, 4, 4, 1),
+    )
+    transfer = MagicMock()
+    monkeypatch.setattr(base, "_LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR", True)
+    monkeypatch.setattr(device_ops, "multi_layer_block_kv_transfer", transfer)
+
+    with pytest.raises(ValueError, match="physical block stride"):
+        gather_paged_kv_to_cpu(
+            {"layer_0": compact, "layer_1": padded},
+            block_ids=[0, 1],
+            blocks_per_chunk=2,
+            layout_hints={"kv_layout": "BLNHC"},
+            engine_kv_format=lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
+        )
+
+    transfer.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("hnd_builder", "expected_format"),
     [
@@ -779,7 +1370,6 @@ def test_gather_scatter_roundtrip_hnd_layout(
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
     )
-    import lmcache.c_ops as lmc_ops
 
     source = {k: v.to(torch_device_type) for k, v in hnd_builder(2, 8, 4, 2, 8).items()}
     layout_hints: LayoutHints = {"kv_layout": "HND"}
@@ -795,7 +1385,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
     assert num_layers == 2
     assert hidden_dim == 16
     assert dtype_str == "float32"
-    assert detected_kv_format == getattr(lmc_ops.EngineKVFormat, expected_format)
+    assert detected_kv_format == getattr(lmcache_native.EngineKVFormat, expected_format)
 
     blocks_per_chunk = 2
     gathered = gather_paged_kv_to_cpu(
@@ -816,7 +1406,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
     )
 
     for name in source:
-        if detected_kv_format == lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS:
+        if detected_kv_format == lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS:
             assert torch.allclose(source[name][:, 0], destination[name][:, 4])
             assert torch.allclose(source[name][:, 1], destination[name][:, 5])
         else:
@@ -985,9 +1575,15 @@ def test_scatter_rounds_down_partial_block_skip_first_n_tokens(
 
 
 @pytest.fixture
-def stub_native_storage_ops() -> Any:
+def stub_lmcache_native() -> Any:
     """Stub native modules so server imports work in source-only test runs."""
-    module = type(sys)("lmcache.native_storage_ops")
+    module = type(sys)("lmcache.lmcache_native")
+    module.PageBufferShapeDesc = type("PageBufferShapeDesc", (), {})  # type: ignore[attr-defined]
+    module.KernelGroupSpec = type(  # type: ignore[attr-defined]
+        "KernelGroupSpec",
+        (),
+        {"__init__": lambda self, *args, **kwargs: None},
+    )
     module.TTLLock = type("TTLLock", (), {})  # type: ignore[attr-defined]
     module.Bitmap = type("Bitmap", (), {})  # type: ignore[attr-defined]
     module.PeriodicEventNotifier = type(  # type: ignore[attr-defined]
@@ -996,7 +1592,7 @@ def stub_native_storage_ops() -> Any:
     with patch.dict(
         sys.modules,
         {
-            "lmcache.native_storage_ops": module,
+            "lmcache.lmcache_native": module,
             "cupy": MagicMock(),
         },
     ):
@@ -1005,7 +1601,7 @@ def stub_native_storage_ops() -> Any:
 
 @pytest.fixture
 def server_module_factory(
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
 ) -> Iterator[ServerModuleFactory]:
     """Create a patched server module/context with configurable mocks."""
     # Standard
@@ -1041,6 +1637,31 @@ def server_module_factory(
         Returns ``(module, mock_storage, mock_session, ctx)``.
         """
         mock_storage = mock_storage or MagicMock()
+        # First Party
+        from lmcache.v1.distributed.admission import AdmissionWaitResult
+        from lmcache.v1.distributed.error import L1Error
+
+        def _reserve_write_detailed(
+            obj_keys: list[str], *args: Any, **kwargs: Any
+        ) -> dict[str, tuple[Any, Any]]:
+            reserved = mock_storage.reserve_write(obj_keys, *args, **kwargs)
+            return {
+                obj_key: (
+                    (L1Error.SUCCESS, reserved[obj_key])
+                    if obj_key in reserved
+                    else (L1Error.KEY_NOT_WRITABLE, None)
+                )
+                for obj_key in obj_keys
+            }
+
+        mock_storage.reserve_write_detailed.side_effect = _reserve_write_detailed
+        mock_storage.get_readable_keys.side_effect = lambda keys: list(keys)
+        mock_storage.get_capacity_generation.return_value = 0
+        mock_storage.wait_for_capacity_change.return_value = (
+            AdmissionWaitResult.TIMEOUT,
+            0,
+        )
+        mock_storage.store_admission_timeout_seconds = 0.0
         if mock_session is None:
             mock_session = MagicMock()
             mock_session.get_hashes.return_value = [b"h"]
@@ -1104,7 +1725,7 @@ def server_module_factory(
     ],
 )
 def test_engine_context_shm_pool_info(
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
     config_kwargs: dict[str, Any],
     expected_pool_info: dict[str, Any],
 ) -> None:
@@ -1130,7 +1751,7 @@ def test_engine_context_shm_pool_info(
 
 
 def test_server_register_and_find_non_cuda_context_layout(
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
     """Ensure backend-agnostic registration stores metadata and lookup finds layout."""
@@ -1146,8 +1767,245 @@ def test_server_register_and_find_non_cuda_context_layout(
     assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
 
 
+def test_server_registers_exact_hybrid_group_layouts_and_windows(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Grouped registration populates current-dev layout and lookup metadata."""
+    module, _, _, ctx = server_module_factory(chunk_size=8)
+
+    response = module.register_kv_cache_engine_driven_context(
+        _grouped_register_payload()
+    )
+
+    assert response.accepts_group_layouts is True
+    assert response.accepts_store_abort is True
+    layouts = ctx.layout_desc_registry.find_group_layout_descs("m", 1)
+    assert layouts is not None
+    assert layouts[0].shapes == [torch.Size([2, 1, 8, 16])]
+    assert layouts[1].shapes == [torch.Size([1, 2, 8])]
+    attn_desc = ctx.layout_desc_registry.find_attn_desc("m", 1)
+    assert attn_desc.num_chunks_in_sw == [-1, 1]
+    assert attn_desc.group_kinds == ("attention", "recurrent")
+
+
+def test_server_rejects_group_geometry_that_disagrees_with_chunk_size(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Registration must fail before mismatched chunks can share cache keys."""
+    module, _, _, _ = server_module_factory(chunk_size=16)
+
+    with pytest.raises(ValueError, match="server uses 16"):
+        module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+
+
+def test_server_rejects_group_shape_that_disagrees_with_layers(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Wire shapes must retain a supported plane and layer structure."""
+    payload = _grouped_register_payload()
+    payload = msgspec.structs.replace(
+        payload,
+        group_layouts=(
+            msgspec.structs.replace(payload.group_layouts[0], shape=(3, 1, 8, 16)),
+            payload.group_layouts[1],
+        ),
+    )
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    with pytest.raises(ValueError, match="Invalid engine-driven group layout"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_allows_multiple_layouts_from_one_engine_group(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Physical transfer splits may legitimately share one block-id space."""
+    payload = _grouped_register_payload()
+    payload = msgspec.structs.replace(
+        payload,
+        group_layouts=tuple(
+            msgspec.structs.replace(group, engine_group_idx=0)
+            for group in payload.group_layouts
+        ),
+    )
+    module, _, _, ctx = server_module_factory(chunk_size=8)
+
+    response = module.register_kv_cache_engine_driven_context(payload)
+
+    assert response.accepts_group_layouts is True
+    layouts = ctx.layout_desc_registry.find_group_layout_descs("m", 1)
+    assert layouts is not None
+    assert set(layouts) == {0, 1}
+
+
+def test_server_pickle_roundtrip_requires_every_hybrid_group(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Pickle transport stores and retrieves one complete payload per group."""
+    mock_storage = MagicMock()
+    group_tensors = {
+        "g0": torch.zeros(2, 1, 8, 16),
+        "g1": torch.zeros(1, 2, 8),
+    }
+    memory_objs = {}
+    for object_key, tensor in group_tensors.items():
+        memory_obj = MagicMock()
+        memory_obj.tensor = tensor
+        memory_objs[object_key] = memory_obj
+
+    def _reserve(keys: list[str], *_args: Any) -> dict[str, Any]:
+        return {key: memory_objs[key] for key in keys}
+
+    @contextmanager
+    def _read(keys: list[str]) -> Any:
+        yield [memory_objs[key] for key in keys]
+
+    mock_storage.reserve_write.side_effect = _reserve
+    mock_storage.read_prefetched_results.side_effect = _read
+    module, _, _, ctx = server_module_factory(chunk_size=8, mock_storage=mock_storage)
+    module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+    source = [
+        [torch.ones_like(group_tensors["g0"])],
+        [torch.full_like(group_tensors["g1"], 2.0)],
+    ]
+    key = _default_key()
+
+    assert module.commit_store(key, 20, pickle.dumps(source)) is True
+    assert torch.equal(group_tensors["g0"], source[0][0])
+    assert torch.equal(group_tensors["g1"], source[1][0])
+
+    response = module.prepare_retrieve(key, 20)
+    assert response.success is True
+    recovered = pickle.loads(response.data)
+    assert len(recovered) == 2
+    assert torch.equal(recovered[0][0], source[0][0])
+    assert torch.equal(recovered[1][0], source[1][0])
+
+
+def test_server_pickle_retrieve_reads_only_each_group_retained_suffix(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Grouped pickle retrieve keeps full attention and recurrent suffixes."""
+    mock_storage = MagicMock()
+    object_keys = [["full-0", "full-1", "full-2"], ["rec-0", "rec-1", "rec-2"]]
+    memory_objs = {
+        object_key: MagicMock(tensor=torch.full((2, 1, 8, 16), float(idx)))
+        for idx, object_key in enumerate(object_keys[0])
+    }
+    memory_objs.update(
+        {
+            object_key: MagicMock(tensor=torch.full((1, 2, 8), float(idx)))
+            for idx, object_key in enumerate(object_keys[1])
+        }
+    )
+
+    @contextmanager
+    def _read(keys: list[str]) -> Any:
+        yield [memory_objs[key] for key in keys]
+
+    mock_storage.read_prefetched_results.side_effect = _read
+    module, _, _, ctx = server_module_factory(chunk_size=8, mock_storage=mock_storage)
+    module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=object_keys)
+
+    response = module.prepare_retrieve(_default_key(tokens=24), 20)
+
+    assert response.success is True
+    assert [
+        call.args[0] for call in mock_storage.read_prefetched_results.call_args_list
+    ] == [
+        object_keys[0],
+        ["rec-2"],
+    ]
+    recovered = pickle.loads(response.data)
+    assert [len(group) for group in recovered] == [3, 1]
+    assert torch.equal(recovered[1][0], memory_objs["rec-2"].tensor)
+
+
+def test_server_pickle_retrieve_missing_retained_suffix_releases_all_reads(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A retained-suffix miss fails closed and releases earlier group locks."""
+    mock_storage = MagicMock()
+    object_keys = [["full-0", "full-1"], ["rec-0", "rec-1"]]
+    full_objs = [MagicMock(tensor=torch.zeros(2, 1, 8, 16)) for _ in object_keys[0]]
+
+    @contextmanager
+    def _read(keys: list[str]) -> Any:
+        yield full_objs if keys == object_keys[0] else []
+
+    mock_storage.read_prefetched_results.side_effect = _read
+    module, _, _, ctx = server_module_factory(chunk_size=8, mock_storage=mock_storage)
+    module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=object_keys)
+
+    response = module.prepare_retrieve(_default_key(tokens=16), 20)
+
+    assert response.success is False
+    assert [
+        call.args[0] for call in mock_storage.read_prefetched_results.call_args_list
+    ] == [
+        object_keys[0],
+        ["rec-1"],
+    ]
+    mock_storage.finish_read_prefetched.assert_called_once_with(object_keys[0])
+
+
+def test_server_pickle_rejects_invalid_group_before_reserving(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Malformed group payloads cannot allocate or publish cache objects."""
+    mock_storage = MagicMock()
+    module, _, _, ctx = server_module_factory(chunk_size=8, mock_storage=mock_storage)
+    module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+    invalid = [
+        [torch.zeros(1)],
+        [torch.zeros(1, 2, 8)],
+    ]
+
+    assert module.commit_store(_default_key(), 20, pickle.dumps(invalid)) is False
+    mock_storage.reserve_write.assert_not_called()
+    mock_storage.finish_write.assert_not_called()
+
+
+def test_server_pickle_aborts_every_reservation_when_copy_fails(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A failed CPU copy leaves no write reservation readable."""
+    mock_storage = MagicMock()
+    target = MagicMock()
+    target.shape = torch.Size([2, 1, 8, 16])
+    target.dtype = torch.float32
+    target.copy_.side_effect = RuntimeError("copy failed")
+    memory_obj = MagicMock()
+    memory_obj.tensor = target
+    mock_storage.reserve_write.return_value = {"g0": memory_obj}
+    module, _, _, ctx = server_module_factory(chunk_size=8, mock_storage=mock_storage)
+    module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+    source = [
+        [torch.zeros(2, 1, 8, 16)],
+        [torch.zeros(1, 2, 8)],
+    ]
+
+    assert module.commit_store(_default_key(), 20, pickle.dumps(source)) is False
+    mock_storage.abort_write.assert_called_once_with(["g0"])
+    mock_storage.finish_write.assert_not_called()
+
+
 def test_server_store_and_retrieve_cpu_chunks(
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
     """Validate mocked server-side CPU chunk store and retrieve behavior."""
@@ -1188,7 +2046,7 @@ def test_server_store_and_retrieve_cpu_chunks(
 
 
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
     """Regression: repeated prompt after worker restart should no-op-store cleanly.
@@ -1223,11 +2081,11 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     assert module.commit_store(key, 3, b"") is False
 
 
-def test_server_prepare_store_releases_unused_reserved_write_locks(
-    stub_native_storage_ops: Any,
+def test_server_prepare_store_rejects_reserved_object_without_tensor(
+    stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
-    """Ensure SHM prepare_store releases reserved keys that have no writable tensor."""
+    """SHM admission aborts a reserved object with no writable tensor."""
     # First Party
     from lmcache.v1.multiprocess.protocols.engine import PrepareStoreResponse
 
@@ -1253,13 +2111,17 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
     key = _default_key()
     prepare_response = module.prepare_store(key, 5)
     assert isinstance(prepare_response, PrepareStoreResponse)
-    assert prepare_response.context == {"slots": [], "chunk_indices": []}
+    assert prepare_response.context == {
+        "success": False,
+        "failure_reason": "invalid_layout",
+    }
     reserved_keys = mock_storage.reserve_write.call_args[0][0]
-    mock_storage.finish_write.assert_called_once_with(reserved_keys)
+    mock_storage.abort_write.assert_called_once_with(reserved_keys)
+    mock_storage.finish_write.assert_not_called()
 
 
 def test_server_shm_transport_uses_engine_level_config(
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
     """Ensure all instances share the same engine-level SHM transport setting."""
@@ -1294,7 +2156,7 @@ def test_server_shm_transport_uses_engine_level_config(
 
 
 def test_server_engine_driven_reregister_returns_existing_shm_response(
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
     """Ensure duplicate non-GPU registration returns existing SHM response."""
@@ -1314,7 +2176,7 @@ def test_server_engine_driven_reregister_returns_existing_shm_response(
 
 
 def test_server_unregister_engine_driven_context_releases_pending_shm_locks(
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
     """Ensure unregister releases pending SHM read/write reservations."""
@@ -1349,8 +2211,45 @@ def test_server_unregister_engine_driven_context_releases_pending_shm_locks(
 
     module.unregister_kv_cache(4)
 
-    mock_storage.finish_write.assert_called_once()
+    mock_storage.abort_write.assert_called_once()
     mock_storage.finish_read_prefetched.assert_called_once()
+
+
+def test_server_close_releases_pending_shm_locks(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Server shutdown aborts orphaned writes and releases reads."""
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+    memory_obj.shm_offset = 0
+    memory_obj.shm_byte_length = 2048
+    mock_storage.reserve_write.side_effect = lambda obj_keys, *_args, **_kwargs: {
+        obj_key: memory_obj for obj_key in obj_keys
+    }
+    mock_storage.unsafe_read.side_effect = lambda obj_keys: (
+        obj_keys,
+        [memory_obj for _ in obj_keys],
+    )
+    module, _, _, ctx = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_test_pool", pool_size=4096
+        ),
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=14)
+    )
+    key = _default_key()
+    assert module.prepare_store(key, 14).context["slots"]
+    assert module.prepare_retrieve(key, 14).success is True
+
+    module.close()
+
+    mock_storage.abort_write.assert_called_once()
+    mock_storage.finish_read_prefetched.assert_called_once()
+    assert ctx.layout_desc_registry.find("m", 1) is None
 
 
 def test_gather_paged_kv_with_chunk_indices_subset() -> None:
@@ -1405,8 +2304,77 @@ def test_gather_paged_kv_with_chunk_indices_subset() -> None:
     assert torch.allclose(out_buffers[1], all_chunks[2])
 
 
+def test_gather_scatter_uses_trailing_subchunk_window() -> None:
+    """A sub-chunk group transfers only each logical chunk's trailing blocks."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    source = {
+        key: value.to(torch_device_type)
+        for key, value in _make_kv_caches(
+            num_layers=1,
+            num_blocks=8,
+            block_size=4,
+            num_heads=2,
+            head_size=4,
+        ).items()
+    }
+    chunks = gather_paged_kv_to_cpu(
+        source,
+        [0, 1, 2, 3],
+        blocks_per_chunk=2,
+        blocks_per_window=1,
+    )
+    full_chunks = gather_paged_kv_to_cpu(
+        source,
+        [0, 1, 2, 3],
+        blocks_per_chunk=2,
+    )
+    assert chunks[0].numel() * 2 == full_chunks[0].numel()
+    destination = {
+        name: torch.full_like(tensor, 999.0) for name, tensor in source.items()
+    }
+
+    scatter_cpu_to_paged_kv(
+        destination,
+        [4, 5, 6, 7],
+        chunks,
+        blocks_per_chunk=2,
+        blocks_per_window=1,
+    )
+
+    for name in source:
+        assert torch.all(destination[name][:, 4] == 999.0)
+        assert torch.all(destination[name][:, 6] == 999.0)
+        assert torch.allclose(destination[name][:, 5], source[name][:, 1])
+        assert torch.allclose(destination[name][:, 7], source[name][:, 3])
+
+
+def test_recurrent_alias_collapse_keeps_only_newest_snapshot() -> None:
+    """Repeated destination IDs must not race old and new recurrent states."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        _collapse_chunks_for_single_destination,
+    )
+
+    chunks = [torch.tensor([1]), torch.tensor([2]), torch.tensor([3])]
+
+    compact_chunks, compact_ids = _collapse_chunks_for_single_destination(
+        chunks,
+        [7, 7, 7],
+        blocks_per_chunk=1,
+        blocks_per_window=1,
+    )
+
+    assert compact_chunks == [chunks[-1]]
+    assert compact_ids == [7]
+
+
 def test_server_prepare_store_includes_chunk_indices(
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
     """prepare_store response context includes chunk_indices for SHM mode.
@@ -1445,6 +2413,345 @@ def test_server_prepare_store_includes_chunk_indices(
     assert len(response_context.get("slots", [])) == 1
     # chunk_indices should be [1] (position of obj2 in [obj1, obj2])
     assert response_context.get("chunk_indices") == [1]
+
+
+def test_server_grouped_shm_labels_slots_and_releases_all_group_miss(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """SHM descriptors retain group identity and a later miss unlocks earlier groups."""
+    mock_storage = MagicMock()
+    memory_objs = []
+    for offset, shape in ((0, (2, 1, 8, 16)), (4096, (1, 2, 8))):
+        memory_obj = MagicMock()
+        memory_obj.tensor = torch.zeros(shape)
+        memory_obj.shm_offset = offset
+        memory_obj.shm_byte_length = memory_obj.tensor.numel() * 4
+        memory_objs.append(memory_obj)
+    mock_storage.reserve_write.side_effect = [
+        {"g0": memory_objs[0]},
+        {"g1": memory_objs[1]},
+    ]
+    module, _, _, ctx = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_group_pool", pool_size=16384
+        ),
+        chunk_size=8,
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+    key = _default_key()
+
+    response = module.prepare_store(key, 20)
+    assert response.context["group_ids"] == [0, 1]
+    assert response.context["chunk_indices"] == [0, 0]
+    assert len(response.context["slots"]) == 2
+
+    mock_storage.unsafe_read.side_effect = [(["g0"], [memory_objs[0]]), ([], [])]
+    miss = module.prepare_retrieve(key, 20)
+    assert miss.success is False
+    mock_storage.finish_read_prefetched.assert_called_once_with(["g0"])
+
+
+def test_server_grouped_shm_retrieve_reads_only_retained_suffix(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Grouped SHM retrieve exposes full attention and newest recurrent slots."""
+    mock_storage = MagicMock()
+    object_keys = [["full-0", "full-1"], ["rec-0", "rec-1"]]
+    memory_objs: dict[str, MagicMock] = {}
+    for idx, object_key in enumerate(object_keys[0]):
+        memory_obj = MagicMock()
+        memory_obj.tensor = torch.zeros(2, 1, 8, 16)
+        memory_obj.shm_offset = idx * 4096
+        memory_obj.shm_byte_length = memory_obj.tensor.numel() * 4
+        memory_objs[object_key] = memory_obj
+    recurrent_obj = MagicMock()
+    recurrent_obj.tensor = torch.zeros(1, 2, 8)
+    recurrent_obj.shm_offset = 8192
+    recurrent_obj.shm_byte_length = recurrent_obj.tensor.numel() * 4
+    memory_objs["rec-1"] = recurrent_obj
+    mock_storage.unsafe_read.side_effect = lambda keys: (
+        list(keys),
+        [memory_objs[key] for key in keys],
+    )
+    module, _, _, ctx = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_group_pool", pool_size=16384
+        ),
+        chunk_size=8,
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=object_keys)
+
+    response = module.prepare_retrieve(_default_key(tokens=16), 20)
+
+    assert response.success is True
+    assert [call.args[0] for call in mock_storage.unsafe_read.call_args_list] == [
+        object_keys[0],
+        ["rec-1"],
+    ]
+    assert response.context["group_ids"] == [0, 0, 1]
+
+
+def test_server_grouped_shm_capacity_failure_aborts_every_group(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A partial multi-group allocation is never exposed as a cache store."""
+    # First Party
+    from lmcache.v1.distributed.error import L1Error
+
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(2, 1, 8, 16)
+    memory_obj.shm_offset = 0
+    memory_obj.shm_byte_length = memory_obj.tensor.numel() * 4
+    module, _, _, ctx = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_group_pool", pool_size=16384
+        ),
+        chunk_size=8,
+        mock_storage=mock_storage,
+    )
+    mock_storage.reserve_write_detailed.side_effect = [
+        {"g0": (L1Error.SUCCESS, memory_obj)},
+        {"g1": (L1Error.OUT_OF_MEMORY, None)},
+    ]
+    mock_storage.get_readable_keys.return_value = []
+    mock_storage.get_readable_keys.side_effect = None
+    mock_storage.store_admission_timeout_seconds = 0.0
+    module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+
+    response = module.prepare_store(_default_key(), 20)
+
+    assert response.context == {
+        "success": False,
+        "failure_reason": "capacity_timeout",
+    }
+    mock_storage.abort_write.assert_called_once_with(["g0"])
+    mock_storage.finish_write.assert_not_called()
+
+
+def test_server_grouped_shm_abort_discards_pending_reservations(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """The abort sentinel removes SHM reservations without publishing them."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        ENGINE_DRIVEN_ABORT_STORE_PAYLOAD,
+    )
+
+    mock_storage = MagicMock()
+    memory_objs = []
+    for offset, shape in ((0, (2, 1, 8, 16)), (4096, (1, 2, 8))):
+        memory_obj = MagicMock()
+        memory_obj.tensor = torch.zeros(shape)
+        memory_obj.shm_offset = offset
+        memory_obj.shm_byte_length = memory_obj.tensor.numel() * 4
+        memory_objs.append(memory_obj)
+    mock_storage.reserve_write.side_effect = [
+        {"g0": memory_objs[0]},
+        {"g1": memory_objs[1]},
+    ]
+    module, _, _, ctx = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_group_pool", pool_size=16384
+        ),
+        chunk_size=8,
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+    key = _default_key()
+
+    assert module.prepare_store(key, 20).context["slots"]
+    assert module.commit_store(key, 20, ENGINE_DRIVEN_ABORT_STORE_PAYLOAD) is True
+    mock_storage.abort_write.assert_called_once_with(["g0", "g1"])
+    mock_storage.finish_write.assert_not_called()
+
+
+def test_worker_grouped_gather_failure_aborts_prepared_shm_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker gather error cannot strand or publish its prepared SHM slots."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    engine_context = MagicMock()
+    engine_context.prepare_store_grouped.return_value = (
+        [[torch.zeros(1)], [torch.zeros(1)]],
+        [[0], [0]],
+    )
+    context = EngineDrivenTransferContext()
+    context._engine_driven_context = engine_context  # noqa: SLF001
+    context._worker_groups = (MagicMock(), MagicMock())  # noqa: SLF001
+    monkeypatch.setattr(
+        context,
+        "_gather_group_payloads",
+        MagicMock(side_effect=RuntimeError("gather failed")),
+    )
+    monkeypatch.setattr(worker_transfer.torch_dev, "synchronize", MagicMock())
+    key = _default_key()
+
+    result = context.submit_store(
+        "req",
+        key,
+        20,
+        _make_kv_caches(),
+        [[0], [1]],
+        MagicMock(),
+        1,
+    ).result()
+
+    assert result is False
+    engine_context.abort_store.assert_called_once_with(key, 20)
+    engine_context.commit_store_grouped.assert_not_called()
+
+
+def test_worker_grouped_scatter_failure_releases_retrieve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed destination write still releases every server read lock."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import EngineDrivenTransferContext
+
+    engine_context = MagicMock()
+    engine_context.prepare_retrieve_grouped.return_value = [
+        [torch.zeros(1)],
+        [torch.zeros(1)],
+    ]
+    engine_context.commit_retrieve.return_value = True
+    context = EngineDrivenTransferContext()
+    context._engine_driven_context = engine_context  # noqa: SLF001
+    context._worker_groups = (MagicMock(), MagicMock())  # noqa: SLF001
+    monkeypatch.setattr(
+        context,
+        "_scatter_group_payloads",
+        MagicMock(side_effect=RuntimeError("scatter failed")),
+    )
+    key = _default_key()
+
+    result = context.submit_retrieve(
+        "req",
+        key,
+        20,
+        _make_kv_caches(),
+        [[0], [1]],
+        MagicMock(),
+        1,
+    ).result()
+
+    assert result is False
+    engine_context.commit_retrieve.assert_called_once_with(key, 20)
+
+
+def test_worker_grouped_scatter_places_retained_suffix_in_trailing_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retained recurrent payloads target trailing logical destination chunks."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import EngineDrivenGroupLayout
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        EngineDrivenTransferContext,
+        _EngineDrivenWorkerGroup,
+    )
+
+    full_layout = EngineDrivenGroupLayout(
+        object_group_id=0,
+        engine_group_idx=0,
+        layer_indices=(0,),
+        tokens_per_block=4,
+        blocks_per_chunk=2,
+        shape=(1, 8, 1),
+        dtype_str="float32",
+        blocks_per_window=2,
+        group_kind="attention",
+        num_chunks_in_window=-1,
+    )
+    recurrent_layout = EngineDrivenGroupLayout(
+        object_group_id=1,
+        engine_group_idx=1,
+        layer_indices=(1,),
+        tokens_per_block=4,
+        blocks_per_chunk=2,
+        shape=(1, 4, 1),
+        dtype_str="float32",
+        blocks_per_window=1,
+        group_kind="recurrent",
+        num_chunks_in_window=1,
+    )
+    context = EngineDrivenTransferContext()
+    context._worker_groups = (  # noqa: SLF001 - focused wire-contract test
+        _EngineDrivenWorkerGroup(full_layout, ("layer_0",), None),
+        _EngineDrivenWorkerGroup(recurrent_layout, ("layer_1",), None),
+    )
+    scatter = MagicMock()
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", scatter)
+    full_payloads = [torch.zeros(full_layout.shape) for _ in range(3)]
+    recurrent_payloads = [torch.zeros(recurrent_layout.shape)]
+
+    context._scatter_group_payloads(  # noqa: SLF001 - focused wire-contract test
+        {"layer_0": torch.zeros(1), "layer_1": torch.zeros(1)},
+        [[0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11]],
+        [full_payloads, recurrent_payloads],
+        skip_first_n_tokens=0,
+    )
+
+    assert scatter.call_args_list[0].args[1] == [0, 1, 2, 3, 4, 5]
+    assert scatter.call_args_list[1].args[1] == [10, 11]
+    assert scatter.call_args_list[1].args[2] == recurrent_payloads
+
+
+def test_worker_grouped_scatter_still_requires_every_full_attention_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full-attention groups cannot use a partial suffix payload."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import EngineDrivenGroupLayout
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        EngineDrivenTransferContext,
+        _EngineDrivenWorkerGroup,
+    )
+
+    layout = EngineDrivenGroupLayout(
+        object_group_id=0,
+        engine_group_idx=0,
+        layer_indices=(0,),
+        tokens_per_block=4,
+        blocks_per_chunk=2,
+        shape=(1, 8, 1),
+        dtype_str="float32",
+        blocks_per_window=2,
+        group_kind="attention",
+        num_chunks_in_window=-1,
+    )
+    context = EngineDrivenTransferContext()
+    context._worker_groups = (  # noqa: SLF001 - focused wire-contract test
+        _EngineDrivenWorkerGroup(layout, ("layer_0",), None),
+    )
+    scatter = MagicMock()
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", scatter)
+
+    with pytest.raises(ValueError, match="returned 1 chunks; expected 2"):
+        context._scatter_group_payloads(  # noqa: SLF001
+            {"layer_0": torch.zeros(1)},
+            [[0, 1, 2, 3]],
+            [[torch.zeros(layout.shape)]],
+            skip_first_n_tokens=0,
+        )
+
+    scatter.assert_not_called()
 
 
 class _CompletedFuture:

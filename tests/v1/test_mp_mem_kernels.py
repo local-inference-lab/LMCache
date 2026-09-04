@@ -7,20 +7,26 @@ import random
 import pytest
 import torch
 
+# First Party
+from lmcache import torch_dev, torch_device_type
+
 pytest.importorskip(
-    "lmcache.c_ops",
-    reason="Requires CUDA extension lmcache.c_ops",
+    "lmcache.cuda_ops",
+    reason="Requires CUDA extension lmcache.cuda_ops",
 )
 
 # First Party
-import lmcache.c_ops as lmc_ops
+import lmcache.cuda_ops as cuda_ops
+import lmcache.lmcache_native as lmcache_native
 
 # Skip all tests if cuda is unavailable
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() == 0,
-    reason="No CUDA GPU present",
-)
-
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not (torch_dev.is_available() and torch_device_type == "cuda"),
+        reason="Requires CUDA backend",
+    ),
+]
 # ---------------------------------------------------------------------------
 # Tensor factories (ported from kernel harness)
 # ---------------------------------------------------------------------------
@@ -42,19 +48,19 @@ def _create_zero_tensor(
     return torch.zeros(shape, dtype=dtype, device=device)
 
 
-# Format enum values from c_ops
-FMT_NORMAL = lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
-FMT_CROSS_LAYER = lmc_ops.EngineKVFormat.NB_NL_TWO_BS_NH_HS
-FMT_FLASH_INFER = lmc_ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
-FMT_MLA = lmc_ops.EngineKVFormat.NL_X_NB_BS_HS
-FMT_SGLANG_MHA = lmc_ops.EngineKVFormat.TWO_X_NL_X_NBBS_NH_HS
-FMT_SGLANG_MLA = lmc_ops.EngineKVFormat.NL_X_NBBS_ONE_HS
-FMT_NORMAL_HND = lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS
-FMT_FLASH_INFER_HND = lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS
-FMT_VLLM_FUSED_HND = lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS
-FMT_VLLM_FUSED_NHD = lmc_ops.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS
-FMT_VLLM_CS_HND = lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_CS
-FMT_VLLM_CS_NHD = lmc_ops.EngineKVFormat.NL_X_NB_BS_NH_CS
+# Format enum values used by the DeviceOps compatibility shim
+FMT_NORMAL = lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
+FMT_CROSS_LAYER = lmcache_native.EngineKVFormat.NB_NL_TWO_BS_NH_HS
+FMT_FLASH_INFER = lmcache_native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
+FMT_MLA = lmcache_native.EngineKVFormat.NL_X_NB_BS_HS
+FMT_SGLANG_MHA = lmcache_native.EngineKVFormat.TWO_X_NL_X_NBBS_NH_HS
+FMT_SGLANG_MLA = lmcache_native.EngineKVFormat.NL_X_NBBS_ONE_HS
+FMT_NORMAL_HND = lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS
+FMT_FLASH_INFER_HND = lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS
+FMT_VLLM_FUSED_HND = lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS
+FMT_VLLM_FUSED_NHD = lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS
+FMT_VLLM_CS_HND = lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS
+FMT_VLLM_CS_NHD = lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS
 
 # Format parameters: (engine_kv_format, num_layers, num_heads, head_size, is_mla)
 # The is_mla column really means "kv_size == 1": the fused-K/V and content-size
@@ -245,10 +251,11 @@ def call_block_kernel(
     is_mla: bool,
     tokens_per_object: int,
     skip_prefix_n_blocks: int = 0,
+    block_stride_elems: int = 0,
 ) -> None:
     device = vllm_tensors[0].device
 
-    shape_desc = lmc_ops.PageBufferShapeDesc()
+    shape_desc = lmcache_native.PageBufferShapeDesc()
     shape_desc.kv_size = 1 if is_mla else 2
     shape_desc.nl = nl
     shape_desc.nb = nb
@@ -256,13 +263,14 @@ def call_block_kernel(
     shape_desc.nh = nh
     shape_desc.hs = hs
     shape_desc.element_size = vllm_tensors[0].element_size()
+    shape_desc.block_stride_elems = block_stride_elems
 
     ptrs = [t.data_ptr() for t in vllm_tensors]
     paged_buffer_ptrs_tensor = torch.tensor(ptrs, dtype=torch.int64, device=device)
     lmcache_objects_ptrs = [m.data_ptr() for m in mem_objects]
 
     block_ids_gpu = torch.tensor(block_ids, dtype=torch.int64, device=device)
-    lmc_ops.multi_layer_block_kv_transfer(
+    cuda_ops.multi_layer_block_kv_transfer(
         paged_buffer_ptrs_tensor,
         lmcache_objects_ptrs,
         block_ids_gpu,
@@ -308,7 +316,9 @@ TOTAL_BLOCKS = NUM_MEMORY_OBJECTS * BLOCKS_PER_OBJECT  # 64
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
 )
-@pytest.mark.parametrize("mem_device", ["cuda", "cpu"], ids=["mem_gpu", "mem_cpu"])
+@pytest.mark.parametrize(
+    "mem_device", [torch_device_type, "cpu"], ids=["mem_gpu", "mem_cpu"]
+)
 def test_block_transfer_roundtrip(
     engine_kv_format, nl, nh, hs, is_mla, dtype, mem_device
 ):
@@ -316,7 +326,7 @@ def test_block_transfer_roundtrip(
     D2H -> H2D roundtrip with different block IDs proves data flows through
     memory objects.
     """
-    device = torch.device("cuda")
+    device = torch.device(torch_device_type)
     mem_dev = torch.device(mem_device)
     kv_dim = 1 if is_mla else 2
     hidden_dim = nh * hs
@@ -352,7 +362,7 @@ def test_block_transfer_roundtrip(
         mem_objects,
         block_ids_d2h,
         engine_kv_format,
-        lmc_ops.TransferDirection.D2H,
+        lmcache_native.TransferDirection.D2H,
         nl,
         NB,
         BS,
@@ -361,7 +371,7 @@ def test_block_transfer_roundtrip(
         is_mla,
         TOKENS_PER_OBJECT,
     )
-    torch.cuda.synchronize()
+    torch_dev.synchronize()
 
     # H2D: mem_objects -> target
     call_block_kernel(
@@ -369,7 +379,7 @@ def test_block_transfer_roundtrip(
         mem_objects,
         block_ids_h2d,
         engine_kv_format,
-        lmc_ops.TransferDirection.H2D,
+        lmcache_native.TransferDirection.H2D,
         nl,
         NB,
         BS,
@@ -378,7 +388,7 @@ def test_block_transfer_roundtrip(
         is_mla,
         TOKENS_PER_OBJECT,
     )
-    torch.cuda.synchronize()
+    torch_dev.synchronize()
 
     # Verify: target[h2d_block] == source[d2h_block]
     for i in range(TOTAL_BLOCKS):
@@ -392,6 +402,188 @@ def test_block_transfer_roundtrip(
             assert torch.equal(src_data[layer_idx], tgt_data[layer_idx]), (
                 f"Mismatch at block index {i}, layer {layer_idx}"
             )
+
+
+def test_block_transfer_roundtrip_packed_nvfp4_page():
+    """A 512-token packed NVFP4 page round-trips as one opaque slot."""
+    device = torch.device(torch_device_type)
+    nl, nb, bs, nh, hs = 2, 20, 1, 1, 177_408
+    block_stride_elems = 200_000
+    slots_per_object = 8  # 4096 logical tokens / 512 tokens per page
+    total_blocks = slots_per_object
+
+    source_pools = [
+        (torch.arange(nb * block_stride_elems, device=device) + layer_idx)
+        .remainder(251)
+        .to(torch.uint8)
+        for layer_idx in range(nl)
+    ]
+    target_pools = [
+        torch.zeros(nb * block_stride_elems, dtype=torch.uint8, device=device)
+        for _ in range(nl)
+    ]
+    source_vllm = [
+        pool.as_strided(
+            (nb, bs, hs),
+            (block_stride_elems, hs, 1),
+        )
+        for pool in source_pools
+    ]
+    target_vllm = [
+        pool.as_strided(
+            (nb, bs, hs),
+            (block_stride_elems, hs, 1),
+        )
+        for pool in target_pools
+    ]
+    mem_objects = create_memory_objects(
+        1,
+        nl,
+        slots_per_object,
+        hs,
+        1,
+        torch.uint8,
+        device,
+    )
+
+    block_ids_d2h = list(range(total_blocks))
+    block_ids_h2d = list(range(total_blocks, 2 * total_blocks))
+    call_block_kernel(
+        source_vllm,
+        mem_objects,
+        block_ids_d2h,
+        FMT_MLA,
+        lmcache_native.TransferDirection.D2H,
+        nl,
+        nb,
+        bs,
+        nh,
+        hs,
+        True,
+        slots_per_object,
+        block_stride_elems=block_stride_elems,
+    )
+    call_block_kernel(
+        target_vllm,
+        mem_objects,
+        block_ids_h2d,
+        FMT_MLA,
+        lmcache_native.TransferDirection.H2D,
+        nl,
+        nb,
+        bs,
+        nh,
+        hs,
+        True,
+        slots_per_object,
+        block_stride_elems=block_stride_elems,
+    )
+    torch_dev.synchronize()
+
+    for src_block, dst_block in zip(block_ids_d2h, block_ids_h2d, strict=True):
+        for source, target in zip(source_vllm, target_vllm, strict=True):
+            assert torch.equal(target[dst_block], source[src_block])
+
+    for target_pool in target_pools:
+        for block_idx in block_ids_h2d:
+            padding_start = block_idx * block_stride_elems + hs
+            padding_end = (block_idx + 1) * block_stride_elems
+            assert torch.count_nonzero(target_pool[padding_start:padding_end]) == 0
+
+
+def test_block_transfer_roundtrip_mamba_dcp1_opaque_page():
+    """The exact GLM-5.3-Flash DCP1 state-page width round-trips whole."""
+    device = torch.device(torch_device_type)
+    nl, nb, bs, nh, hs = 2, 6, 1, 1, 1_085_440
+    block_stride_elems = hs + 64
+    slots_per_object = 1
+    num_objects = 2
+    total_blocks = slots_per_object * num_objects
+
+    source_pools = [
+        torch.zeros(nb * block_stride_elems, dtype=torch.uint8, device=device)
+        for _ in range(nl)
+    ]
+    for layer_idx, pool in enumerate(source_pools):
+        for block_idx in range(nb):
+            page_start = block_idx * block_stride_elems
+            page_end = page_start + hs
+            fill_value = (17 * layer_idx + block_idx + 1) % 251
+            pool[page_start:page_end].fill_(fill_value)
+            pool[page_start : page_start + 32] = torch.arange(
+                32, dtype=torch.uint8, device=device
+            ) + (layer_idx * 32)
+    target_pools = [
+        torch.zeros(nb * block_stride_elems, dtype=torch.uint8, device=device)
+        for _ in range(nl)
+    ]
+    source_vllm = [
+        pool.as_strided(
+            (nb, bs, hs),
+            (block_stride_elems, hs, 1),
+        )
+        for pool in source_pools
+    ]
+    target_vllm = [
+        pool.as_strided(
+            (nb, bs, hs),
+            (block_stride_elems, hs, 1),
+        )
+        for pool in target_pools
+    ]
+    mem_objects = create_memory_objects(
+        1,
+        nl,
+        slots_per_object,
+        hs,
+        num_objects,
+        torch.uint8,
+        device,
+    )
+
+    block_ids_d2h = list(range(total_blocks))
+    block_ids_h2d = list(range(total_blocks, 2 * total_blocks))
+    call_block_kernel(
+        source_vllm,
+        mem_objects,
+        block_ids_d2h,
+        FMT_MLA,
+        lmcache_native.TransferDirection.D2H,
+        nl,
+        nb,
+        bs,
+        nh,
+        hs,
+        True,
+        slots_per_object,
+        block_stride_elems=block_stride_elems,
+    )
+    call_block_kernel(
+        target_vllm,
+        mem_objects,
+        block_ids_h2d,
+        FMT_MLA,
+        lmcache_native.TransferDirection.H2D,
+        nl,
+        nb,
+        bs,
+        nh,
+        hs,
+        True,
+        slots_per_object,
+        block_stride_elems=block_stride_elems,
+    )
+    torch_dev.synchronize()
+
+    for src_block, dst_block in zip(block_ids_d2h, block_ids_h2d, strict=True):
+        for source, target in zip(source_vllm, target_vllm, strict=True):
+            assert torch.equal(target[dst_block], source[src_block])
+
+    for target_pool in target_pools:
+        for block_idx in block_ids_h2d:
+            padding_start = block_idx * block_stride_elems + hs
+            padding_end = (block_idx + 1) * block_stride_elems
+            assert torch.count_nonzero(target_pool[padding_start:padding_end]) == 0
 
 
 @pytest.mark.parametrize(
@@ -415,7 +607,7 @@ def test_block_transfer_roundtrip(
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 def test_block_transfer_skip_prefix(engine_kv_format, nl, nh, hs, is_mla, dtype):
     """Verify skip_prefix_n_blocks=4 skips the first 4 blocks globally."""
-    device = torch.device("cuda")
+    device = torch.device(torch_device_type)
     kv_dim = 1 if is_mla else 2
     hidden_dim = nh * hs
     skip = 4
@@ -449,7 +641,7 @@ def test_block_transfer_skip_prefix(engine_kv_format, nl, nh, hs, is_mla, dtype)
         mem_objects,
         block_ids_d2h,
         engine_kv_format,
-        lmc_ops.TransferDirection.D2H,
+        lmcache_native.TransferDirection.D2H,
         nl,
         NB,
         BS,
@@ -459,7 +651,7 @@ def test_block_transfer_skip_prefix(engine_kv_format, nl, nh, hs, is_mla, dtype)
         TOKENS_PER_OBJECT,
         skip_prefix_n_blocks=skip,
     )
-    torch.cuda.synchronize()
+    torch_dev.synchronize()
 
     # H2D with skip
     call_block_kernel(
@@ -467,7 +659,7 @@ def test_block_transfer_skip_prefix(engine_kv_format, nl, nh, hs, is_mla, dtype)
         mem_objects,
         block_ids_h2d,
         engine_kv_format,
-        lmc_ops.TransferDirection.H2D,
+        lmcache_native.TransferDirection.H2D,
         nl,
         NB,
         BS,
@@ -477,7 +669,7 @@ def test_block_transfer_skip_prefix(engine_kv_format, nl, nh, hs, is_mla, dtype)
         TOKENS_PER_OBJECT,
         skip_prefix_n_blocks=skip,
     )
-    torch.cuda.synchronize()
+    torch_dev.synchronize()
 
     # Non-skipped blocks should match
     for i in range(skip, TOTAL_BLOCKS):
@@ -504,3 +696,229 @@ def test_block_transfer_skip_prefix(engine_kv_format, nl, nh, hs, is_mla, dtype)
             assert block.abs().sum().item() == 0, (
                 f"Skipped block {i}, layer {layer_idx} is not zero"
             )
+
+
+# ---------------------------------------------------------------------------
+# Large-block content-size case (e.g., DeepSeek indexer k-cache): NH == 1 and
+# BS much larger than one thread block can cover with a single token slice,
+# exercising the blockDim.z token partitioning in the transfer kernel. This
+# geometry cannot reuse FORMAT_PARAMS because the tests above hard-code
+# BS = 16 and TOKENS_PER_OBJECT = 256, while the kernel requires
+# blocks_per_object * bs == lmcache_chunk_size (so here one engine block
+# fills a whole memory object).
+# ---------------------------------------------------------------------------
+
+LARGE_BLOCK_NL = 20
+LARGE_BLOCK_NH = 1
+LARGE_BLOCK_BS = 1536
+LARGE_BLOCK_CS = 576
+# Keep NB small: each layer tensor is [NB, 1, 1536, 576] and there are
+# source + target copies of LARGE_BLOCK_NL layers on the GPU.
+LARGE_BLOCK_NB = 8
+LARGE_BLOCK_TOKENS_PER_OBJECT = LARGE_BLOCK_BS  # one engine block per object
+LARGE_BLOCK_TOTAL_BLOCKS = NUM_MEMORY_OBJECTS
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
+)
+@pytest.mark.parametrize(
+    "mem_device", [torch_device_type, "cpu"], ids=["mem_gpu", "mem_cpu"]
+)
+def test_block_transfer_roundtrip_large_block(dtype, mem_device):
+    """
+    D2H -> H2D roundtrip for the content-size HND format (NL_X_NB_NH_BS_CS)
+    with a single head and a large block size (NH=1, BS=1536, CS=576).
+
+    Unlike the BS=16 cases above, this launches the kernel with multiple
+    z-slices per thread block, so it verifies the strided token loop copies
+    every token exactly once.
+    """
+    device = torch.device(torch_device_type)
+    mem_dev = torch.device(mem_device)
+    kv_dim = 1  # content-size formats transfer with kv_size == 1
+    hidden_dim = LARGE_BLOCK_NH * LARGE_BLOCK_CS
+
+    source_vllm = create_vllm_tensors(
+        FMT_VLLM_CS_HND,
+        LARGE_BLOCK_NL,
+        LARGE_BLOCK_NB,
+        LARGE_BLOCK_BS,
+        LARGE_BLOCK_NH,
+        LARGE_BLOCK_CS,
+        dtype,
+        device,
+    )
+    target_vllm = create_zero_vllm_tensors(
+        FMT_VLLM_CS_HND,
+        LARGE_BLOCK_NL,
+        LARGE_BLOCK_NB,
+        LARGE_BLOCK_BS,
+        LARGE_BLOCK_NH,
+        LARGE_BLOCK_CS,
+        dtype,
+        device,
+    )
+    mem_objects = create_memory_objects(
+        kv_dim,
+        LARGE_BLOCK_NL,
+        LARGE_BLOCK_TOKENS_PER_OBJECT,
+        hidden_dim,
+        NUM_MEMORY_OBJECTS,
+        dtype,
+        mem_dev,
+    )
+
+    # Disjoint block IDs for D2H and H2D
+    rng_d2h = random.Random(42)
+    block_ids_d2h = rng_d2h.sample(range(LARGE_BLOCK_NB), LARGE_BLOCK_TOTAL_BLOCKS)
+    excluded = set(block_ids_d2h)
+    available = [i for i in range(LARGE_BLOCK_NB) if i not in excluded]
+    rng_h2d = random.Random(123)
+    block_ids_h2d = rng_h2d.sample(available, LARGE_BLOCK_TOTAL_BLOCKS)
+
+    # D2H: source -> mem_objects
+    call_block_kernel(
+        source_vllm,
+        mem_objects,
+        block_ids_d2h,
+        FMT_VLLM_CS_HND,
+        lmcache_native.TransferDirection.D2H,
+        LARGE_BLOCK_NL,
+        LARGE_BLOCK_NB,
+        LARGE_BLOCK_BS,
+        LARGE_BLOCK_NH,
+        LARGE_BLOCK_CS,
+        True,
+        LARGE_BLOCK_TOKENS_PER_OBJECT,
+    )
+    torch_dev.synchronize()
+
+    # H2D: mem_objects -> target
+    call_block_kernel(
+        target_vllm,
+        mem_objects,
+        block_ids_h2d,
+        FMT_VLLM_CS_HND,
+        lmcache_native.TransferDirection.H2D,
+        LARGE_BLOCK_NL,
+        LARGE_BLOCK_NB,
+        LARGE_BLOCK_BS,
+        LARGE_BLOCK_NH,
+        LARGE_BLOCK_CS,
+        True,
+        LARGE_BLOCK_TOKENS_PER_OBJECT,
+    )
+    torch_dev.synchronize()
+
+    # Verify: target[h2d_block] == source[d2h_block]
+    for i in range(LARGE_BLOCK_TOTAL_BLOCKS):
+        src_data = get_block_data(
+            source_vllm,
+            FMT_VLLM_CS_HND,
+            LARGE_BLOCK_NL,
+            LARGE_BLOCK_BS,
+            LARGE_BLOCK_NH,
+            block_ids_d2h[i],
+        )
+        tgt_data = get_block_data(
+            target_vllm,
+            FMT_VLLM_CS_HND,
+            LARGE_BLOCK_NL,
+            LARGE_BLOCK_BS,
+            LARGE_BLOCK_NH,
+            block_ids_h2d[i],
+        )
+        for layer_idx in range(LARGE_BLOCK_NL):
+            assert torch.equal(src_data[layer_idx], tgt_data[layer_idx]), (
+                f"Mismatch at block index {i}, layer {layer_idx}"
+            )
+
+
+def test_block_transfer_roundtrip_byte_odd_padded_mla_page():
+    """Opaque byte-odd rows round-trip without touching dim-0 padding."""
+    device = torch.device(torch_device_type)
+    nl, nb, bs, nh, hs = 2, 40, 16, 1, 561
+    block_stride_elems = bs * hs + 37
+    tokens_per_object = 256
+    blocks_per_object = tokens_per_object // bs
+    num_objects = 1
+    total_blocks = blocks_per_object * num_objects
+
+    source_pools = [
+        (torch.arange(nb * block_stride_elems, device=device) + layer_idx)
+        .remainder(251)
+        .to(torch.uint8)
+        for layer_idx in range(nl)
+    ]
+    target_pools = [
+        torch.zeros(nb * block_stride_elems, dtype=torch.uint8, device=device)
+        for _ in range(nl)
+    ]
+    source_vllm = [
+        pool.as_strided(
+            (nb, bs, hs),
+            (block_stride_elems, hs, 1),
+        )
+        for pool in source_pools
+    ]
+    target_vllm = [
+        pool.as_strided(
+            (nb, bs, hs),
+            (block_stride_elems, hs, 1),
+        )
+        for pool in target_pools
+    ]
+    mem_objects = create_memory_objects(
+        1,
+        nl,
+        tokens_per_object,
+        hs,
+        num_objects,
+        torch.uint8,
+        device,
+    )
+
+    block_ids_d2h = list(range(total_blocks))
+    block_ids_h2d = list(range(total_blocks, 2 * total_blocks))
+    call_block_kernel(
+        source_vllm,
+        mem_objects,
+        block_ids_d2h,
+        FMT_MLA,
+        lmcache_native.TransferDirection.D2H,
+        nl,
+        nb,
+        bs,
+        nh,
+        hs,
+        True,
+        tokens_per_object,
+        block_stride_elems=block_stride_elems,
+    )
+    call_block_kernel(
+        target_vllm,
+        mem_objects,
+        block_ids_h2d,
+        FMT_MLA,
+        lmcache_native.TransferDirection.H2D,
+        nl,
+        nb,
+        bs,
+        nh,
+        hs,
+        True,
+        tokens_per_object,
+        block_stride_elems=block_stride_elems,
+    )
+    torch_dev.synchronize()
+
+    for src_block, dst_block in zip(block_ids_d2h, block_ids_h2d, strict=True):
+        for source, target in zip(source_vllm, target_vllm, strict=True):
+            assert torch.equal(target[dst_block], source[src_block])
+
+    for target_pool in target_pools:
+        for block_idx in block_ids_h2d:
+            padding_start = block_idx * block_stride_elems + bs * hs
+            padding_end = (block_idx + 1) * block_stride_elems
+            assert torch.count_nonzero(target_pool[padding_start:padding_end]) == 0

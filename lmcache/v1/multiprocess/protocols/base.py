@@ -41,6 +41,9 @@ class RequestType(enum.Enum):
     # Engine operations
     REGISTER_KV_CACHE = enum.auto()
     UNREGISTER_KV_CACHE = enum.auto()
+    REGISTER_Q_CACHE = enum.auto()
+    UNREGISTER_Q_CACHE = enum.auto()
+    STORE_Q = enum.auto()
     STORE = enum.auto()
     RETRIEVE = enum.auto()
     LOOKUP = enum.auto()
@@ -67,28 +70,27 @@ class RequestType(enum.Enum):
     # Debug operations
     NOOP = enum.auto()
 
-    # Blend operations
-    CB_REGISTER_KV_CACHE = enum.auto()
-    CB_UNREGISTER_KV_CACHE = enum.auto()
-    CB_STORE_PRE_COMPUTED = enum.auto()
-    CB_LOOKUP_PRE_COMPUTED = enum.auto()
+    # Blend operations (paged-aware; KV cache registration rides the
+    # standard REGISTER_KV_CACHE). A payload-shape change means a new request
+    # name -- the blend plugin dispatches on these.
+    CB_REGISTER_ROPE = enum.auto()
+    CB_UNREGISTER_ROPE = enum.auto()
     CB_RETRIEVE_PRE_COMPUTED = enum.auto()
-    CB_STORE_FINAL = enum.auto()
-
-    # Blend V2 operations (use CBMatchResult instead of list[tuple[int, int]])
-    CB_LOOKUP_PRE_COMPUTED_V2 = enum.auto()
-    CB_RETRIEVE_PRE_COMPUTED_V2 = enum.auto()
-
-    # Blend V3 — paged-aware CB.
-    CB_REGISTER_ROPE_V3 = enum.auto()
-    CB_UNREGISTER_ROPE_V3 = enum.auto()
-    CB_RETRIEVE_PRE_COMPUTED_V3 = enum.auto()
     CB_UNIFIED_LOOKUP = enum.auto()
+    # Deprecated aliases (same member, same wire value) for blend plugins that
+    # still use the ``_V3`` names. Remove once the plugin has moved to the
+    # unversioned names above.
+    CB_REGISTER_ROPE_V3 = CB_REGISTER_ROPE
+    CB_UNREGISTER_ROPE_V3 = CB_UNREGISTER_ROPE
+    CB_RETRIEVE_PRE_COMPUTED_V3 = CB_RETRIEVE_PRE_COMPUTED
 
     # P2P operations
     P2P_LOOKUP_AND_LOCK = enum.auto()
     P2P_QUERY_LOOKUP_RESULTS = enum.auto()
     P2P_UNLOCK_OBJECTS = enum.auto()
+
+    # Experimental transfer intermediate tensor
+    GET_EXPERIMENTAL = enum.auto()
 
 
 @dataclass

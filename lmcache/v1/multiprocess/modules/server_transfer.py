@@ -13,8 +13,18 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import ObjectKey
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.distributed.admission import (
+    AdmissionAttempt,
+    AdmissionFailure,
+    AdmissionOutcome,
+    reserve_with_eviction_backpressure,
+)
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.error import L1Error
+from lmcache.v1.multiprocess.custom_types import (
+    ENGINE_DRIVEN_ABORT_STORE_PAYLOAD,
+    IPCCacheServerKey,
+)
 from lmcache.v1.multiprocess.protocols.engine import (
     PrepareRetrieveResponse,
     PrepareStoreResponse,
@@ -28,10 +38,85 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+ObjectKeyGroups = list[list[ObjectKey]]
+ResolveObjectKeyGroups = Callable[[IPCCacheServerKey], ObjectKeyGroups]
+
 
 def _dtype_to_name(dtype: torch.dtype) -> str:
     """Return a stable torch dtype name without module prefix."""
     return str(dtype).split(".")[-1]
+
+
+def _attempt_group_writes(
+    storage_manager: "StorageManager",
+    obj_key_groups: ObjectKeyGroups,
+    context: EngineDrivenContextMetadata,
+) -> AdmissionAttempt[list[dict[ObjectKey, Any]]]:
+    """Reserve every new group object or abort the entire attempt."""
+    layouts = context.effective_group_layouts
+    if len(layouts) != len(obj_key_groups):
+        return AdmissionAttempt.failure(AdmissionFailure.INVALID_LAYOUT)
+
+    reserved_by_group: list[dict[ObjectKey, Any]] = []
+    all_reserved_keys: list[ObjectKey] = []
+    for layout, obj_keys in zip(layouts, obj_key_groups, strict=True):
+        layout_desc = MemoryLayoutDesc(
+            shapes=[torch.Size(layout.shape)],
+            dtypes=[getattr(torch, layout.dtype_str)],
+        )
+        detailed = storage_manager.reserve_write_detailed(obj_keys, layout_desc, "new")
+        reserved = {
+            obj_key: memory_obj
+            for obj_key, (_error, memory_obj) in detailed.items()
+            if memory_obj is not None
+        }
+        reserved_by_group.append(reserved)
+        all_reserved_keys.extend(reserved)
+
+        missing = [obj_key for obj_key in obj_keys if obj_key not in reserved]
+        readable = set(storage_manager.get_readable_keys(missing))
+        unresolved = [obj_key for obj_key in missing if obj_key not in readable]
+        if unresolved:
+            storage_manager.abort_write(all_reserved_keys)
+            capacity_only = all(
+                detailed.get(obj_key, (L1Error.KEY_NOT_WRITABLE, None))[0]
+                is L1Error.OUT_OF_MEMORY
+                for obj_key in unresolved
+            )
+            return AdmissionAttempt.failure(
+                AdmissionFailure.CAPACITY
+                if capacity_only
+                else AdmissionFailure.CONFLICT
+            )
+    return AdmissionAttempt.success(reserved_by_group)
+
+
+def _reserve_group_writes(
+    storage_manager: "StorageManager",
+    obj_key_groups: ObjectKeyGroups,
+    context: EngineDrivenContextMetadata,
+) -> AdmissionOutcome[list[dict[ObjectKey, Any]]]:
+    """Reserve all groups with bounded capacity-only eviction backpressure."""
+    outcome = reserve_with_eviction_backpressure(
+        attempt=lambda: _attempt_group_writes(storage_manager, obj_key_groups, context),
+        get_generation=storage_manager.get_capacity_generation,
+        request_eviction=storage_manager.request_immediate_eviction,
+        wait_for_change=storage_manager.wait_for_capacity_change,
+        timeout_seconds=storage_manager.store_admission_timeout_seconds,
+        on_wait=storage_manager.record_admission_wait,
+        on_retry=storage_manager.record_admission_retry,
+        on_success_after_eviction=(
+            storage_manager.record_admission_success_after_eviction
+        ),
+        on_timeout=storage_manager.record_admission_timeout,
+    )
+    if outcome.failure is not None:
+        logger.warning(
+            "Atomic engine-driven store admission failed: reason=%s retries=%d",
+            outcome.failure.value,
+            outcome.retries,
+        )
+    return outcome
 
 
 def create_transfer_strategy(
@@ -91,7 +176,7 @@ class TransferStrategy(abc.ABC):
         key: IPCCacheServerKey,
         instance_id: int,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: ResolveObjectKeyGroups,
     ) -> PrepareStoreResponse:
         """Prepare destination resources for a store request.
 
@@ -112,7 +197,7 @@ class TransferStrategy(abc.ABC):
         instance_id: int,
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: ResolveObjectKeyGroups,
     ) -> bool:
         """Finalize a store request.
 
@@ -132,7 +217,7 @@ class TransferStrategy(abc.ABC):
         self,
         key: IPCCacheServerKey,
         instance_id: int,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: ResolveObjectKeyGroups,
     ) -> PrepareRetrieveResponse:
         """Prepare source resources for a retrieve request.
 
@@ -187,7 +272,7 @@ class PickleTransferStrategy(TransferStrategy):
         key: IPCCacheServerKey,
         instance_id: int,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: ResolveObjectKeyGroups,
     ) -> PrepareStoreResponse:
         """Return empty store context for pickle mode.
 
@@ -201,64 +286,119 @@ class PickleTransferStrategy(TransferStrategy):
         instance_id: int,
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: ResolveObjectKeyGroups,
     ) -> bool:
         """Deserialize and write pickled chunks into reserved objects.
 
         Returns:
             ``True`` when every reserved object is written successfully.
         """
-        obj_keys = resolve_obj_keys(key)
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
-        reserved_dict = self._storage_manager.reserve_write(
-            obj_keys, context.layout_desc, "new"
-        )
-        written_keys: list[ObjectKey] = []
+        obj_key_groups = resolve_obj_keys(key)
         try:
-            for idx, obj_key in enumerate(obj_keys):
-                if obj_key not in reserved_dict:
-                    continue
-                if idx >= len(chunks):
-                    continue
-                memory_obj = reserved_dict[obj_key]
-                if memory_obj.tensor is None:
-                    continue
-                chunk_cpu = chunks[idx]
-                if chunk_cpu.shape != memory_obj.tensor.shape:
-                    continue
-                memory_obj.tensor.copy_(chunk_cpu)
-                written_keys.append(obj_key)
-        finally:
-            if written_keys:
-                self._storage_manager.finish_write(written_keys)
+            decoded = pickle.loads(cpu_data)
+        except (pickle.PickleError, EOFError, AttributeError, ValueError, TypeError):
+            logger.exception("Invalid engine-driven pickle store payload")
+            return False
+        grouped = len(obj_key_groups) > 1
+        if not isinstance(decoded, list):
+            return False
+        chunk_groups: list[list[torch.Tensor]] = decoded if grouped else [decoded]
+        if len(chunk_groups) != len(obj_key_groups):
+            return False
 
-        return len(written_keys) == len(reserved_dict)
+        layouts = context.effective_group_layouts
+        if len(layouts) != len(obj_key_groups):
+            return False
+        for obj_keys, chunks, layout in zip(
+            obj_key_groups, chunk_groups, layouts, strict=True
+        ):
+            if not isinstance(chunks, list) or len(chunks) != len(obj_keys):
+                return False
+            expected_shape = torch.Size(layout.shape)
+            expected_dtype = getattr(torch, layout.dtype_str, None)
+            if not isinstance(expected_dtype, torch.dtype) or any(
+                not isinstance(chunk, torch.Tensor)
+                or chunk.device.type != "cpu"
+                or chunk.shape != expected_shape
+                or chunk.dtype != expected_dtype
+                for chunk in chunks
+            ):
+                return False
+
+        admission = _reserve_group_writes(
+            self._storage_manager, obj_key_groups, context
+        )
+        if admission.failure is not None or admission.value is None:
+            return False
+        reserved_by_group = admission.value
+        reserved_keys = [
+            obj_key for reserved in reserved_by_group for obj_key in reserved
+        ]
+        try:
+            for obj_keys, chunks, reserved_dict in zip(
+                obj_key_groups, chunk_groups, reserved_by_group, strict=True
+            ):
+                for idx, obj_key in enumerate(obj_keys):
+                    memory_obj = reserved_dict.get(obj_key)
+                    if memory_obj is None:
+                        continue
+                    if memory_obj.tensor is None:
+                        raise RuntimeError(
+                            f"reserved object {obj_key} has no tensor storage"
+                        )
+                    chunk_cpu = chunks[idx]
+                    if (
+                        chunk_cpu.shape != memory_obj.tensor.shape
+                        or chunk_cpu.dtype != memory_obj.tensor.dtype
+                    ):
+                        raise RuntimeError(
+                            f"reserved object {obj_key} layout changed after "
+                            "payload validation"
+                        )
+                    memory_obj.tensor.copy_(chunk_cpu)
+        except (RuntimeError, ValueError, TypeError):
+            logger.exception("Failed to copy engine-driven pickle store payload")
+            if reserved_keys:
+                self._storage_manager.abort_write(reserved_keys)
+            return False
+
+        if reserved_keys:
+            self._storage_manager.finish_write(reserved_keys)
+        return True
 
     def prepare_retrieve(
         self,
         key: IPCCacheServerKey,
         instance_id: int,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: ResolveObjectKeyGroups,
     ) -> PrepareRetrieveResponse:
         """Read prefetched objects and return serialized pickle payload."""
-        obj_keys = resolve_obj_keys(key)
+        obj_key_groups = resolve_obj_keys(key)
         prefetched_keys: list[ObjectKey] = []
         try:
-            read_ctx = self._storage_manager.read_prefetched_results(obj_keys)
-            with read_ctx as maybe_memory_objs:
-                if not maybe_memory_objs or len(maybe_memory_objs) != len(obj_keys):
-                    return PrepareRetrieveResponse(success=False, data=b"", context={})
-                prefetched_keys = obj_keys[: len(maybe_memory_objs)]
-                chunks = []
-                for memory_obj in maybe_memory_objs:
-                    if memory_obj.tensor is None:
+            chunk_groups: list[list[torch.Tensor]] = []
+            for obj_keys in obj_key_groups:
+                read_ctx = self._storage_manager.read_prefetched_results(obj_keys)
+                with read_ctx as maybe_memory_objs:
+                    if not maybe_memory_objs or len(maybe_memory_objs) != len(obj_keys):
                         return PrepareRetrieveResponse(
                             success=False, data=b"", context={}
                         )
-                    chunks.append(memory_obj.tensor.cpu().clone())
-                return PrepareRetrieveResponse(
-                    success=True, data=pickle.dumps(chunks), context={}
-                )
+                    prefetched_keys.extend(obj_keys)
+                    chunks = []
+                    for memory_obj in maybe_memory_objs:
+                        if memory_obj.tensor is None:
+                            return PrepareRetrieveResponse(
+                                success=False, data=b"", context={}
+                            )
+                        chunks.append(memory_obj.tensor.cpu().clone())
+                    chunk_groups.append(chunks)
+            payload: object = (
+                chunk_groups if len(obj_key_groups) > 1 else chunk_groups[0]
+            )
+            return PrepareRetrieveResponse(
+                success=True, data=pickle.dumps(payload), context={}
+            )
         finally:
             if prefetched_keys:
                 self._storage_manager.finish_read_prefetched(prefetched_keys)
@@ -314,25 +454,49 @@ class ShmTransferStrategy(TransferStrategy):
         key: IPCCacheServerKey,
         instance_id: int,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: ResolveObjectKeyGroups,
     ) -> PrepareStoreResponse:
         """Reserve SHM-backed objects and return slot descriptors.
 
         Returns:
             Context with ``slots`` and ``chunk_indices``.
         """
-        obj_keys = resolve_obj_keys(key)
-        reserved = self._storage_manager.reserve_write(
-            obj_keys, context.layout_desc, "new"
-        )
+        obj_key_groups = resolve_obj_keys(key)
+        grouped = len(obj_key_groups) > 1
         slots: list[dict[str, Any]] = []
         chunk_indices: list[int] = []
-        reserved_keys: list[ObjectKey] = []
-        try:
+        group_ids: list[int] = []
+        admission = _reserve_group_writes(
+            self._storage_manager, obj_key_groups, context
+        )
+        if admission.failure is not None or admission.value is None:
+            reason = (
+                admission.failure.value
+                if admission.failure is not None
+                else AdmissionFailure.CONFLICT.value
+            )
+            return PrepareStoreResponse(
+                context={"success": False, "failure_reason": reason}
+            )
+        reserved_by_group = admission.value
+        reserved_keys = [
+            obj_key for reserved in reserved_by_group for obj_key in reserved
+        ]
+        for group_idx, (obj_keys, reserved) in enumerate(
+            zip(obj_key_groups, reserved_by_group, strict=True)
+        ):
             for idx, obj_key in enumerate(obj_keys):
                 memory_obj = reserved.get(obj_key)
-                if memory_obj is None or memory_obj.tensor is None:
+                if memory_obj is None:
                     continue
+                if memory_obj.tensor is None:
+                    self._storage_manager.abort_write(reserved_keys)
+                    return PrepareStoreResponse(
+                        context={
+                            "success": False,
+                            "failure_reason": AdmissionFailure.INVALID_LAYOUT.value,
+                        }
+                    )
                 slots.append(
                     ShmSlotDescriptor(
                         offset=memory_obj.shm_offset,
@@ -342,22 +506,27 @@ class ShmTransferStrategy(TransferStrategy):
                     ).to_dict()
                 )
                 chunk_indices.append(idx)
-                reserved_keys.append(obj_key)
-        finally:
-            reserved_keys_set = set(reserved_keys)
-            unused_keys = [
-                obj_key for obj_key in reserved if obj_key not in reserved_keys_set
-            ]
-            if unused_keys:
-                self._storage_manager.finish_write(unused_keys)
+                group_ids.append(group_idx)
         if not reserved_keys:
-            return PrepareStoreResponse(context={"slots": [], "chunk_indices": []})
+            response_context: dict[str, Any] = {
+                "slots": [],
+                "chunk_indices": [],
+            }
+            if grouped:
+                response_context["group_ids"] = []
+            return PrepareStoreResponse(context=response_context)
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
-            self._pending_writes[transfer_key] = reserved_keys
-        return PrepareStoreResponse(
-            context={"slots": slots, "chunk_indices": chunk_indices}
-        )
+            duplicate = transfer_key in self._pending_writes
+            if not duplicate:
+                self._pending_writes[transfer_key] = reserved_keys
+        if duplicate:
+            self._storage_manager.abort_write(reserved_keys)
+            raise RuntimeError("duplicate pending engine-driven SHM store")
+        response_context = {"slots": slots, "chunk_indices": chunk_indices}
+        if grouped:
+            response_context["group_ids"] = group_ids
+        return PrepareStoreResponse(context=response_context)
 
     def commit_store(
         self,
@@ -365,14 +534,26 @@ class ShmTransferStrategy(TransferStrategy):
         instance_id: int,
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: ResolveObjectKeyGroups,
     ) -> bool:
         """Finalize SHM store write locks or fallback to pickle commit.
 
         Returns:
             ``True`` when pending SHM reservation is committed successfully.
         """
+        transfer_key = self._transfer_key_factory(key, instance_id)
+        if cpu_data == ENGINE_DRIVEN_ABORT_STORE_PAYLOAD:
+            with self._pending_lock:
+                reserved_keys = self._pending_writes.pop(transfer_key, None)
+            if reserved_keys is None:
+                return False
+            self._storage_manager.abort_write(reserved_keys)
+            return True
         if cpu_data != b"":
+            with self._pending_lock:
+                reserved_keys = self._pending_writes.pop(transfer_key, None)
+            if reserved_keys:
+                self._storage_manager.abort_write(reserved_keys)
             return self._fallback_strategy.commit_store(
                 key=key,
                 instance_id=instance_id,
@@ -380,7 +561,6 @@ class ShmTransferStrategy(TransferStrategy):
                 context=context,
                 resolve_obj_keys=resolve_obj_keys,
             )
-        transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
             reserved_keys = self._pending_writes.pop(transfer_key, None)
         if reserved_keys is None:
@@ -393,38 +573,52 @@ class ShmTransferStrategy(TransferStrategy):
         self,
         key: IPCCacheServerKey,
         instance_id: int,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: ResolveObjectKeyGroups,
     ) -> PrepareRetrieveResponse:
         """Read SHM objects and return slot descriptors for worker access."""
-        obj_keys = resolve_obj_keys(key)
-        shm_prefetched_keys, shm_memory_objs = self._storage_manager.unsafe_read(
-            obj_keys
-        )
-        if (
-            not shm_memory_objs
-            or len(shm_prefetched_keys) != len(obj_keys)
-            or len(shm_memory_objs) != len(obj_keys)
-        ):
-            if shm_prefetched_keys:
-                self._storage_manager.finish_read_prefetched(shm_prefetched_keys)
-            return PrepareRetrieveResponse(success=False, data=b"", context={})
+        obj_key_groups = resolve_obj_keys(key)
+        grouped = len(obj_key_groups) > 1
         slots: list[dict[str, Any]] = []
-        for memory_obj in shm_memory_objs:
-            if memory_obj.tensor is None:
-                self._storage_manager.finish_read_prefetched(shm_prefetched_keys)
+        group_ids: list[int] = []
+        all_prefetched_keys: list[ObjectKey] = []
+        for group_idx, obj_keys in enumerate(obj_key_groups):
+            prefetched_keys, memory_objs = self._storage_manager.unsafe_read(obj_keys)
+            if (
+                not memory_objs
+                or len(prefetched_keys) != len(obj_keys)
+                or len(memory_objs) != len(obj_keys)
+            ):
+                if prefetched_keys:
+                    self._storage_manager.finish_read_prefetched(prefetched_keys)
+                if all_prefetched_keys:
+                    self._storage_manager.finish_read_prefetched(all_prefetched_keys)
                 return PrepareRetrieveResponse(success=False, data=b"", context={})
-            slots.append(
-                ShmSlotDescriptor(
-                    offset=memory_obj.shm_offset,
-                    length=memory_obj.shm_byte_length,
-                    shape=list(memory_obj.tensor.shape),
-                    dtype=_dtype_to_name(memory_obj.tensor.dtype),
-                ).to_dict()
-            )
+            all_prefetched_keys.extend(prefetched_keys)
+            for memory_obj in memory_objs:
+                if memory_obj.tensor is None:
+                    self._storage_manager.finish_read_prefetched(all_prefetched_keys)
+                    return PrepareRetrieveResponse(success=False, data=b"", context={})
+                slots.append(
+                    ShmSlotDescriptor(
+                        offset=memory_obj.shm_offset,
+                        length=memory_obj.shm_byte_length,
+                        shape=list(memory_obj.tensor.shape),
+                        dtype=_dtype_to_name(memory_obj.tensor.dtype),
+                    ).to_dict()
+                )
+                group_ids.append(group_idx)
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
-            self._pending_reads[transfer_key] = shm_prefetched_keys
-        return PrepareRetrieveResponse(success=True, data=b"", context={"slots": slots})
+            duplicate = transfer_key in self._pending_reads
+            if not duplicate:
+                self._pending_reads[transfer_key] = all_prefetched_keys
+        if duplicate:
+            self._storage_manager.finish_read_prefetched(all_prefetched_keys)
+            raise RuntimeError("duplicate pending engine-driven SHM retrieve")
+        response_context: dict[str, Any] = {"slots": slots}
+        if grouped:
+            response_context["group_ids"] = group_ids
+        return PrepareRetrieveResponse(success=True, data=b"", context=response_context)
 
     def commit_retrieve(
         self,
