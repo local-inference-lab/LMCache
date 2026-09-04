@@ -2615,6 +2615,36 @@ def test_server_grouped_shm_retrieve_reads_only_retained_suffix(
     assert response.context["group_ids"] == [0, 0, 1]
 
 
+def test_server_shm_retrieve_materializes_each_tensor_view_once(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A retrieve descriptor reuses one materialized tensor view per object."""
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    tensor = torch.zeros(2, 1, 8, 16)
+    tensor_property = PropertyMock(return_value=tensor)
+    type(memory_obj).tensor = tensor_property
+    memory_obj.shm_offset = 0
+    memory_obj.shm_byte_length = tensor.numel() * tensor.element_size()
+    mock_storage.unsafe_read.return_value = (["g0"], [memory_obj])
+    module, _, _, ctx = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_group_pool", pool_size=16384
+        ),
+        chunk_size=8,
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(_default_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"]])
+
+    response = module.prepare_retrieve(_default_key(), 1)
+
+    assert response.success is True
+    assert response.context["slots"][0]["shape"] == [2, 1, 8, 16]
+    assert tensor_property.call_count == 1
+
+
 def test_server_grouped_shm_capacity_failure_aborts_every_group(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,

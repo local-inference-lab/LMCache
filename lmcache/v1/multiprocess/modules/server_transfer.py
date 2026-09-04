@@ -595,15 +595,16 @@ class ShmTransferStrategy(TransferStrategy):
                 return PrepareRetrieveResponse(success=False, data=b"", context={})
             all_prefetched_keys.extend(prefetched_keys)
             for memory_obj in memory_objs:
-                if memory_obj.tensor is None:
+                tensor = memory_obj.tensor
+                if tensor is None:
                     self._storage_manager.finish_read_prefetched(all_prefetched_keys)
                     return PrepareRetrieveResponse(success=False, data=b"", context={})
                 slots.append(
                     ShmSlotDescriptor(
                         offset=memory_obj.shm_offset,
                         length=memory_obj.shm_byte_length,
-                        shape=list(memory_obj.tensor.shape),
-                        dtype=_dtype_to_name(memory_obj.tensor.dtype),
+                        shape=list(tensor.shape),
+                        dtype=_dtype_to_name(tensor.dtype),
                     ).to_dict()
                 )
                 group_ids.append(group_idx)
