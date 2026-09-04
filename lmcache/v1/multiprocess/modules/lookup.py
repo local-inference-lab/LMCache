@@ -45,9 +45,15 @@ def resolve_prefetched_obj_keys(
     A worker-specific key resolves only that worker's shard (or one MLA reader
     share), which is required for per-instance RETRIEVE failure cleanup.
     """
-    chunk_hashes = ctx.token_hasher.compute_chunk_hashes(
-        list(key.token_ids), start=key.start, end=key.end
-    )
+    if key.token_ids:
+        chunk_hashes = ctx.token_hasher.compute_chunk_hashes(
+            list(key.token_ids), start=key.start, end=key.end
+        )
+    else:
+        session = ctx.session_manager.get(key.request_id)
+        if session is None:
+            raise ValueError("retrieve session reference has no active request session")
+        chunk_hashes = session.resolve_retrieve_session_reference(key)
     if not chunk_hashes:
         return []
 

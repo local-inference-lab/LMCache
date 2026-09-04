@@ -110,7 +110,11 @@ def test_missing_registration_returns_terminal_false(method_name: str) -> None:
 
 
 @pytest.mark.parametrize("mla", [False, True], ids=["sharded-kv", "mla-shared-kv"])
-def test_tp_failed_worker_releases_only_its_reader_share_once(mla: bool) -> None:
+@pytest.mark.parametrize("compact_key", [False, True], ids=["full-key", "session-ref"])
+def test_tp_failed_worker_releases_only_its_reader_share_once(
+    mla: bool,
+    compact_key: bool,
+) -> None:
     """A failed TP worker must preserve its peer and a concurrent reader.
 
     Two lookups of the same content are represented: the request under test
@@ -130,8 +134,9 @@ def test_tp_failed_worker_releases_only_its_reader_share_once(mla: bool) -> None
     lookup_key = _cache_key(
         world_size=world_size, worker_id=None, request_id=request_id
     )
+    hashes = hasher.compute_chunk_hashes(list(lookup_key.token_ids), end=lookup_key.end)
     session = sessions.get_or_create(request_id)
-    session.begin_lookup(lookup_key, (-1,))
+    session.begin_lookup(lookup_key, (-1,), tuple(hashes))
     session.record_prefetch_result(2, (0,))
 
     storage = _CountingStorageManager()
@@ -147,7 +152,6 @@ def test_tp_failed_worker_releases_only_its_reader_share_once(mla: bool) -> None
         storage_manager=storage,
     )
 
-    hashes = hasher.compute_chunk_hashes(list(lookup_key.token_ids), end=lookup_key.end)
     all_rank_keys = ipc_key_to_object_keys(lookup_key, hashes, [0])[0]
     lookup_read_locks = tp_size if mla else 1
     # The request under test and a concurrent reader both own read locks.
@@ -171,6 +175,8 @@ def test_tp_failed_worker_releases_only_its_reader_share_once(mla: bool) -> None
         start=2,
         end=4,
     )
+    if compact_key:
+        failed_key = failed_key.as_retrieve_session_reference()
 
     args = (failed_key, 101, [[0]], b"producer-event")
     assert module.retrieve(*args) == (b"", False)

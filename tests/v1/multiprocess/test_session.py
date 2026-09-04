@@ -170,6 +170,59 @@ class TestSession:
         with pytest.raises(ValueError, match="does not match"):
             session.resolve_retrieve_session_reference(wrong_salt)
 
+    def test_failed_retrieve_cleanup_accepts_valid_session_reference(
+        self, hasher: TokenHasher, session: Session
+    ) -> None:
+        """A compact worker key can claim one lookup-owned lock release."""
+        tokens = list(range(8))
+        lookup_key = IPCCacheServerKey.from_token_ids(
+            model_name="m",
+            world_size=2,
+            worker_id=None,
+            token_ids=tokens,
+            start=0,
+            end=8,
+            request_id="req-1",
+            cache_salt="tenant-a",
+            num_kv_readers=2,
+        )
+        session.begin_lookup(
+            lookup_key,
+            (-1,),
+            tuple(hasher.compute_chunk_hashes(tokens)),
+        )
+        session.record_prefetch_result(2, (0,))
+        worker_key = IPCCacheServerKey.from_token_ids(
+            model_name="m",
+            world_size=2,
+            worker_id=1,
+            token_ids=tokens,
+            start=4,
+            end=8,
+            request_id="req-1",
+            cache_salt="tenant-a",
+            num_kv_readers=2,
+        ).as_retrieve_session_reference()
+
+        lock_state = session.prepare_failed_retrieve_release(worker_key)
+
+        assert lock_state is not None
+        assert session.claim_failed_retrieve_release(17, worker_key, lock_state[3])
+        assert not session.claim_failed_retrieve_release(17, worker_key, lock_state[3])
+
+        wrong_reader_count = IPCCacheServerKey(
+            model_name=worker_key.model_name,
+            world_size=worker_key.world_size,
+            worker_id=worker_key.worker_id,
+            num_kv_readers=1,
+            token_ids=(),
+            start=worker_key.start,
+            end=worker_key.end,
+            request_id=worker_key.request_id,
+            cache_salt=worker_key.cache_salt,
+        )
+        assert session.prepare_failed_retrieve_release(wrong_reader_count) is None
+
 
 class TestSessionManager:
     def test_get_or_create_new(self, session_manager: SessionManager) -> None:
