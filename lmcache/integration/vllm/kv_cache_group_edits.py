@@ -38,6 +38,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Mapping
+from math import gcd
 from typing import TypeAlias
 
 # Third Party
@@ -374,25 +375,24 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
 
 
 class _MambaUnifiedViewEdit(KVCacheGroupEdit):
-    """Re-view mamba's unified state as a single attention tensor
+    """Expose a unified recurrent-state page as an attention-shaped view.
 
-    This is for vLLM >= 0.26.0, where the unified KV cache layout is implemented.
+    vLLM registers each recurrent layer as one opaque byte tensor with shape
+    ``[num_blocks, 1, 1, page_elements]``. LMCache transfer kernels require a
+    slot axis, so the edit factors ``page_elements`` into physical slots without
+    copying or interpreting the recurrent-state bytes. The slot count is the
+    greatest common divisor of the page element count and logical block size.
+    ``EngineGroupInfo.tokens_per_block`` retains the logical token span.
 
-    In this case, Mamba's KV layer will be a single tensor with the shape of:
-    - [num_blocks, 1, 1, context_size]
-    Where the context size equals to vllm_block_size * ``head_size''
-
-
-    What we do here is to convert the shape to
-    - [num_blocks, 1, vllm_block_size, head_size]
+    NHD produces ``[num_blocks, slots, 1, head_size]`` and HND produces
+    ``[num_blocks, 1, slots, head_size]``. The singleton head dimension
+    and derived head size are addressing metadata, not attention semantics.
     """
 
     name = "mamba-unified-view"
 
     def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
-        """
-        Matches the mamba kv cache with unified layout.
-        """
+        """Return whether vLLM registered one unified recurrent-state tensor."""
         return (
             get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA
             and isinstance(kv_cache, torch.Tensor)
@@ -405,23 +405,38 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
         kv_cache: RegisteredKVCache,
         layout_hints: LayoutHints,
     ) -> torch.Tensor:
-        """
-        Convert [num_blocks, 1, 1, context_size] to
-        [num_blocks, 1, vllm_block_size, head_size] for HND layout, or
-        [num_blocks, vllm_block_size, 1, head_size] for NHD layout.
-        """
-        assert isinstance(kv_cache, torch.Tensor), (
-            "single-layer KV cache must be a torch.Tensor"
-        )
-        kv_layout = layout_hints.get("kv_layout", "none")
-        if kv_layout == "NHD":
-            return kv_cache.view(kv_cache.shape[0], spec.block_size, 1, -1)
-        elif kv_layout == "HND":
-            return kv_cache.view(kv_cache.shape[0], 1, spec.block_size, -1)
-        else:
+        """Return a zero-copy logical-block view of the opaque page buffer."""
+        if not isinstance(kv_cache, torch.Tensor):
+            raise ValueError("unified recurrent-state KV cache must be a torch.Tensor")
+        if kv_cache.shape[1:3] != (1, 1):
             raise ValueError(
-                f"Unsupported kv_layout: {kv_layout}. Only NHD and HND are supported."
+                "unified recurrent-state KV cache must have shape "
+                f"[num_blocks, 1, 1, page_elements], got {tuple(kv_cache.shape)}"
             )
+        if not kv_cache.is_contiguous():
+            raise ValueError("unified recurrent-state KV cache must be contiguous")
+        page_bytes = kv_cache.shape[1:].numel() * kv_cache.element_size()
+        if page_bytes != spec.page_size_bytes:
+            raise ValueError(
+                f"registered recurrent page is {page_bytes} bytes, but the "
+                f"Mamba spec declares {spec.page_size_bytes} bytes"
+            )
+        page_elements = kv_cache.shape[-1]
+        if page_elements <= 0 or spec.block_size <= 0:
+            raise ValueError(
+                "recurrent page element count and logical block size must be positive"
+            )
+        slots = gcd(page_elements, spec.block_size)
+        head_size = page_elements // slots
+
+        kv_layout = layout_hints.get("kv_layout")
+        if kv_layout == "NHD":
+            return kv_cache.view(kv_cache.shape[0], slots, 1, head_size)
+        if kv_layout == "HND":
+            return kv_cache.view(kv_cache.shape[0], 1, slots, head_size)
+        raise ValueError(
+            f"unsupported vLLM KV layout {kv_layout!r}; expected 'NHD' or 'HND'"
+        )
 
 
 class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
