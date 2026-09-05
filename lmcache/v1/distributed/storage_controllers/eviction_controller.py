@@ -562,7 +562,13 @@ class L1EvictionController(EvictionController):
 
         # Only keys we read and then fully persisted may be deleted. A key
         # that failed reserve_read can have become locked after candidate
-        # selection and must never be treated as absent.
+        # selection and must never be treated as absent. The exception is a
+        # reservation whose writer never finished and whose write lock has
+        # expired: it holds uninitialized memory that can never be read or
+        # persisted, so it is discarded instead of being carried forever.
+        unreadable_keys = [k for k in keys if k not in set(readable_keys)]
+        if unreadable_keys:
+            self._l1_manager.discard_abandoned_writes(unreadable_keys)
         keys_to_delete = list(readable_keys) if flushed else []
         if not flushed and readable_keys:
             logger.warning(

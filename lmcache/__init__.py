@@ -1,7 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from pathlib import Path
+import site
 import sys
+
+# This source overlay carries patched Python modules but not wheel-built native
+# extensions. Keep source modules first and use the matching installed package
+# only as a fallback for submodules such as lmcache.c_ops.
+_LMCACHE_BINARY_PACKAGE_PATHS = tuple(
+    str(Path(site_dir) / "lmcache")
+    for site_dir in site.getsitepackages()
+    if (Path(site_dir) / "lmcache").is_dir()
+)
+for binary_package_path in _LMCACHE_BINARY_PACKAGE_PATHS:
+    if binary_package_path not in __path__:
+        __path__.append(binary_package_path)
 
 # First Party
 from lmcache.logging import init_logger

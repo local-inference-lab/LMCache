@@ -195,6 +195,20 @@ def mla_enabled(model_config: "ModelConfig") -> bool:
     )
 
 
+def _use_multiple_attentions(model_config: "ModelConfig") -> bool:
+    """Return whether vLLM classifies the model as attention/recurrent hybrid."""
+    return bool(getattr(model_config, "is_hybrid", False))
+
+
+def mla_only(model_config: "ModelConfig") -> bool:
+    """Return whether every cached tensor is replicated across TP ranks.
+
+    Pure MLA state is replicated and can use LMCache's rank-sharing shortcut.
+    Hybrid MLA + Mamba/KDA state is not: its recurrent tensors are rank-sharded.
+    """
+    return mla_enabled(model_config) and not _use_multiple_attentions(model_config)
+
+
 def create_lmcache_metadata(
     vllm_config=None,
     model_config=None,

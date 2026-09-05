@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 import zmq
 from lmcache import torch_dev, torch_device_type
-from lmcache.integration.vllm.utils import mla_enabled
+from lmcache.integration.vllm.utils import mla_only
 from lmcache.utils import check_interprocess_event_support, init_logger as lmcache_init_logger
 
 from vllm.config import VllmConfig
@@ -85,7 +85,7 @@ def extract_world_size_and_kv_rank(
     """
     Convert the rank for the MLA.
     """
-    use_mla = mla_enabled(vllm_config.model_config)
+    use_mla = mla_only(vllm_config.model_config)
     if not use_mla:
         return world_size, rank
     else:

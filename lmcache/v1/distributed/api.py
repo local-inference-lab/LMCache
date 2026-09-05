@@ -53,6 +53,14 @@ class PrefetchMode(enum.Enum):
     WARM = enum.auto()
 
 
+CACHE_SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
+"""Characters an ``ObjectKey.cache_salt`` must not contain (key separators
+and path-unsafe bytes of the storage backends)."""
+
+CACHE_SALT_MAX_LEN = 128
+"""Maximum length of an ``ObjectKey.cache_salt``."""
+
+
 @dataclass(frozen=True)
 class ObjectKey:
     """
@@ -94,8 +102,8 @@ class ObjectKey:
     hash, and extension are added.
     """
 
-    _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
-    _SALT_MAX_LEN = 128
+    _SALT_FORBIDDEN_CHARS = CACHE_SALT_FORBIDDEN_CHARS
+    _SALT_MAX_LEN = CACHE_SALT_MAX_LEN
 
     def __post_init__(self) -> None:
         if "@" in self.model_name:

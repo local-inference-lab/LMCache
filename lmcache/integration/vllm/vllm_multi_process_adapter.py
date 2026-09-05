@@ -34,6 +34,7 @@ from lmcache.v1.multiprocess.transfer_context import (
     TransferContext,
     create_transfer_context,
 )
+from lmcache.v1.multiprocess.transfer_context.base import compute_kv_layout
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 from lmcache.v1.platform import resolve_kv_wrapper_factory
 
@@ -54,6 +55,10 @@ class ExtraConfigDefault(enum.Enum):
     # Interval (seconds) between periodic heartbeat pings
     # to the server.
     heartbeat_interval = 10.0
+    # Timeout (seconds) for each heartbeat PING. Zero preserves the
+    # historical behavior of using heartbeat_interval as the timeout.
+    # heartbeat-timeout-decouple
+    heartbeat_timeout = 0.0
     # Routing mode for ``create_transfer_context``: ``auto`` keeps the
     # historical CUDA -> lmcache_driven / others -> engine_driven dispatch;
     # ``lmcache_driven`` forces the IPC / SHM zero-copy path where the
@@ -455,6 +460,7 @@ class HeartbeatThread(PeriodicThread):
         health_event: threading.Event,
         interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         instance_id: int | None = None,
+        timeout: float = 0.0,
     ):
         """
         Args:
@@ -476,6 +482,9 @@ class HeartbeatThread(PeriodicThread):
         self._mq_client = mq_client
         self._health_event = health_event
         self._interval = interval
+        # heartbeat_timeout > 0 decouples the PING response timeout from
+        # the cadence; bounded queue latency must not flip health.
+        self._effective_timeout = timeout if timeout > 0.0 else interval
         self._instance_id = instance_id
 
         # Optional callback invoked on the unhealthy->healthy edge,
@@ -516,7 +525,7 @@ class HeartbeatThread(PeriodicThread):
         """
         was_healthy = self._health_event.is_set()
         healthy = send_ping(
-            self._mq_client, timeout=self._interval, instance_id=self._instance_id
+            self._mq_client, timeout=self._effective_timeout, instance_id=self._instance_id
         )
 
         if self.stop_requested:
@@ -647,10 +656,12 @@ class LMCacheMPSchedulerAdapter:
         self.mq_clients: dict[str, MessageQueueClient] = {
             url: MessageQueueClient(url, context) for url in self._server_urls
         }
+        heartbeat_timeout = 0.0
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
+            heartbeat_timeout = cfg[ExtraConfigDefault.heartbeat_timeout.name]
         self._mq_timeout = mq_timeout
 
         # Lookup state tracking:
@@ -707,6 +718,7 @@ class LMCacheMPSchedulerAdapter:
         # It will be lazily started on the first lookup
         # request, by which time vLLM is fully ready.
         self._heartbeat_interval = heartbeat_interval
+        self._heartbeat_timeout = heartbeat_timeout
         self._heartbeats: dict[str, HeartbeatThread] = {}
         self._heartbeat_lock = threading.Lock()
 
@@ -737,6 +749,7 @@ class LMCacheMPSchedulerAdapter:
                     mq_client=client,
                     health_event=self._health_events[url],
                     interval=self._heartbeat_interval,
+                    timeout=self._heartbeat_timeout,
                 )
                 hb.start()
                 self._heartbeats[url] = hb
@@ -1126,10 +1139,12 @@ class LMCacheMPWorkerAdapter:
             legacy_block_size,
             mq_timeout,
         )
+        heartbeat_timeout = 0.0
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
+            heartbeat_timeout = cfg[ExtraConfigDefault.heartbeat_timeout.name]
             # Only treat ``mp_transfer_mode`` as an explicit override when
             # the user actually set it in extra_config; otherwise leave it
             # as ``None`` so ``create_transfer_context`` can still consult
@@ -1209,6 +1224,10 @@ class LMCacheMPWorkerAdapter:
             "LMCache chunk size should be a multiple of vLLM block size"
         )
         self.blocks_in_chunk = lmcache_tokens_per_chunk // vllm_block_size
+        # Scheduler block counts use vLLM's manager-page size. Engine-driven
+        # gather/scatter counts are recomputed from the registered KV tensor's
+        # physical page size once the cache layout is available.
+        self._transfer_blocks_in_chunk = self.blocks_in_chunk
 
         # Health state (shared with heartbeat thread)
         self._health_event = threading.Event()
@@ -1219,18 +1238,27 @@ class LMCacheMPWorkerAdapter:
         # request, by which time vLLM is fully ready (model loaded,
         # KV caches allocated, warmup & CUDA graph capture done).
         self._heartbeat_interval = heartbeat_interval
+        self._heartbeat_timeout = heartbeat_timeout
         self._heartbeat: HeartbeatThread | None = None
         self._heartbeat_lock = threading.Lock()
-        if 3 * heartbeat_interval > _SERVER_REAP_TIMEOUT_FLOOR_SECONDS:
+        effective_heartbeat_timeout = (
+            heartbeat_timeout if heartbeat_timeout > 0.0 else heartbeat_interval
+        )
+        heartbeat_refresh_gap = max(
+            3 * heartbeat_interval,
+            heartbeat_interval + effective_heartbeat_timeout,
+        )
+        if heartbeat_refresh_gap > _SERVER_REAP_TIMEOUT_FLOOR_SECONDS:
             logger.warning(
-                "lmcache.mp.heartbeat_interval is %.1fs, so 3 x "
-                "heartbeat_interval (%.1fs) exceeds the MP server's "
-                "default worker reap timeout floor (%.1fs). Raise the "
-                "server's worker reap timeout to at least 3 x the "
-                "heartbeat interval, or the server may reap this "
-                "worker between heartbeats.",
+                "LMCache heartbeat refresh gap can reach %.1fs with "
+                "heartbeat_interval=%.1fs and heartbeat_timeout=%.1fs, "
+                "which exceeds the MP server's default worker reap "
+                "timeout floor (%.1fs). Raise the server's worker reap "
+                "timeout above the refresh gap, or the server may reap "
+                "this worker between heartbeats.",
+                heartbeat_refresh_gap,
                 heartbeat_interval,
-                3 * heartbeat_interval,
+                effective_heartbeat_timeout,
                 _SERVER_REAP_TIMEOUT_FLOOR_SECONDS,
             )
 
@@ -1289,20 +1317,22 @@ class LMCacheMPWorkerAdapter:
         Raises:
             ConnectionError: if the server does not respond within
                 mq_timeout.
-            ValueError: if the LMCache chunk size is not a multiple of an
-                engine group's ``tokens_per_block`` (chunk boundaries would
-                not align with that group's paged-chunk boundaries).
+            ValueError: if the LMCache chunk size and an engine group's
+                ``tokens_per_block`` do not divide one another exactly, or an
+                engine-driven external object is not an integral number of
+                physical KV-cache blocks.
         """
         logger.info("Registering kv caches")
         for info in engine_group_infos:
             if (
                 info.tokens_per_block > 0
                 and self.lmcache_tokens_per_chunk % info.tokens_per_block
+                and info.tokens_per_block % self.lmcache_tokens_per_chunk
             ):
                 raise ValueError(
-                    f"LMCache chunk size {self.lmcache_tokens_per_chunk} must be a "
-                    f"multiple of engine group {info.engine_group_id} "
-                    f"tokens_per_block {info.tokens_per_block}"
+                    f"LMCache chunk size {self.lmcache_tokens_per_chunk} and "
+                    f"engine group {info.engine_group_id} tokens_per_block "
+                    f"{info.tokens_per_block} must divide each other exactly"
                 )
         self.kv_caches = kv_caches
         self.engine_group_infos = list(engine_group_infos)
@@ -1330,6 +1360,29 @@ class LMCacheMPWorkerAdapter:
         self.kv_caches = kv_caches
         transfer_ctx = create_transfer_context(kv_caches, mode=self._mp_transfer_mode)
         layout_hints = vllm_layout_hints()
+        transfer_blocks_in_chunk = self.blocks_in_chunk
+        # Whole-dict layout detection is valid only for homogeneous/single-group
+        # caches. Hybrid vLLM registration may place a rank-4 fused attention
+        # tensor before rank-3 Mamba state tensors; applying the first tensor's
+        # reshape to the whole dict corrupts discovery. Multigroup contexts are
+        # validated independently by EngineDrivenTransferContext.register(),
+        # including the fail-closed sliding-window/recurrent fine-split guard.
+        if (
+            isinstance(transfer_ctx, EngineDrivenTransferContext)
+            and len(self.engine_group_infos) <= 1
+        ):
+            physical_block_size, *_ = compute_kv_layout(
+                kv_caches, layout_hints=layout_hints
+            )
+            if self.lmcache_tokens_per_chunk % physical_block_size:
+                raise ValueError(
+                    f"LMCache chunk size {self.lmcache_tokens_per_chunk} is not "
+                    "an integral number of engine-driven physical KV-cache "
+                    f"blocks of size {physical_block_size}"
+                )
+            transfer_blocks_in_chunk = (
+                self.lmcache_tokens_per_chunk // physical_block_size
+            )
         self.transfer_ctx = transfer_ctx
         try:
             # Register on the local, not self.transfer_ctx: a concurrent
@@ -1340,19 +1393,28 @@ class LMCacheMPWorkerAdapter:
                 kv_caches,
                 self.model_name,
                 self.world_size,
-                self.blocks_in_chunk,
+                transfer_blocks_in_chunk,
                 self.mq_client,
                 self._mq_timeout,
                 send_request=send_lmcache_request,
                 layout_hints=layout_hints,
                 engine_group_infos=self.engine_group_infos,
+                tokens_per_chunk=self.lmcache_tokens_per_chunk,
             )
+            self._transfer_blocks_in_chunk = transfer_blocks_in_chunk
         except TimeoutError:
             raise ConnectionError(
                 "LMCache server did not respond to "
                 "register_kv_caches within "
                 f"{self._mq_timeout}s. Is the server running?"
             ) from None
+
+        # Runtime patch compatibility marker: heartbeat-at-registration.
+        # A lazy (first store/retrieve) heartbeat lets the server reap a live
+        # but never-pinged registration after the grace window; the next
+        # PREPARE_STORE then raises and kills every worker. Ping from
+        # registration onward so the reaper never targets a live worker.
+        self._ensure_heartbeat_started()
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first store/retrieve.
@@ -1373,6 +1435,7 @@ class LMCacheMPWorkerAdapter:
                 mq_client=self.mq_client,
                 health_event=self._health_event,
                 interval=self._heartbeat_interval,
+                timeout=self._heartbeat_timeout,
                 instance_id=self.instance_id,
             )
             heartbeat.register_recover_callback(self._reregister_kv_caches_callback)
@@ -1472,7 +1535,7 @@ class LMCacheMPWorkerAdapter:
             self.kv_caches,
             self._block_ids_per_group(op),
             event,
-            self.blocks_in_chunk,
+            self._transfer_blocks_in_chunk,
         )
         # Chunked prefill can submit multiple stores for one request before
         # earlier stores finish. Keep every future and its exporting event.
@@ -1481,6 +1544,22 @@ class LMCacheMPWorkerAdapter:
         self.store_events.setdefault(request_id, []).append(event)
 
     @_lmcache_nvtx_annotate
+    def fail_retrieve(self, request_id: str, flat_block_ids: list[int]) -> None:
+        """Report a retrieve that was never submitted as a failed load.
+
+        The scheduler-side connector calls this (through the connector
+        metadata) when it expected to retrieve for a request but could not
+        build the operation. The request's blocks are flagged through
+        ``error_block_ids`` so vLLM recomputes them, and the id is recorded
+        so ``get_finished`` reports it exactly once.
+
+        Args:
+            request_id: The ID of the request.
+            flat_block_ids: Every block ID allocated to the request.
+        """
+        self.error_block_ids.update(flat_block_ids)
+        self._dropped_retrieves.add(request_id)
+
     def submit_retrieve_request(
         self,
         request_id: str,
@@ -1529,7 +1608,7 @@ class LMCacheMPWorkerAdapter:
             self.kv_caches,
             self._block_ids_per_group(op),
             event,
-            self.blocks_in_chunk,
+            self._transfer_blocks_in_chunk,
             skip_first_n_tokens=op.skip_first_n_tokens,
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
@@ -1796,6 +1875,21 @@ class LMCacheMPWorkerAdapter:
         errors = self.error_block_ids.copy()
         self.error_block_ids.clear()
         return errors
+
+    def flush_inflight_overwrite_gathers(self) -> None:
+        """Protect cache pages that the next forward updates in place.
+
+        Async grouped contexts expose a narrow fence after recurrent/window
+        groups reach host memory. Stable attention gathers and server commits
+        remain asynchronous. Synchronous and non-grouped contexts need no
+        additional fence.
+        """
+        if not self.is_healthy or self.transfer_ctx is None:
+            return
+        flush = getattr(self.transfer_ctx, "flush_inflight_overwrite_gathers", None)
+        if flush is None:
+            flush = self.transfer_ctx.flush_inflight_stores
+        flush()
 
     def handle_preemptions(self, need_flush_before_forward: bool) -> None:
         """Handle worker-side preemption hints from connector metadata.

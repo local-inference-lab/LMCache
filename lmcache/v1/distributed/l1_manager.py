@@ -51,13 +51,24 @@ class L1ObjectState:
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
 
+    write_pending: bool = True
+    """ True from ``reserve_write`` until the writer finishes the write.
+
+    The write lock's TTL only bounds how long a writer may hold the object;
+    when it expires the object becomes reclaimable, not readable. Without
+    this flag an object whose writer died (or never committed) would be
+    served as a cache hit with uninitialized contents once the TTL ran out,
+    and the store controller would persist it to L2. """
+
     def available_for_read(self) -> bool:
         """Check if the object is available for read.
 
         Returns:
-            True if the object is not write-locked, False otherwise.
+            True if the object's write has been finished and it is not
+            write-locked, False otherwise. An object whose write lock
+            expired before ``finish_write`` stays unreadable.
         """
-        return not self.write_lock.is_locked()
+        return not self.write_pending and not self.write_lock.is_locked()
 
     def available_for_write(self) -> bool:
         """Check if the object is available for write.
@@ -488,6 +499,7 @@ class L1Manager:
                 continue
 
             entry.write_lock.lock()
+            entry.write_pending = True
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
             successful_keys.append(key)
 
@@ -642,6 +654,7 @@ class L1Manager:
                 continue
 
             entry.write_lock.unlock()
+            entry.write_pending = False
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
 
@@ -713,6 +726,7 @@ class L1Manager:
                 continue
 
             entry.write_lock.unlock()
+            entry.write_pending = False
             for _ in range(total):
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
@@ -727,6 +741,54 @@ class L1Manager:
             )
         )
         return ret
+
+    @l1_mgr_synchronized
+    def discard_abandoned_writes(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Delete objects whose writer reserved them and never finished.
+
+        An object is abandoned when ``write_pending`` is still set and its
+        write lock TTL has expired, i.e. the writer died or gave up before
+        ``finish_write``. Such objects hold uninitialized memory, can never
+        become readable, and would otherwise stay resident until the next
+        restart because the write-back eviction path only deletes objects it
+        could read and persist.
+
+        Args:
+            keys: Candidate keys; keys that are absent, readable, still
+                write-locked or read-locked are left untouched.
+
+        Returns:
+            The keys that were deleted.
+        """
+        need_to_free: list[MemoryObj] = []
+        discarded: list[ObjectKey] = []
+        for key in keys:
+            entry = self._objects.get(key, None)
+            if entry is None or not entry.write_pending:
+                continue
+            if entry.write_lock.is_locked() or entry.read_lock.is_locked():
+                continue
+            need_to_free.append(entry.memory_obj)
+            del self._objects[key]
+            discarded.append(key)
+
+        if not discarded:
+            return discarded
+        logger.warning(
+            "L1Manager: discarding %d abandoned write reservations "
+            "(write lock expired before finish_write)",
+            len(discarded),
+        )
+        self._memory_manager.free(need_to_free)
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_deleted_by_manager(discarded)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_KEYS_EVICTED,
+                metadata={"keys": discarded},
+            )
+        )
+        return discarded
 
     @l1_mgr_synchronized
     def delete(
