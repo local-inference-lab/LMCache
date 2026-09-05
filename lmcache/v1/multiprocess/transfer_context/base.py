@@ -727,9 +727,7 @@ def gather_paged_kv_to_cpu(
                     ),
                     dtype=np.uint64,
                 ).view(np.int64)
-                paged_arg = torch.from_numpy(_ptrs_np).to(
-                    device=get_device(normalized)
-                )
+                paged_arg = torch.from_numpy(_ptrs_np).to(device=get_device(normalized))
                 block_ids_arg = torch.tensor(
                     selected_block_ids,
                     dtype=torch.int64,

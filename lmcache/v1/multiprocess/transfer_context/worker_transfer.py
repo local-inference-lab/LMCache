@@ -32,8 +32,8 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContextMetadata,
     PagedKVTransferWorkspace,
     compute_kv_layout,
-    create_paged_kv_transfer_workspace,
     create_engine_driven_context,
+    create_paged_kv_transfer_workspace,
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
@@ -843,9 +843,7 @@ class EngineDrivenTransferContext(TransferContext):
             gather_kwargs: dict[str, Any] = {
                 "layout_hints": self._layout_hints,
                 "engine_kv_format": group.engine_kv_format,
-                "out": (
-                    out_buffers[group_idx] if out_buffers is not None else None
-                ),
+                "out": (out_buffers[group_idx] if out_buffers is not None else None),
                 "chunk_indices": indices,
                 "blocks_per_window": group.layout.blocks_per_window,
                 "group_idx": group.layout.object_group_id,

@@ -492,8 +492,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
 
                     transfer_workspace_slot = self._transfer_workspace_slots.get()
                     with self._copy_enqueue_lock:
-                        with torch.inference_mode(), torch_dev.stream(
-                            self._copy_stream
+                        with (
+                            torch.inference_mode(),
+                            torch_dev.stream(self._copy_stream),
                         ):
                             event.wait(stream=self._copy_stream)
                             # A later group can fail after an earlier group has
