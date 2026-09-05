@@ -315,7 +315,7 @@ def _bounded_relative_path_to_object_key(
             hash_start = hash_marker + 1
             leaf_index = hash_start + hash_count
             if (
-                hash_count <= 0
+                hash_count < 0
                 or leaf_index != len(parts) - 1
                 or leaf != f"object{_FILE_EXT}"
             ):
@@ -448,20 +448,25 @@ class FSL2Adapter(L2AdapterInterface):
             )
 
         try:
-            self._name_max = os.pathconf(self._base_path, "PC_NAME_MAX")
+            name_limits = [os.pathconf(self._base_path, "PC_NAME_MAX")]
+            path_limits = [os.pathconf(self._base_path, "PC_PATH_MAX")]
             if self._relative_tmp_dir is not None:
                 tmp_path = self._base_path / self._relative_tmp_dir
-                tmp_name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
-                self._name_max = min(self._name_max, tmp_name_max)
+                name_limits.append(os.pathconf(tmp_path, "PC_NAME_MAX"))
+                path_limits.append(os.pathconf(tmp_path, "PC_PATH_MAX"))
         except (OSError, ValueError) as exc:
             raise RuntimeError(
-                f"Failed to determine PC_NAME_MAX for FS L2 adapter: {exc}"
+                f"Failed to determine filesystem path limits for FS L2 adapter: {exc}"
             ) from exc
-        if self._name_max < _LEGACY_FILENAME_MAX_BYTES:
+        finite_name_limits = [limit for limit in name_limits if limit >= 0]
+        self._name_max = min(finite_name_limits, default=None)
+        if self._name_max is not None and self._name_max < _LEGACY_FILENAME_MAX_BYTES:
             raise ValueError(
                 "FS L2 adapter requires PC_NAME_MAX >= "
                 f"{_LEGACY_FILENAME_MAX_BYTES}, got {self._name_max}"
             )
+        finite_path_limits = [limit for limit in path_limits if limit >= 0]
+        self._path_max = min(finite_path_limits, default=None)
 
         # I/O tuning options aligned with FSConnector
         self._read_ahead_size = config.read_ahead_size
@@ -686,7 +691,9 @@ class FSL2Adapter(L2AdapterInterface):
         return tid
 
     def _key_to_path(self, key: ObjectKey) -> Path:
-        return self._base_path / _object_key_to_relative_path(key)
+        path = self._base_path / _object_key_to_relative_path(key)
+        self._require_representable_path(path)
+        return path
 
     def _key_candidate_paths(self, key: ObjectKey) -> tuple[Path, ...]:
         """Return canonical-first paths accepted for one cache object.
@@ -696,11 +703,23 @@ class FSL2Adapter(L2AdapterInterface):
         contain a valid legacy object that must remain readable and must block
         a duplicate canonical store.
         """
-        canonical = self._key_to_path(key)
+        canonical = self._base_path / _object_key_to_relative_path(key)
         legacy = self._base_path / _object_key_to_filename(key)
-        if canonical == legacy:
-            return (canonical,)
-        return canonical, legacy
+        candidates: list[Path] = []
+        if self._path_is_representable(canonical):
+            candidates.append(canonical)
+        if (
+            canonical != legacy
+            and (
+                self._name_max is None
+                or len(os.fsencode(legacy.name)) <= self._name_max
+            )
+            and self._path_is_representable(legacy)
+        ):
+            candidates.append(legacy)
+        if not candidates:
+            self._require_representable_path(canonical)
+        return tuple(candidates)
 
     async def _existing_key_path(self, key: ObjectKey) -> Optional[Path]:
         """Resolve the first existing canonical or compatible legacy path."""
@@ -731,7 +750,7 @@ class FSL2Adapter(L2AdapterInterface):
         """
         relative_path = _object_key_to_relative_path(key)
         final = self._base_path / relative_path
-        final.parent.mkdir(parents=True, exist_ok=True)
+        self._require_representable_path(final)
         if self._relative_tmp_dir is not None:
             tmp_dir = self._base_path / self._relative_tmp_dir
         else:
@@ -741,6 +760,19 @@ class FSL2Adapter(L2AdapterInterface):
         # overflow the same filesystem's component limit during publication.
         tmp = tmp_dir / ".lmcache-write.tmp"
         return final, tmp
+
+    def _path_is_representable(self, path: Path) -> bool:
+        """Return whether the encoded path fits the filesystem path limit."""
+        return self._path_max is None or len(os.fsencode(path)) < self._path_max
+
+    def _require_representable_path(self, path: Path) -> None:
+        """Reject a path that cannot be passed to the target filesystem."""
+        if not self._path_is_representable(path):
+            path_bytes = len(os.fsencode(path))
+            raise ValueError(
+                f"FS L2 object path uses {path_bytes} bytes, but PC_PATH_MAX "
+                f"is {self._path_max}"
+            )
 
     # ---- O_DIRECT helpers -----------------------------------------------
 
@@ -824,16 +856,17 @@ class FSL2Adapter(L2AdapterInterface):
         stored_sizes: list[int] = []
         try:
             for key, obj in zip(keys, objects, strict=True):
-                file_path, tmp_template = self._key_to_file_and_tmp_path(key)
-
                 # Skip if already stored on disk
                 if await self._existing_key_path(key) is not None:
                     continue
+                file_path, tmp_template = self._key_to_file_and_tmp_path(key)
                 buf = obj.byte_array
                 size = len(buf)
                 tmp_path = tmp_template.with_name(
                     f"{tmp_template.name}.{os.getpid()}.{uuid.uuid4().hex}"
                 )
+                self._require_representable_path(tmp_path)
+                file_path.parent.mkdir(parents=True, exist_ok=True)
 
                 try:
                     # Decide whether O_DIRECT is usable
@@ -910,7 +943,12 @@ class FSL2Adapter(L2AdapterInterface):
     ) -> None:
         bitmap = Bitmap(len(keys))
         for i, key in enumerate(keys):
-            if not await self._key_exists_on_disk(key):
+            try:
+                key_exists = await self._key_exists_on_disk(key)
+            except ValueError:
+                logger.exception("FSL2Adapter rejected unrepresentable key %s", key)
+                continue
+            if not key_exists:
                 continue
             bitmap.set(i)
 
@@ -928,8 +966,8 @@ class FSL2Adapter(L2AdapterInterface):
     ) -> None:
         bitmap = Bitmap(len(keys))
         for i, key in enumerate(keys):
-            file_path = await self._existing_key_path(key) or self._key_to_path(key)
             try:
+                file_path = await self._existing_key_path(key) or self._key_to_path(key)
                 dst_buf = objects[i].byte_array
                 expected = len(dst_buf)
                 num_read: Optional[int] = None
@@ -996,8 +1034,8 @@ class FSL2Adapter(L2AdapterInterface):
                 continue
             except Exception:
                 logger.exception(
-                    "FSL2Adapter failed to load %s",
-                    file_path,
+                    "FSL2Adapter failed to load key %s",
+                    key,
                 )
                 continue
 
@@ -1018,7 +1056,11 @@ class FSL2Adapter(L2AdapterInterface):
         sem = asyncio.Semaphore(self._DELETE_CONCURRENCY)
 
         async def _delete_one(key: ObjectKey) -> tuple[ObjectKey, int] | None:
-            file_path = await self._existing_key_path(key)
+            try:
+                file_path = await self._existing_key_path(key)
+            except ValueError:
+                logger.exception("FSL2Adapter rejected unrepresentable key %s", key)
+                return None
             if file_path is None:
                 return None
             async with sem:

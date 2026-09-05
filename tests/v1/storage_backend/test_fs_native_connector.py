@@ -172,6 +172,24 @@ def test_current_object_group_keys_match_python_filename(
         client.close()
 
 
+def test_native_connector_rejects_negative_kv_rank(tmp_path) -> None:
+    """Native wire input enforces the non-negative ObjectKey rank invariant."""
+    LMCacheFSClient = _import_fs_client()
+    client = LMCacheFSClient(str(tmp_path), 1)
+    try:
+        completion = _submit_and_wait(
+            client,
+            "submit_batch_set",
+            "model@-0000001@0@78",
+            memoryview(bytearray(b"payload")),
+        )
+        assert completion[1] is False
+        assert "kv_rank must be non-negative" in completion[2]
+        assert list(tmp_path.rglob("*.data")) == []
+    finally:
+        client.close()
+
+
 def test_oversized_glm_key_survives_native_restart(tmp_path) -> None:
     """Native FS stores and inventories the maximum supported tenant salt."""
     LMCacheFSClient = _import_fs_client()
@@ -252,6 +270,66 @@ def test_native_connector_bounds_long_chunk_hash(tmp_path) -> None:
         for component in expected_path.relative_to(tmp_path).parts
     )
     assert _scan_existing_key_sizes(str(tmp_path)) == {key: len(payload)}
+
+
+def test_native_connector_preserves_empty_hash_in_split_layout(tmp_path) -> None:
+    """Native storage and restart inventory agree on a split empty hash."""
+    LMCacheFSClient = _import_fs_client()
+    key = ObjectKey(
+        chunk_hash=b"",
+        model_name="org/model",
+        kv_rank=1 << 4096,
+        object_group_id=7,
+        cache_salt="tenant-a",
+    )
+    expected_path = tmp_path / _object_key_to_relative_path(key)
+    assert "h0" in expected_path.parts
+    payload = bytearray(b"empty-native-hash")
+
+    writer = LMCacheFSClient(str(tmp_path), 1)
+    try:
+        completion = _submit_and_wait(
+            writer,
+            "submit_batch_set",
+            _object_key_to_string(key),
+            memoryview(payload),
+        )
+        assert completion[1], completion[2]
+    finally:
+        writer.close()
+
+    assert expected_path.read_bytes() == payload
+    assert _scan_existing_key_sizes(str(tmp_path)) == {key: len(payload)}
+
+
+def test_native_connector_rejects_object_path_at_path_max(tmp_path) -> None:
+    """Native storage rejects an overlong complete path before filesystem I/O."""
+    LMCacheFSClient = _import_fs_client()
+    path_max = os.pathconf(tmp_path, "PC_PATH_MAX")
+    if path_max < 0:
+        pytest.skip("filesystem reports no fixed PC_PATH_MAX")
+    key = ObjectKey(
+        chunk_hash=b"hash",
+        model_name="m" * (path_max // 2 + 128),
+        kv_rank=0,
+    )
+    full_path = tmp_path / _object_key_to_relative_path(key)
+    assert len(os.fsencode(full_path)) >= path_max
+
+    client = LMCacheFSClient(str(tmp_path), 1)
+    try:
+        completion = _submit_and_wait(
+            client,
+            "submit_batch_set",
+            _object_key_to_string(key),
+            memoryview(bytearray(b"payload")),
+        )
+        assert completion[1] is False
+        assert "PATH_MAX" in completion[2]
+        assert list(tmp_path.rglob("*.data")) == []
+        assert not (tmp_path / ".lmcache-objects-v1").exists()
+    finally:
+        client.close()
 
 
 def test_batch_set_reports_partial_results_and_continues(tmp_path) -> None:

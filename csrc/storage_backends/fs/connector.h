@@ -32,6 +32,9 @@ struct WorkerFSConn {
   std::filesystem::path tmp_dir;  // empty if not configured
   bool use_odirect = false;
   size_t disk_block_size = 0;
+  // Zero denotes a filesystem that reports no fixed limit.
+  size_t name_max = 0;
+  size_t path_max = 0;
   // If > 0, trigger filesystem readahead by issuing a small
   // initial read of this many bytes before reading the rest.
   size_t read_ahead_size = 0;
@@ -88,6 +91,8 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   bool use_odirect_;
   size_t disk_block_size_;
   size_t read_ahead_size_;
+  size_t name_max_;
+  size_t path_max_;
 };
 
 }  // namespace connector

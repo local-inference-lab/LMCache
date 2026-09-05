@@ -246,7 +246,15 @@ class TestIpcKeyToObjectKeys:
 
 
 class TestObjectKeyValidation:
-    """``ObjectKey.__post_init__`` rejects invalid ``object_group_id``."""
+    """``ObjectKey.__post_init__`` rejects negative numeric identifiers."""
+
+    def test_negative_kv_rank_rejected(self):
+        with pytest.raises(ValueError, match="kv_rank"):
+            ObjectKey(
+                chunk_hash=b"\xde\xad\xbe\xef",
+                model_name="llama",
+                kv_rank=-1,
+            )
 
     def test_negative_object_group_id_rejected(self):
         with pytest.raises(ValueError, match="object_group_id"):

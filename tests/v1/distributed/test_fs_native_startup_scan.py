@@ -85,6 +85,23 @@ def test_scan_inventories_bounded_long_key(tmp_path) -> None:
     assert _scan_existing_key_sizes(str(tmp_path)) == {key: 7}
 
 
+def test_scan_inventories_split_path_with_empty_hash(tmp_path) -> None:
+    """Restart inventory decodes the explicit zero-component hash field."""
+    key = ObjectKey(
+        chunk_hash=b"",
+        model_name="org/model",
+        kv_rank=1 << 4096,
+        object_group_id=7,
+        cache_salt="tenant-a",
+    )
+    path = tmp_path / _object_key_to_relative_path(key)
+    assert "h0" in path.parts
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"bounded")
+
+    assert _scan_existing_key_sizes(str(tmp_path)) == {key: 7}
+
+
 def test_scan_missing_directory_is_empty(tmp_path) -> None:
     assert _scan_existing_key_sizes(str(tmp_path / "not-created")) == {}
 
