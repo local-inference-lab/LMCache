@@ -180,6 +180,99 @@ def test_distinct_oversized_keys_use_distinct_stable_files(tmp_path: Path) -> No
         restarted.close()
 
 
+def test_oversized_chunk_hash_uses_bounded_components(tmp_path: Path) -> None:
+    """A valid long chunk hash never creates an oversized path component."""
+    key = ObjectKey(
+        chunk_hash=bytes(range(128)),
+        model_name="org/model",
+        kv_rank=42,
+        object_group_id=7,
+        cache_salt="tenant-a",
+    )
+    relative_path = _object_key_to_relative_path(key)
+    name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
+    assert all(
+        len(os.fsencode(component)) <= name_max
+        for component in relative_path.parts
+    )
+    assert _bounded_relative_path_to_object_key(relative_path) == key
+
+    payload = b"long-hash payload"
+    adapter = FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
+    try:
+        _wait_for_store(adapter, key, payload)
+        assert _wait_for_load(adapter, key, len(payload)) == payload
+    finally:
+        adapter.close()
+
+
+def test_oversized_numeric_fields_use_bounded_components(tmp_path: Path) -> None:
+    """Object rank and group integers cannot exceed the component limit."""
+    key = ObjectKey(
+        chunk_hash=b"hash",
+        model_name="org/model",
+        kv_rank=1 << 4096,
+        object_group_id=1 << 4096,
+        cache_salt="tenant-a",
+    )
+    relative_path = _object_key_to_relative_path(key)
+    name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
+    assert all(
+        len(os.fsencode(component)) <= name_max
+        for component in relative_path.parts
+    )
+    assert _bounded_relative_path_to_object_key(relative_path) == key
+
+
+def test_python_adapter_reads_and_deletes_oversized_legacy_file(
+    tmp_path: Path,
+) -> None:
+    """Canonical bounded paths retain the representable flat-file fallback."""
+    key = ObjectKey(
+        chunk_hash=b"legacy-hash",
+        model_name="org/model-with-a-long-name",
+        kv_rank=42,
+        object_group_id=7,
+        cache_salt="tenant-a",
+    )
+    legacy_path = tmp_path / (
+        "org-SEP-model-with-a-long-name@0x0000002a@7@"
+        "6c65676163792d68617368@tenant-a.data"
+    )
+    payload = b"legacy payload"
+    legacy_path.write_bytes(payload)
+
+    module = "lmcache.v1.distributed.l2_adapters.fs_l2_adapter"
+    with patch(f"{module}._LEGACY_FILENAME_MAX_BYTES", 32):
+        assert _object_key_to_relative_path(key).parent != Path(".")
+        adapter = FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
+        try:
+            assert _wait_for_lookup(adapter, key)
+            assert _wait_for_load(adapter, key, len(payload)) == payload
+
+            task_id = adapter.submit_store_task(
+                [key], [_memory_obj(b"replacement must not be stored")]
+            )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                result = adapter.pop_completed_store_tasks().get(task_id)
+                if result is not None:
+                    assert result == L2StoreResult(True, 0)
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("duplicate store did not complete within 5s")
+
+            assert legacy_path.read_bytes() == payload
+            adapter.delete([key])
+            deadline = time.monotonic() + 5.0
+            while legacy_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not legacy_path.exists()
+        finally:
+            adapter.close()
+
+
 def test_path_does_not_depend_on_local_name_max(tmp_path: Path) -> None:
     """The same oversized key maps to one path on all supported hosts."""
     key = _long_key(salt_suffix="a")

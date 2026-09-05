@@ -7,6 +7,7 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 #include <cstring>
+#include <array>
 #include <filesystem>
 #include <string>
 #include <vector>

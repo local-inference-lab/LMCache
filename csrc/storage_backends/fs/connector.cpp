@@ -152,7 +152,28 @@ std::filesystem::path FSConnector::key_to_relative_path(
 
   std::string leaf = "0x" + parts[1] + std::string(1, KEY_SEP) + parts[2] +
                      std::string(1, KEY_SEP) + parts[3] + FILE_EXT;
-  relative_path /= leaf;
+  if (leaf.size() <= LEGACY_FILENAME_MAX_BYTES) {
+    relative_path /= leaf;
+    return relative_path;
+  }
+
+  const std::string rank = "0x" + parts[1];
+  const std::array<std::pair<char, std::string>, 3> bounded_fields = {{
+      {'r', rank},
+      {'g', parts[2]},
+      {'h', parts[3]},
+  }};
+  for (const auto& [marker, value] : bounded_fields) {
+    const size_t component_count =
+        (value.size() + ENCODED_COMPONENT_MAX_CHARS - 1) /
+        ENCODED_COMPONENT_MAX_CHARS;
+    relative_path /= std::string(1, marker) + std::to_string(component_count);
+    for (size_t offset = 0; offset < value.size();
+         offset += ENCODED_COMPONENT_MAX_CHARS) {
+      relative_path /= value.substr(offset, ENCODED_COMPONENT_MAX_CHARS);
+    }
+  }
+  relative_path /= "object.data";
   return relative_path;
 }
 

@@ -139,6 +139,30 @@ def test_scan_skips_entry_removed_before_stat(monkeypatch) -> None:
     assert _scan_existing_key_sizes("/cache") == {}
 
 
+def test_scan_fails_closed_when_bounded_root_cannot_be_inspected(
+    monkeypatch,
+) -> None:
+    """A bounded-tree stat error cannot silently reduce restart capacity."""
+    monkeypatch.setattr(os, "scandir", lambda _path: _FakeScandir([]))
+    real_stat = os.stat
+
+    def fail_bounded_root(path, *, follow_symlinks=True):
+        if str(path).endswith(".lmcache-objects-v1"):
+            raise PermissionError("denied")
+        return real_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "stat", fail_bounded_root)
+    with pytest.raises(RuntimeError, match="bounded cache root"):
+        _scan_existing_key_sizes("/cache")
+
+
+def test_scan_rejects_non_directory_bounded_root(tmp_path) -> None:
+    """A conflicting bounded-root file fails before native client startup."""
+    (tmp_path / ".lmcache-objects-v1").write_bytes(b"conflict")
+    with pytest.raises(RuntimeError, match="not a directory"):
+        _scan_existing_key_sizes(str(tmp_path))
+
+
 def test_scan_rejects_duplicate_decoded_keys(tmp_path) -> None:
     key = _key(10)
     canonical = _object_key_to_filename(key)

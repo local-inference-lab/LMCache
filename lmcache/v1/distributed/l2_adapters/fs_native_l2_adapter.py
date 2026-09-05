@@ -117,7 +117,22 @@ def _scan_existing_key_sizes(base_path: str) -> dict[ObjectKey, int]:
         ) from exc
 
     bounded_root = os.path.join(base_path, _BOUNDED_PATH_VERSION)
-    if os.path.isdir(bounded_root):
+    try:
+        bounded_stat = os.stat(bounded_root, follow_symlinks=False)
+    except FileNotFoundError:
+        bounded_root_exists = False
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed to inspect native FS bounded cache root {bounded_root!r}: {exc}"
+        ) from exc
+    else:
+        if not stat.S_ISDIR(bounded_stat.st_mode):
+            raise RuntimeError(
+                f"Native FS bounded cache root is not a directory: {bounded_root!r}"
+            )
+        bounded_root_exists = True
+
+    if bounded_root_exists:
 
         def _raise_walk_error(exc: OSError) -> None:
             raise RuntimeError(

@@ -221,6 +221,39 @@ def test_oversized_glm_key_survives_native_restart(tmp_path) -> None:
         reader.close()
 
 
+def test_native_connector_bounds_long_chunk_hash(tmp_path) -> None:
+    """The C++ and Python encoders agree for a 128-byte chunk hash."""
+    LMCacheFSClient = _import_fs_client()
+    key = ObjectKey(
+        chunk_hash=bytes(range(128)),
+        model_name="org/model",
+        kv_rank=0x01020304,
+        object_group_id=7,
+        cache_salt="tenant-a",
+    )
+    expected_path = tmp_path / _object_key_to_relative_path(key)
+    payload = bytearray(b"long-native-hash")
+
+    writer = LMCacheFSClient(str(tmp_path), 1)
+    try:
+        completion = _submit_and_wait(
+            writer,
+            "submit_batch_set",
+            _object_key_to_string(key),
+            memoryview(payload),
+        )
+        assert completion[1], completion[2]
+    finally:
+        writer.close()
+
+    assert expected_path.read_bytes() == payload
+    assert all(
+        len(os.fsencode(component)) <= os.pathconf(tmp_path, "PC_NAME_MAX")
+        for component in expected_path.relative_to(tmp_path).parts
+    )
+    assert _scan_existing_key_sizes(str(tmp_path)) == {key: len(payload)}
+
+
 def test_batch_set_reports_partial_results_and_continues(tmp_path) -> None:
     """A failed key must not hide or prevent successful siblings."""
     LMCacheFSClient = _import_fs_client()
