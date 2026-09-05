@@ -1211,7 +1211,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return
 
         tracker = self._get_or_create_request_tracker(request)
-        lookup_token_ids = list(request.all_token_ids)
+        lookup_token_ids = tracker.get_token_ids()
         prefill_replay_tokens = getattr(self, "_prefill_replay_tokens", 0)
         if prefill_replay_tokens:
             lookup_token_ids = lookup_token_ids[
