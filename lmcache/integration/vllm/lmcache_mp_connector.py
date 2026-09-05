@@ -107,12 +107,15 @@ if TYPE_CHECKING:
 logger = lmcache_init_logger(__name__)
 
 
-MM_KEY_TOKEN_FLAG = 1 << 40
+MM_KEY_TOKEN_FLAG = 1 << 30
 """Bit set on every key token that stands in for a multimodal placeholder.
-No tokenizer vocabulary reaches 2**40, so a prompt with an image can never
-produce the same key tokens as a text-only prompt."""
+No tokenizer vocabulary reaches 2**30, so a prompt with an image can never
+produce the same key tokens as a text-only prompt. Key tokens stay below
+2**31: the token hashers serialize ids as unsigned 32-bit values
+(``struct.pack(">I")``) and other consumers may use signed 32-bit arrays."""
 
-_MM_KEY_WORD_BYTES = 4
+_MM_KEY_WORD_BITS = 30
+_MM_KEY_WORD_MASK = (1 << _MM_KEY_WORD_BITS) - 1
 
 
 def multimodal_key_tokens(identifier: str, length: int) -> list[int]:
@@ -123,17 +126,17 @@ def multimodal_key_tokens(identifier: str, length: int) -> list[int]:
     prompt position tokenize identically. The KV cache computed for those
     positions depends on the image content, so cache keys must too: the
     returned tokens spread the SHA-256 of the item's content identifier
-    (vLLM's ``MultiModalFeatureSpec.identifier``) over the range, eight 32-bit
-    words repeated, each tagged with :data:`MM_KEY_TOKEN_FLAG`. Every full
-    256-bit identifier is covered within the first eight positions; shorter
-    ranges keep a prefix of it.
+    (vLLM's ``MultiModalFeatureSpec.identifier``) over the range as eight
+    30-bit words (240 of the 256 digest bits) repeated, each tagged with
+    :data:`MM_KEY_TOKEN_FLAG`. Every identifier is covered within the first
+    eight positions; shorter ranges keep a prefix of it.
     """
     if length <= 0:
         return []
-    digest = hashlib.sha256(identifier.encode("utf-8")).digest()
+    digest = int.from_bytes(hashlib.sha256(identifier.encode("utf-8")).digest(), "big")
     words = [
-        MM_KEY_TOKEN_FLAG | int.from_bytes(digest[i : i + _MM_KEY_WORD_BYTES], "big")
-        for i in range(0, len(digest), _MM_KEY_WORD_BYTES)
+        MM_KEY_TOKEN_FLAG | ((digest >> (_MM_KEY_WORD_BITS * i)) & _MM_KEY_WORD_MASK)
+        for i in range(8)
     ]
     return [words[i % len(words)] for i in range(length)]
 
