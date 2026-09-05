@@ -152,3 +152,50 @@ def test_process_tokens_returns_int_keys_for_bytes_hash_func() -> None:
         assert isinstance(hash_val, int), f"Expected int, got {type(hash_val)}"
         # Must fit in uint64 (msgpack range: 0 to 2**64 - 1)
         assert 0 <= hash_val <= 2**64 - 1
+
+
+def test_cache_namespace_tags_keys():
+    """Engine-level cache_namespace must become a constant "ns" key tag.
+
+    Without a namespace, keys are unchanged (backward compatible). With one,
+    every minted key carries the tag, keys differ across namespaces, and a
+    per-request "ns" tag cannot override the engine-level value.
+    """
+    metadata = dumb_metadata()
+    test_length = 512
+    tokens = generate_tokens(test_length, "cpu")
+    mask = torch.full([test_length], True, dtype=torch.bool, device="cpu")
+
+    def keys_for(namespace, request_configs=None):
+        cfg = LMCacheEngineConfig.from_legacy(chunk_size=256, backend="cpu")
+        cfg.cache_namespace = namespace
+        db = ChunkedTokenDatabase(cfg, metadata)
+        return [
+            key
+            for _, _, key in db.process_tokens(
+                tokens, mask, request_configs=request_configs
+            )
+        ]
+
+    plain = keys_for(None)
+    assert all(key.tags is None for key in plain)
+
+    ns_a = keys_for("imgA")
+    assert len(ns_a) == len(plain)
+    for key in ns_a:
+        assert key.tags == (("ns", "imgA"),)
+
+    ns_b = keys_for("imgB")
+    assert all(a != b for a, b in zip(ns_a, ns_b))
+    assert all(a != p for a, p in zip(ns_a, plain))
+
+    # Same namespace reproduces identical keys.
+    assert keys_for("imgA") == ns_a
+
+    # A request-supplied "ns" tag must not defeat engine-level isolation.
+    hijack = keys_for("imgA", request_configs={"lmcache.tag.ns": "evil"})
+    assert hijack == ns_a
+
+    # Round-trips through the string codec preserve the namespace tag.
+    for key in ns_a[:2]:
+        assert key.__class__.from_string(key.to_string()) == key
