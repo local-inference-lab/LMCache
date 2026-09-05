@@ -55,8 +55,10 @@ def test_key_tokens_are_flagged_and_cover_the_identifier() -> None:
 
     assert len(tokens) == 20
     assert all(token & MM_KEY_TOKEN_FLAG for token in tokens)
-    assert all(token < (1 << 41) for token in tokens)
-    # Eight 32-bit words cover the 256-bit digest, then repeat.
+    # Unsigned and signed 32-bit consumers (blake3 hasher packs ">I") must
+    # accept every key token.
+    assert all(MM_KEY_TOKEN_FLAG <= token < (1 << 31) for token in tokens)
+    # Eight 30-bit words cover 240 bits of the digest, then repeat.
     assert len(set(tokens[:8])) == 8
     assert tokens[8:16] == tokens[:8]
     assert tokens[16:20] == tokens[:4]
@@ -201,3 +203,16 @@ def test_metadata_ops_carry_the_keyed_tokens(direction: str) -> None:
     assert metadata is not None
     assert metadata.direction == direction
     assert metadata.op.token_ids == keyed
+
+
+def test_key_tokens_hash_through_the_multiprocess_token_hasher() -> None:
+    """The cache server hashes token ids as unsigned 32-bit values."""
+    from lmcache.v1.multiprocess.token_hasher import TokenHasher
+
+    hasher = TokenHasher(chunk_size=16, hash_algorithm="blake3")
+    keyed = list(range(16)) + multimodal_key_tokens("img", 16)
+    hashes = hasher.compute_chunk_hashes(keyed)
+    assert len(hashes) == 2
+    plain = hasher.compute_chunk_hashes(list(range(32)))
+    assert hashes[0] == plain[0]
+    assert hashes[1] != plain[1]
