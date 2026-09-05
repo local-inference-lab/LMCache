@@ -19,6 +19,7 @@ from lmcache.usage_telemetry.l2_usage import InitializeL2ConnectorUsage
 from lmcache.usage_telemetry.mp import InitializeMPUsageContext
 from lmcache.usage_telemetry.mp_continuous import InitializeMPContinuousUsage
 from lmcache.v1.distributed.config import (
+    L1MemoryManagerConfig,
     StorageManagerConfig,
     add_storage_manager_args,
     parse_args_to_config,
@@ -95,6 +96,25 @@ def _available_l1_shm_bytes_after_cleanup(shm_name: str) -> int:
     """Return tmpfs capacity after removing the replaceable named pool."""
     _unlink_configured_l1_shm(shm_name)
     return shutil.disk_usage("/dev/shm").free
+
+
+def _available_configured_l1_shm_bytes(
+    mem_cfg: L1MemoryManagerConfig,
+) -> int | None:
+    """Return usable POSIX-SHM capacity for a configuration that uses it.
+
+    Lazy DRAM and Device-DAX configurations do not publish a POSIX shared
+    memory pool to engine workers. Their configured ``shm_name`` must not be
+    unlinked during restart because this process will not replace that object.
+    """
+    if (
+        not mem_cfg.shm_name
+        or mem_cfg.use_lazy
+        or mem_cfg.devdax_path
+        or not sys.platform.startswith("linux")
+    ):
+        return None
+    return _available_l1_shm_bytes_after_cleanup(mem_cfg.shm_name)
 
 
 class MPCacheServer:
@@ -395,11 +415,12 @@ def run_cache_server(
         mem_cfg = storage_manager_config.l1_manager_config.memory_config
         if mp_config.shm_name is not None:
             mem_cfg.shm_name = mp_config.shm_name
-        if mem_cfg.shm_name and sys.platform.startswith("linux"):
-            logger.info("Checking if shm capacity is larger than L1 request")
+        if mem_cfg.shm_name:
             try:
-                free_bytes = _available_l1_shm_bytes_after_cleanup(mem_cfg.shm_name)
-                if free_bytes < mem_cfg.size_in_bytes:
+                free_bytes = _available_configured_l1_shm_bytes(mem_cfg)
+                if free_bytes is not None:
+                    logger.info("Checking if shm capacity is larger than L1 request")
+                if free_bytes is not None and free_bytes < mem_cfg.size_in_bytes:
                     logger.warning(
                         "Insufficient /dev/shm capacity: need %d bytes, have %d bytes. "
                         "Disabling SHM, falling back to pickle.",
