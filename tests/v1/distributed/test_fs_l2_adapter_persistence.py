@@ -17,6 +17,8 @@ from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
     FSL2Adapter,
     FSL2AdapterConfig,
+    _bounded_relative_path_to_object_key,
+    _object_key_to_relative_path,
 )
 from lmcache.v1.memory_management import MemoryObj
 
@@ -141,7 +143,7 @@ def test_short_legacy_filename_remains_readable(tmp_path: Path) -> None:
 
 
 def test_distinct_oversized_keys_use_distinct_stable_files(tmp_path: Path) -> None:
-    """Digest addressing includes key fields that differ near their ends."""
+    """Bounded paths preserve key fields that differ near their ends."""
     keys = [
         _long_key(model_suffix="a", salt_suffix="a"),
         _long_key(model_suffix="b", salt_suffix="a"),
@@ -152,27 +154,36 @@ def test_distinct_oversized_keys_use_distinct_stable_files(tmp_path: Path) -> No
         payloads = (b"base", b"model differs", b"salt differs")
         for key, payload in zip(keys, payloads, strict=True):
             _wait_for_store(adapter, key, payload)
-        filenames = {path.name for path in tmp_path.iterdir()}
-        assert len(filenames) == 3
-        assert all(len(name) == 64 + len(".data") for name in filenames)
-        assert all(name.endswith(".data") for name in filenames)
+        relative_paths = {
+            path.relative_to(tmp_path) for path in tmp_path.rglob("*.data")
+        }
+        assert relative_paths == {_object_key_to_relative_path(key) for key in keys}
         name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
-        assert all(len(os.fsencode(name)) <= name_max for name in filenames)
+        assert all(
+            len(os.fsencode(component)) <= name_max
+            for path in relative_paths
+            for component in path.parts
+        )
+        assert {
+            _bounded_relative_path_to_object_key(path) for path in relative_paths
+        } == set(keys)
     finally:
         adapter.close()
 
     restarted = FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
     try:
         assert [_wait_for_lookup(restarted, key) for key in keys] == [True] * 3
-        assert {path.name for path in tmp_path.iterdir()} == filenames
+        assert {
+            path.relative_to(tmp_path) for path in tmp_path.rglob("*.data")
+        } == relative_paths
     finally:
         restarted.close()
 
 
-def test_filename_does_not_depend_on_local_name_max(tmp_path: Path) -> None:
-    """The same oversized key maps to one filename on all supported hosts."""
+def test_path_does_not_depend_on_local_name_max(tmp_path: Path) -> None:
+    """The same oversized key maps to one path on all supported hosts."""
     key = _long_key(salt_suffix="a")
-    filenames = []
+    relative_paths = []
 
     for dirname, name_max in (("standard", 255), ("large", 512)):
         base_path = tmp_path / dirname
@@ -181,16 +192,18 @@ def test_filename_does_not_depend_on_local_name_max(tmp_path: Path) -> None:
             adapter = FSL2Adapter(FSL2AdapterConfig(base_path=str(base_path)))
         try:
             _wait_for_store(adapter, key, b"payload")
-            filenames.append(next(base_path.iterdir()).name)
+            relative_paths.append(
+                next(base_path.rglob("*.data")).relative_to(base_path)
+            )
         finally:
             adapter.close()
 
-    assert filenames[0] == filenames[1]
-    assert len(filenames[0]) == 64 + len(".data")
+    assert relative_paths[0] == relative_paths[1]
+    assert _bounded_relative_path_to_object_key(relative_paths[0]) == key
 
 
 def test_oversized_surrogateescaped_key_can_be_stored(tmp_path: Path) -> None:
-    """Digest addressing accepts model strings restored from FS bytes."""
+    """Bounded addressing accepts model strings restored from FS bytes."""
     escaped_byte = b"\x80".decode(errors="surrogateescape")
     key = _long_key(model_suffix=escaped_byte, salt_suffix="a")
     adapter = FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
@@ -211,10 +224,11 @@ def test_relative_tmp_dir_stores_oversized_key(tmp_path: Path) -> None:
         _wait_for_store(adapter, key, b"payload")
         assert _wait_for_lookup(adapter, key)
         assert list((tmp_path / "tmp").iterdir()) == []
-        data_files = [path for path in tmp_path.iterdir() if path.is_file()]
+        data_files = list(tmp_path.rglob("*.data"))
         assert len(data_files) == 1
-        assert len(os.fsencode(data_files[0].name)) <= os.pathconf(
-            tmp_path / "tmp", "PC_NAME_MAX"
+        assert all(
+            len(os.fsencode(component)) <= os.pathconf(tmp_path, "PC_NAME_MAX")
+            for component in data_files[0].relative_to(tmp_path).parts
         )
     finally:
         adapter.close()

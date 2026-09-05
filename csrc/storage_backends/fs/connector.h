@@ -19,6 +19,9 @@ static constexpr char KEY_SEP = '@';
 static constexpr const char* PATH_SLASH_REPLACEMENT = "-SEP-";
 static constexpr const char* FILE_EXT = ".data";
 static constexpr const char* TMP_EXT = ".tmp";
+static constexpr const char* BOUNDED_PATH_VERSION = ".lmcache-objects-v1";
+static constexpr size_t LEGACY_FILENAME_MAX_BYTES = 255;
+static constexpr size_t ENCODED_COMPONENT_MAX_CHARS = 200;
 
 // Per-worker connection state for the FS connector. O_DIRECT is enabled per
 // request only when both the transfer length and caller-owned buffer address
@@ -68,6 +71,12 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   // are preserved because four fields can represent either a legacy salted
   // key or a current unsalted key.
   static std::string key_to_filename(const std::string& key);
+
+  // Preserve the flat filename when it fits NAME_MAX. Oversized keys use a
+  // reversible hierarchy whose individual components remain bounded.
+  static std::filesystem::path key_to_relative_path(const std::string& key);
+
+  static std::string hex_encode(const std::string& value);
 
   static std::string replace_all(const std::string& str,
                                  const std::string& from,

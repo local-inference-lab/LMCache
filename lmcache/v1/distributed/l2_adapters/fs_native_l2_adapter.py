@@ -10,8 +10,10 @@ Backed by the native C++ filesystem connector wrapped with
 from __future__ import annotations
 
 # Standard
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 import os
+import stat
 
 if TYPE_CHECKING:
     from lmcache.v1.distributed.internal_api import (
@@ -32,6 +34,8 @@ from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
+    _BOUNDED_PATH_VERSION,
+    _bounded_relative_path_to_object_key,
     _filename_to_object_key,
 )
 
@@ -44,10 +48,10 @@ _IGNORED_FILE_SAMPLE_LIMIT = 5
 def _scan_existing_key_sizes(base_path: str) -> dict[ObjectKey, int]:
     """Inventory complete native-FS objects before the client starts.
 
-    Only direct, regular, positive-size ``.data`` files with filenames
-    reversible by the current ObjectKey codec are counted. Entries are returned
-    oldest-to-newest by ``(mtime_ns, filename)`` so an LRU policy can reconstruct
-    a deterministic best-effort order. The cache directory is expected to be
+    Regular, positive-size ``.data`` objects in either the legacy flat layout
+    or the bounded reversible layout are counted. Entries are returned
+    oldest-to-newest by ``(mtime_ns, path)`` so an LRU policy can reconstruct a
+    deterministic best-effort order. The cache directory is expected to be
     quiescent (or exclusively owned by this server) during startup: a file that
     disappears during the scan is skipped, while every other I/O error fails
     construction instead of silently undercounting capacity.
@@ -87,7 +91,7 @@ def _scan_existing_key_sizes(base_path: str) -> dict[ObjectKey, int]:
                     continue
 
                 try:
-                    stat = entry.stat(follow_symlinks=False)
+                    entry_stat = entry.stat(follow_symlinks=False)
                 except FileNotFoundError:
                     # A concurrent cleanup can remove an entry between listing
                     # and stat. No controller is connected to this adapter yet.
@@ -97,18 +101,72 @@ def _scan_existing_key_sizes(base_path: str) -> dict[ObjectKey, int]:
                         f"Failed to stat native FS cache entry {entry.path!r}: {exc}"
                     ) from exc
 
-                if stat.st_size <= 0:
+                if entry_stat.st_size <= 0:
                     ignored_data_count += 1
                     if len(ignored_data_files) < _IGNORED_FILE_SAMPLE_LIMIT:
                         ignored_data_files.append(entry.name)
                     continue
-                records.append((stat.st_mtime_ns, entry.name, key, stat.st_size))
+                records.append(
+                    (entry_stat.st_mtime_ns, entry.name, key, entry_stat.st_size)
+                )
     except RuntimeError:
         raise
     except OSError as exc:
         raise RuntimeError(
             f"Failed while scanning native FS cache directory {base_path!r}: {exc}"
         ) from exc
+
+    bounded_root = os.path.join(base_path, _BOUNDED_PATH_VERSION)
+    if os.path.isdir(bounded_root):
+
+        def _raise_walk_error(exc: OSError) -> None:
+            raise RuntimeError(
+                f"Failed while scanning native FS cache directory {base_path!r}: {exc}"
+            ) from exc
+
+        for root, directories, filenames in os.walk(
+            bounded_root,
+            topdown=True,
+            onerror=_raise_walk_error,
+            followlinks=False,
+        ):
+            directories[:] = [
+                name
+                for name in directories
+                if not os.path.islink(os.path.join(root, name))
+            ]
+            for filename in filenames:
+                if not filename.endswith(_FILE_EXT):
+                    continue
+                path = os.path.join(root, filename)
+                try:
+                    file_stat = os.lstat(path)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Failed to stat native FS cache entry {path!r}: {exc}"
+                    ) from exc
+                if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size <= 0:
+                    ignored_data_count += 1
+                    if len(ignored_data_files) < _IGNORED_FILE_SAMPLE_LIMIT:
+                        ignored_data_files.append(path)
+                    continue
+                relative_path = Path(os.path.relpath(path, base_path))
+                key = _bounded_relative_path_to_object_key(relative_path)
+                if key is None:
+                    ignored_data_count += 1
+                    if len(ignored_data_files) < _IGNORED_FILE_SAMPLE_LIMIT:
+                        ignored_data_files.append(str(relative_path))
+                    continue
+                records.append(
+                    (
+                        file_stat.st_mtime_ns,
+                        relative_path.as_posix(),
+                        key,
+                        file_stat.st_size,
+                    )
+                )
 
     if ignored_data_count:
         logger.warning(

@@ -17,9 +17,11 @@ from lmcache.v1.distributed.config import EvictionConfig
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
     _object_key_to_filename,
+    _object_key_to_relative_path,
 )
 from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
     FSNativeL2AdapterConfig,
+    _scan_existing_key_sizes,
 )
 from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
     NativeConnectorL2Adapter,
@@ -168,6 +170,55 @@ def test_current_object_group_keys_match_python_filename(
         assert expected_path.read_bytes() == payload
     finally:
         client.close()
+
+
+def test_oversized_glm_key_survives_native_restart(tmp_path) -> None:
+    """Native FS stores and inventories the maximum supported tenant salt."""
+    LMCacheFSClient = _import_fs_client()
+    key = ObjectKey(
+        chunk_hash=bytes.fromhex("70f8501b00e17eb724cd5eb68e21c012" * 2),
+        model_name=(
+            "/model/snapshots/378ca54585c46542bad1f3cb3ed0d73ae51cdb62"
+            "##lmcache-dcp-layout-v1-d4-interleave4"
+        ),
+        kv_rank=0x04010401,
+        object_group_id=7,
+        cache_salt="tenant-" + "s" * 121,
+    )
+    wire_key = _object_key_to_string(key)
+    payload = bytearray(b"persistent-native-payload")
+    expected_path = tmp_path / _object_key_to_relative_path(key)
+
+    writer = LMCacheFSClient(str(tmp_path), 1)
+    try:
+        completion = _submit_and_wait(
+            writer, "submit_batch_set", wire_key, memoryview(payload)
+        )
+        assert completion[1], completion[2]
+    finally:
+        writer.close()
+
+    assert expected_path.read_bytes() == payload
+    assert all(
+        len(os.fsencode(component)) <= os.pathconf(tmp_path, "PC_NAME_MAX")
+        for component in expected_path.relative_to(tmp_path).parts
+    )
+    assert _scan_existing_key_sizes(str(tmp_path)) == {key: len(payload)}
+
+    reader = LMCacheFSClient(str(tmp_path), 1)
+    destination = bytearray(len(payload))
+    try:
+        exists_id = reader.submit_batch_exists([wire_key])
+        exists_completion = _wait_for_completion(reader, exists_id)
+        assert exists_completion[1], exists_completion[2]
+        assert exists_completion[3] == [True]
+        completion = _submit_and_wait(
+            reader, "submit_batch_get", wire_key, memoryview(destination)
+        )
+        assert completion[1], completion[2]
+        assert destination == payload
+    finally:
+        reader.close()
 
 
 def test_batch_set_reports_partial_results_and_continues(tmp_path) -> None:

@@ -94,6 +94,68 @@ std::string FSConnector::key_to_filename(const std::string& key) {
   return result;
 }
 
+std::string FSConnector::hex_encode(const std::string& value) {
+  static constexpr char HEX[] = "0123456789abcdef";
+  std::string encoded;
+  encoded.resize(value.size() * 2);
+  for (size_t index = 0; index < value.size(); ++index) {
+    const auto byte = static_cast<unsigned char>(value[index]);
+    encoded[2 * index] = HEX[byte >> 4];
+    encoded[2 * index + 1] = HEX[byte & 0x0f];
+  }
+  return encoded;
+}
+
+std::filesystem::path FSConnector::key_to_relative_path(
+    const std::string& key) {
+  const std::string legacy_filename = key_to_filename(key);
+  if (legacy_filename.size() <= LEGACY_FILENAME_MAX_BYTES) {
+    return legacy_filename;
+  }
+
+  std::vector<std::string> parts;
+  size_t start = 0;
+  for (size_t pos = 0; pos <= key.size(); ++pos) {
+    if (pos == key.size() || key[pos] == KEY_SEP) {
+      parts.emplace_back(key.substr(start, pos - start));
+      start = pos + 1;
+    }
+  }
+  if (parts.size() != 4 && parts.size() != 5) {
+    throw std::runtime_error(
+        "FSConnector: oversized keys require the current four- or five-field "
+        "ObjectKey encoding: " +
+        key);
+  }
+
+  const std::string model_hex = hex_encode(parts[0]);
+  const std::string salt_hex =
+      parts.size() == 5 ? hex_encode(parts[4]) : std::string();
+  const size_t model_count =
+      (model_hex.size() + ENCODED_COMPONENT_MAX_CHARS - 1) /
+      ENCODED_COMPONENT_MAX_CHARS;
+  const size_t salt_count =
+      (salt_hex.size() + ENCODED_COMPONENT_MAX_CHARS - 1) /
+      ENCODED_COMPONENT_MAX_CHARS;
+
+  std::filesystem::path relative_path = BOUNDED_PATH_VERSION;
+  relative_path /= "m" + std::to_string(model_count);
+  for (size_t offset = 0; offset < model_hex.size();
+       offset += ENCODED_COMPONENT_MAX_CHARS) {
+    relative_path /= model_hex.substr(offset, ENCODED_COMPONENT_MAX_CHARS);
+  }
+  relative_path /= "s" + std::to_string(salt_count);
+  for (size_t offset = 0; offset < salt_hex.size();
+       offset += ENCODED_COMPONENT_MAX_CHARS) {
+    relative_path /= salt_hex.substr(offset, ENCODED_COMPONENT_MAX_CHARS);
+  }
+
+  std::string leaf = "0x" + parts[1] + std::string(1, KEY_SEP) + parts[2] +
+                     std::string(1, KEY_SEP) + parts[3] + FILE_EXT;
+  relative_path /= leaf;
+  return relative_path;
+}
+
 // ---------------------------------------------------------------
 // read/write helpers
 // ---------------------------------------------------------------
@@ -166,6 +228,15 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
   // Create base directory
   std::filesystem::create_directories(base_path_);
 
+  errno = 0;
+  const long name_max = ::pathconf(base_path_.c_str(), _PC_NAME_MAX);
+  if ((name_max < 0 && errno != 0) ||
+      (name_max >= 0 &&
+       static_cast<size_t>(name_max) < LEGACY_FILENAME_MAX_BYTES)) {
+    throw std::runtime_error(
+        "FSConnector requires a filesystem NAME_MAX of at least 255 bytes");
+  }
+
   // Create tmp directory if configured
   if (!relative_tmp_dir_.empty()) {
     auto tmp_path = std::filesystem::path(base_path_) / relative_tmp_dir_;
@@ -199,8 +270,18 @@ WorkerFSConn FSConnector::create_connection() {
 
 void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
                                 void* buf, size_t len, size_t chunk_size) {
-  std::string filename = key_to_filename(key);
-  auto file_path = conn.base_path / filename;
+  const auto relative_path = key_to_relative_path(key);
+  auto file_path = conn.base_path / relative_path;
+  if (relative_path.has_parent_path()) {
+    std::error_code exists_ec;
+    if (!std::filesystem::exists(file_path, exists_ec)) {
+      const auto legacy_path = conn.base_path / key_to_filename(key);
+      exists_ec.clear();
+      if (std::filesystem::exists(legacy_path, exists_ec)) {
+        file_path = legacy_path;
+      }
+    }
+  }
 
   int flags = O_RDONLY;
   bool do_odirect = conn.use_odirect &&
@@ -247,12 +328,18 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
 void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
                                 const void* buf, size_t len,
                                 size_t chunk_size) {
-  std::string filename = key_to_filename(key);
-  auto file_path = conn.base_path / filename;
+  const auto relative_path = key_to_relative_path(key);
+  auto file_path = conn.base_path / relative_path;
 
   // Skip if already stored on disk
   if (std::filesystem::exists(file_path)) {
     return;
+  }
+  if (relative_path.has_parent_path()) {
+    std::error_code exists_ec;
+    const auto legacy_path = conn.base_path / key_to_filename(key);
+    if (std::filesystem::exists(legacy_path, exists_ec)) return;
+    std::filesystem::create_directories(file_path.parent_path());
   }
 
   const auto tmp_dir =
@@ -267,7 +354,7 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
   for (size_t attempt = 0; attempt < 1024; ++attempt) {
     const uint64_t id =
         next_temp_file_id.fetch_add(1, std::memory_order_relaxed);
-    tmp_path = tmp_dir / (filename + TMP_EXT + "." +
+    tmp_path = tmp_dir / (std::string(".lmcache-write") + TMP_EXT + "." +
                           std::to_string(static_cast<uint64_t>(::getpid())) +
                           "." + std::to_string(id));
     fd = ::open(tmp_path.c_str(), flags, 0644);
@@ -312,16 +399,24 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
 }
 
 bool FSConnector::do_single_exists(WorkerFSConn& conn, const std::string& key) {
-  std::string filename = key_to_filename(key);
-  auto file_path = conn.base_path / filename;
-  return std::filesystem::exists(file_path);
+  const auto relative_path = key_to_relative_path(key);
+  const auto file_path = conn.base_path / relative_path;
+  std::error_code exists_ec;
+  if (std::filesystem::exists(file_path, exists_ec)) return true;
+  if (!relative_path.has_parent_path()) return false;
+  exists_ec.clear();
+  return std::filesystem::exists(conn.base_path / key_to_filename(key),
+                                 exists_ec);
 }
 
 bool FSConnector::do_single_delete(WorkerFSConn& conn, const std::string& key) {
-  std::string filename = key_to_filename(key);
-  auto file_path = conn.base_path / filename;
+  const auto relative_path = key_to_relative_path(key);
+  auto file_path = conn.base_path / relative_path;
   std::error_code ec;
-  return std::filesystem::remove(file_path, ec);
+  if (std::filesystem::remove(file_path, ec)) return true;
+  if (!relative_path.has_parent_path()) return false;
+  ec.clear();
+  return std::filesystem::remove(conn.base_path / key_to_filename(key), ec);
 }
 
 }  // namespace connector

@@ -14,7 +14,9 @@ import pytest
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
+    _bounded_relative_path_to_object_key,
     _filename_to_object_key,
+    _object_key_to_relative_path,
     _object_key_to_filename,
 )
 
@@ -113,6 +115,25 @@ class TestFilenameRoundtrip:
         too_long_salt = "x" * 129
         fn = f"llama@0x0000002a@0@deadbeef@{too_long_salt}.data"
         assert _filename_to_object_key(fn) is None
+
+    def test_glm_long_key_uses_reversible_bounded_components(self):
+        """The production GLM identity supports a maximum-length tenant salt."""
+        key = ObjectKey(
+            chunk_hash=bytes.fromhex("70f8501b00e17eb724cd5eb68e21c012" * 2),
+            model_name=(
+                "/model/snapshots/378ca54585c46542bad1f3cb3ed0d73ae51cdb62"
+                "##lmcache-dcp-layout-v1-d4-interleave4"
+            ),
+            kv_rank=0x04010401,
+            object_group_id=7,
+            cache_salt="tenant-" + "s" * 121,
+        )
+
+        relative_path = _object_key_to_relative_path(key)
+
+        assert len(_object_key_to_filename(key).encode()) > 255
+        assert all(len(part.encode()) <= 200 for part in relative_path.parts)
+        assert _bounded_relative_path_to_object_key(relative_path) == key
 
 
 class TestIpcKeyToObjectKeys:

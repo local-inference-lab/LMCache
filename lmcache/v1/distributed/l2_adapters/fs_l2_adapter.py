@@ -3,9 +3,9 @@
 File-system based L2 adapter using aiofiles for async I/O.
 
 Stores KV cache objects as raw tensor bytes on disk (no metadata
-header). Each ObjectKey maps to a separate ``.data`` file. Names that
-fit the filesystem limit encode all key fields; oversized names use a
-deterministic digest of that encoding.
+header). Each ObjectKey maps to a separate ``.data`` file. Names that fit the
+filesystem component limit use the flat layout. Oversized names use bounded,
+reversible path components so restart inventory retains the complete key.
 """
 
 # Future
@@ -15,7 +15,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 import asyncio
-import hashlib
 import os
 import threading
 import uuid
@@ -60,6 +59,8 @@ _PATH_SLASH_REPLACEMENT = "-SEP-"
 _FILE_EXT = ".data"
 # Keep ObjectKey-to-filename mapping independent of local filesystem settings.
 _LEGACY_FILENAME_MAX_BYTES = 255
+_BOUNDED_PATH_VERSION = ".lmcache-objects-v1"
+_ENCODED_COMPONENT_MAX_CHARS = 200
 
 
 def _write_all(fd: int, buf: bytes | bytearray | memoryview) -> None:
@@ -166,8 +167,7 @@ def _filename_to_object_key(
     Accepts both the 4-field unsalted shape and the 5-field salted
     shape (trailing ``cache_salt``). Returns ``None`` for anything
     else. Since ``model_name`` is guaranteed not to contain ``@``,
-    plain ``split`` suffices — no marker, no rsplit. Digest filenames
-    used by ``FSL2Adapter`` for oversized keys are not reversible.
+    plain ``split`` suffices — no marker, no rsplit.
     """
     if not filename.endswith(_FILE_EXT):
         return None
@@ -199,6 +199,90 @@ def _filename_to_object_key(
             cache_salt=cache_salt,
         )
     except ValueError:
+        return None
+
+
+def _hex_path_components(value: str) -> list[str]:
+    """Encode a key field into bounded, path-safe components."""
+    encoded = value.encode("utf-8", errors="surrogatepass").hex()
+    return [
+        encoded[offset : offset + _ENCODED_COMPONENT_MAX_CHARS]
+        for offset in range(0, len(encoded), _ENCODED_COMPONENT_MAX_CHARS)
+    ]
+
+
+def _object_key_to_bounded_relative_path(key: ObjectKey) -> Path:
+    """Map an oversized ObjectKey to a reversible bounded relative path.
+
+    Model identity and tenant salt are preserved exactly so restart inventory
+    can reconstruct capacity and per-tenant accounting without a sidecar.
+    """
+    model_parts = _hex_path_components(key.model_name)
+    salt_parts = _hex_path_components(key.cache_salt)
+    leaf = (
+        f"{key.kv_rank:#010x}{_KEY_SEP}{key.object_group_id:x}"
+        f"{_KEY_SEP}{key.chunk_hash.hex()}{_FILE_EXT}"
+    )
+    return Path(
+        _BOUNDED_PATH_VERSION,
+        f"m{len(model_parts)}",
+        *model_parts,
+        f"s{len(salt_parts)}",
+        *salt_parts,
+        leaf,
+    )
+
+
+def _object_key_to_relative_path(key: ObjectKey) -> Path:
+    """Return a stable flat or bounded storage path for an ObjectKey."""
+    legacy_filename = _object_key_to_filename(key)
+    canonical_bytes = legacy_filename.encode("utf-8", errors="surrogatepass")
+    if len(canonical_bytes) <= _LEGACY_FILENAME_MAX_BYTES:
+        return Path(legacy_filename)
+    return _object_key_to_bounded_relative_path(key)
+
+
+def _bounded_relative_path_to_object_key(
+    relative_path: Path,
+) -> Optional[ObjectKey]:
+    """Decode the reversible bounded path shape into its ObjectKey."""
+    parts = relative_path.parts
+    if len(parts) < 4 or parts[0] != _BOUNDED_PATH_VERSION:
+        return None
+    try:
+        model_count = int(parts[1][1:]) if parts[1].startswith("m") else -1
+        model_start = 2
+        salt_marker = model_start + model_count
+        if model_count < 0 or salt_marker >= len(parts):
+            return None
+        salt_header = parts[salt_marker]
+        salt_count = int(salt_header[1:]) if salt_header.startswith("s") else -1
+        salt_start = salt_marker + 1
+        leaf_index = salt_start + salt_count
+        if salt_count < 0 or leaf_index != len(parts) - 1:
+            return None
+
+        model_name = bytes.fromhex("".join(parts[model_start:salt_marker])).decode(
+            "utf-8", errors="surrogatepass"
+        )
+        cache_salt = bytes.fromhex("".join(parts[salt_start:leaf_index])).decode(
+            "utf-8", errors="surrogatepass"
+        )
+        leaf = parts[leaf_index]
+        if not leaf.endswith(_FILE_EXT):
+            return None
+        key_parts = leaf[: -len(_FILE_EXT)].split(_KEY_SEP)
+        if len(key_parts) != 3:
+            return None
+        kv_rank_str, object_group_str, chunk_hash_hex = key_parts
+        return ObjectKey(
+            chunk_hash=bytes.fromhex(chunk_hash_hex),
+            model_name=model_name,
+            kv_rank=int(kv_rank_str, 16),
+            object_group_id=int(object_group_str, 16),
+            cache_salt=cache_salt,
+        )
+    except (UnicodeDecodeError, ValueError):
         return None
 
 
@@ -282,10 +366,9 @@ class FSL2Adapter(L2AdapterInterface):
     """
     File-system backed L2 adapter with async I/O via *aiofiles*.
 
-    Each file stores **only** the raw tensor bytes (no metadata
-    header), which gives maximum I/O throughput. Representable file
-    names encode the full ``ObjectKey``; oversized names use a stable
-    digest and are addressed again using the caller-supplied key.
+    Each file stores **only** the raw tensor bytes (no metadata header), which
+    gives maximum I/O throughput. Representable file names encode the complete
+    ``ObjectKey``; oversized names use a reversible bounded path.
 
     Thread safety is ensured via a lock for shared bookkeeping
     and an asyncio event loop running on a dedicated daemon
@@ -555,7 +638,7 @@ class FSL2Adapter(L2AdapterInterface):
         return tid
 
     def _key_to_path(self, key: ObjectKey) -> Path:
-        return self._base_path / self._key_to_filename(key)
+        return self._base_path / _object_key_to_relative_path(key)
 
     async def _key_exists_on_disk(
         self,
@@ -578,22 +661,18 @@ class FSL2Adapter(L2AdapterInterface):
         ``FSConnector._get_file_and_tmp_path``).  Otherwise a
         ``.tmp`` suffix is used.
         """
-        fname = self._key_to_filename(key)
-        final = self._base_path / fname
+        relative_path = _object_key_to_relative_path(key)
+        final = self._base_path / relative_path
+        final.parent.mkdir(parents=True, exist_ok=True)
         if self._relative_tmp_dir is not None:
             tmp_dir = self._base_path / self._relative_tmp_dir
         else:
-            tmp_dir = self._base_path
-        tmp = tmp_dir / f"{fname}.tmp"
+            tmp_dir = final.parent
+        # The caller appends a PID and UUID. Keep the temporary basename
+        # independent of the final key so a valid 255-byte legacy name cannot
+        # overflow the same filesystem's component limit during publication.
+        tmp = tmp_dir / ".lmcache-write.tmp"
         return final, tmp
-
-    def _key_to_filename(self, key: ObjectKey) -> str:
-        legacy_filename = _object_key_to_filename(key)
-        canonical_bytes = legacy_filename.encode("utf-8", errors="surrogatepass")
-        if len(canonical_bytes) <= _LEGACY_FILENAME_MAX_BYTES:
-            return legacy_filename
-        digest = hashlib.sha256(canonical_bytes).hexdigest()
-        return f"{digest}{_FILE_EXT}"
 
     # ---- O_DIRECT helpers -----------------------------------------------
 
