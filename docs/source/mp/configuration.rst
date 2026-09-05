@@ -20,6 +20,13 @@ Source: ``lmcache/v1/multiprocess/config.py``
    * - Argument
      - Default
      - Description
+   * - ``--cpu-only``
+     - ``False``
+     - Re-exec the standalone server with CUDA devices hidden before server
+       modules initialize. This prevents the server process from creating an
+       accelerator context or reserving VRAM; engine workers retain their own
+       device visibility because the environment change is process-local.
+       Requires ``--supported-transfer-mode engine_driven``.
    * - ``--instance-id``
      - *(unset, default UUID v4)*
      - Stable identity of this MP server. Used as the coordinator
