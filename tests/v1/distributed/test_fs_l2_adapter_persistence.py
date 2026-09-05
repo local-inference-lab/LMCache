@@ -222,6 +222,60 @@ def test_oversized_numeric_fields_use_bounded_components(tmp_path: Path) -> None
     assert _bounded_relative_path_to_object_key(relative_path) == key
 
 
+def test_empty_chunk_hash_round_trips_through_split_layout(tmp_path: Path) -> None:
+    """A split bounded path preserves an empty chunk hash across restart."""
+    key = ObjectKey(
+        chunk_hash=b"",
+        model_name="org/model",
+        kv_rank=1 << 4096,
+        object_group_id=7,
+        cache_salt="tenant-a",
+    )
+    relative_path = _object_key_to_relative_path(key)
+
+    assert "h0" in relative_path.parts
+    assert _bounded_relative_path_to_object_key(relative_path) == key
+
+    payload = b"empty-hash payload"
+    adapter = FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
+    try:
+        _wait_for_store(adapter, key, payload)
+        assert _wait_for_load(adapter, key, len(payload)) == payload
+    finally:
+        adapter.close()
+
+
+def test_store_rejects_object_path_at_path_max(tmp_path: Path) -> None:
+    """An unrepresentable complete path fails before creating directories."""
+    path_max = os.pathconf(tmp_path, "PC_PATH_MAX")
+    if path_max < 0:
+        pytest.skip("filesystem reports no fixed PC_PATH_MAX")
+    key = ObjectKey(
+        chunk_hash=b"hash",
+        model_name="m" * (path_max // 2 + 128),
+        kv_rank=0,
+    )
+    full_path = tmp_path / _object_key_to_relative_path(key)
+    assert len(os.fsencode(full_path)) >= path_max
+
+    adapter = FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
+    try:
+        task_id = adapter.submit_store_task([key], [_memory_obj(b"payload")])
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            result = adapter.pop_completed_store_tasks().get(task_id)
+            if result is not None:
+                assert result == L2StoreResult(False, 0)
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("rejected store did not complete within 5s")
+        assert list(tmp_path.rglob("*.data")) == []
+        assert not (tmp_path / ".lmcache-objects-v1").exists()
+    finally:
+        adapter.close()
+
+
 def test_python_adapter_reads_and_deletes_oversized_legacy_file(
     tmp_path: Path,
 ) -> None:
@@ -276,10 +330,16 @@ def test_path_does_not_depend_on_local_name_max(tmp_path: Path) -> None:
     key = _long_key(salt_suffix="a")
     relative_paths = []
 
+    real_pathconf = os.pathconf
     for dirname, name_max in (("standard", 255), ("large", 512)):
         base_path = tmp_path / dirname
         base_path.mkdir()
-        with patch("os.pathconf", return_value=name_max):
+        with patch(
+            "os.pathconf",
+            side_effect=lambda path, name, name_max=name_max: (
+                name_max if name == "PC_NAME_MAX" else real_pathconf(path, name)
+            ),
+        ):
             adapter = FSL2Adapter(FSL2AdapterConfig(base_path=str(base_path)))
         try:
             _wait_for_store(adapter, key, b"payload")
