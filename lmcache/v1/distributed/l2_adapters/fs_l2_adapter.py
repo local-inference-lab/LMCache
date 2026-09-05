@@ -305,17 +305,13 @@ def _bounded_relative_path_to_object_key(
             if rank_count <= 0 or group_marker >= len(parts):
                 return None
             group_header = parts[group_marker]
-            group_count = (
-                int(group_header[1:]) if group_header.startswith("g") else -1
-            )
+            group_count = int(group_header[1:]) if group_header.startswith("g") else -1
             group_start = group_marker + 1
             hash_marker = group_start + group_count
             if group_count <= 0 or hash_marker >= len(parts):
                 return None
             hash_header = parts[hash_marker]
-            hash_count = (
-                int(hash_header[1:]) if hash_header.startswith("h") else -1
-            )
+            hash_count = int(hash_header[1:]) if hash_header.startswith("h") else -1
             hash_start = hash_marker + 1
             leaf_index = hash_start + hash_count
             if (

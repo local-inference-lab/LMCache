@@ -16,8 +16,8 @@ from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
     _bounded_relative_path_to_object_key,
     _filename_to_object_key,
-    _object_key_to_relative_path,
     _object_key_to_filename,
+    _object_key_to_relative_path,
 )
 
 

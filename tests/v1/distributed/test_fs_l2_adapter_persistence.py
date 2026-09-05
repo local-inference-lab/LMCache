@@ -192,8 +192,7 @@ def test_oversized_chunk_hash_uses_bounded_components(tmp_path: Path) -> None:
     relative_path = _object_key_to_relative_path(key)
     name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
     assert all(
-        len(os.fsencode(component)) <= name_max
-        for component in relative_path.parts
+        len(os.fsencode(component)) <= name_max for component in relative_path.parts
     )
     assert _bounded_relative_path_to_object_key(relative_path) == key
 
@@ -218,8 +217,7 @@ def test_oversized_numeric_fields_use_bounded_components(tmp_path: Path) -> None
     relative_path = _object_key_to_relative_path(key)
     name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
     assert all(
-        len(os.fsencode(component)) <= name_max
-        for component in relative_path.parts
+        len(os.fsencode(component)) <= name_max for component in relative_path.parts
     )
     assert _bounded_relative_path_to_object_key(relative_path) == key
 
