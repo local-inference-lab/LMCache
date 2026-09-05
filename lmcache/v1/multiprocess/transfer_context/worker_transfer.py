@@ -128,7 +128,10 @@ def _drop_skipped_chunks(
     if blocks_in_chunk < 1 or len(block_ids) != num_chunks * blocks_in_chunk:
         return chunks, block_ids, 0
     skipped = [
-        any(bid < 0 for bid in block_ids[i * blocks_in_chunk : (i + 1) * blocks_in_chunk])
+        any(
+            bid < 0
+            for bid in block_ids[i * blocks_in_chunk : (i + 1) * blocks_in_chunk]
+        )
         for i in range(num_chunks)
     ]
     dropped = 0
@@ -1337,7 +1340,8 @@ class EngineDrivenTransferContext(TransferContext):
                     transfer_kv_caches, group_block_ids = self._group_transfer_inputs(
                         state, key, kv_caches, kept_ids, start_token_idx=group_start
                     )
-                    if group_skip == 0:
+                    physical_skip = self._physical_skip_tokens(state, group_skip)
+                    if physical_skip == 0:
                         compact_chunks, compact_block_ids = (
                             _collapse_chunks_for_single_destination(
                                 chunks,
@@ -1360,9 +1364,7 @@ class EngineDrivenTransferContext(TransferContext):
                         group_block_ids,
                         chunks,
                         state.blocks_in_chunk,
-                        skip_first_n_tokens=self._physical_skip_tokens(
-                            state, group_skip
-                        ),
+                        skip_first_n_tokens=physical_skip,
                         layout_hints=self._layout_hints,
                         engine_kv_format=state.engine_kv_format,
                         blocks_per_window=state.blocks_per_window,
@@ -1415,7 +1417,8 @@ class EngineDrivenTransferContext(TransferContext):
                     transfer_kv_caches, group_block_ids = self._group_transfer_inputs(
                         state, key, kv_caches, kept_ids, start_token_idx=group_start
                     )
-                    if group_skip == 0:
+                    physical_skip = self._physical_skip_tokens(state, group_skip)
+                    if physical_skip == 0:
                         src_g, group_block_ids = (
                             _collapse_chunks_for_single_destination(
                                 src_g,
@@ -1429,9 +1432,7 @@ class EngineDrivenTransferContext(TransferContext):
                         group_block_ids,
                         src_g,
                         state.blocks_in_chunk,
-                        skip_first_n_tokens=self._physical_skip_tokens(
-                            state, group_skip
-                        ),
+                        skip_first_n_tokens=physical_skip,
                         layout_hints=self._layout_hints,
                         engine_kv_format=state.engine_kv_format,
                         blocks_per_window=state.blocks_per_window,

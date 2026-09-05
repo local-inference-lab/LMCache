@@ -18,6 +18,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Mapping
+from math import gcd
 from typing import TypeAlias
 
 # Third Party
@@ -353,11 +354,13 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
 
     vLLM registers each recurrent layer as one opaque byte tensor with shape
     ``[num_blocks, 1, 1, page_elements]``. LMCache transfer kernels require a
-    token-block axis, so the edit splits ``page_elements`` across the logical
-    block size without copying or interpreting the recurrent-state bytes.
+    slot axis, so the edit factors ``page_elements`` into physical slots without
+    copying or interpreting the recurrent-state bytes. The slot count is the
+    greatest common divisor of the page element count and logical block size.
+    ``EngineGroupInfo.tokens_per_block`` retains the logical token span.
 
-    NHD produces ``[num_blocks, block_size, 1, head_size]`` and HND produces
-    ``[num_blocks, 1, block_size, head_size]``. The singleton head dimension
+    NHD produces ``[num_blocks, slots, 1, head_size]`` and HND produces
+    ``[num_blocks, 1, slots, head_size]``. The singleton head dimension
     and derived head size are addressing metadata, not attention semantics.
     """
 
@@ -394,17 +397,18 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
                 f"Mamba spec declares {spec.page_size_bytes} bytes"
             )
         page_elements = kv_cache.shape[-1]
-        if page_elements % spec.block_size:
+        if page_elements <= 0 or spec.block_size <= 0:
             raise ValueError(
-                f"recurrent page has {page_elements} elements, which is not "
-                f"divisible by block_size={spec.block_size}"
+                "recurrent page element count and logical block size must be positive"
             )
+        slots = gcd(page_elements, spec.block_size)
+        head_size = page_elements // slots
 
         kv_layout = layout_hints.get("kv_layout")
         if kv_layout == "NHD":
-            return kv_cache.view(kv_cache.shape[0], spec.block_size, 1, -1)
+            return kv_cache.view(kv_cache.shape[0], slots, 1, head_size)
         if kv_layout == "HND":
-            return kv_cache.view(kv_cache.shape[0], 1, spec.block_size, -1)
+            return kv_cache.view(kv_cache.shape[0], 1, slots, head_size)
         raise ValueError(
             f"unsupported vLLM KV layout {kv_layout!r}; expected 'NHD' or 'HND'"
         )
