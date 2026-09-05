@@ -23,6 +23,9 @@ from lmcache.v1.distributed.config import (
     add_storage_manager_args,
     parse_args_to_config,
 )
+from lmcache.v1.distributed.memory_manager.l1_memory_manager import (
+    _unlink_stale_shm,
+)
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.config import (
     ObservabilityConfig,
@@ -72,6 +75,26 @@ from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.isolated_ipc import set_isolated_ipc
 
 logger = init_logger(__name__)
+
+
+def _unlink_configured_l1_shm(shm_name: str) -> None:
+    """Remove the exact named L1 pool before measuring available capacity.
+
+    The L1 memory manager performs the same cleanup immediately before it
+    creates the pool. Doing it before the capacity check makes ``disk_usage``
+    authoritative: an unused stale object releases its actual allocated pages,
+    while an object still mapped by another process remains charged to tmpfs.
+    """
+    bare = shm_name.lstrip("/")
+    if not bare.startswith("lmcache_l1_pool_"):
+        bare = f"lmcache_l1_pool_{bare}"
+    _unlink_stale_shm(bare)
+
+
+def _available_l1_shm_bytes_after_cleanup(shm_name: str) -> int:
+    """Return tmpfs capacity after removing the replaceable named pool."""
+    _unlink_configured_l1_shm(shm_name)
+    return shutil.disk_usage("/dev/shm").free
 
 
 class MPCacheServer:
@@ -375,7 +398,7 @@ def run_cache_server(
         if mem_cfg.shm_name and sys.platform.startswith("linux"):
             logger.info("Checking if shm capacity is larger than L1 request")
             try:
-                free_bytes = shutil.disk_usage("/dev/shm").free
+                free_bytes = _available_l1_shm_bytes_after_cleanup(mem_cfg.shm_name)
                 if free_bytes < mem_cfg.size_in_bytes:
                     logger.warning(
                         "Insufficient /dev/shm capacity: need %d bytes, have %d bytes. "
