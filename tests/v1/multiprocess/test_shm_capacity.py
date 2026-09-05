@@ -3,11 +3,13 @@
 
 # Standard
 from types import SimpleNamespace
+from typing import cast
 
 # Third Party
 import pytest
 
 # First Party
+from lmcache.v1.distributed.config import L1MemoryManagerConfig
 from lmcache.v1.multiprocess import server
 
 
@@ -81,3 +83,37 @@ def test_available_l1_shm_bytes_is_measured_after_cleanup(
 
     assert available == 70 * 1024**3
     assert calls == ["unlink:restart-test", "usage:/dev/shm"]
+
+
+@pytest.mark.parametrize(
+    ("use_lazy", "devdax_path"),
+    [(True, None), (False, "/dev/dax0.0")],
+)
+def test_non_posix_l1_modes_do_not_unlink_named_shm(
+    monkeypatch: pytest.MonkeyPatch,
+    use_lazy: bool,
+    devdax_path: str | None,
+) -> None:
+    """Restart cleanup is limited to configurations that replace POSIX SHM."""
+    calls: list[str] = []
+
+    def _available(shm_name: str) -> int:
+        calls.append(shm_name)
+        return 1
+
+    monkeypatch.setattr(
+        server,
+        "_available_l1_shm_bytes_after_cleanup",
+        _available,
+    )
+    mem_cfg = cast(
+        L1MemoryManagerConfig,
+        SimpleNamespace(
+            shm_name="pool-owned-by-another-process",
+            use_lazy=use_lazy,
+            devdax_path=devdax_path,
+        ),
+    )
+
+    assert server._available_configured_l1_shm_bytes(mem_cfg) is None
+    assert calls == []
