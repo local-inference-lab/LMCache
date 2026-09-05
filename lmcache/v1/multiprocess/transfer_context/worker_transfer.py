@@ -30,8 +30,10 @@ from lmcache.v1.multiprocess.protocols.engine import RegisterEngineDrivenContext
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
+    PagedKVTransferWorkspace,
     compute_kv_layout,
     create_engine_driven_context,
+    create_paged_kv_transfer_workspace,
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
@@ -206,6 +208,7 @@ class _EngineDrivenWorkerGroup:
     layout: EngineDrivenGroupLayout
     layer_names: tuple[str, ...]
     engine_kv_format: Any
+    transfer_workspace: PagedKVTransferWorkspace | None = None
 
 
 def _validate_group_block_ids(
@@ -804,6 +807,10 @@ class EngineDrivenTransferContext(TransferContext):
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
         self._worker_groups: tuple[_EngineDrivenWorkerGroup, ...] = ()
+        # Synchronous transfers need one staging slot. Async subclasses set
+        # this to their maximum number of concurrent gather workers before
+        # register() creates the per-group transfer workspaces.
+        self._transfer_workspace_slot_count = 1
 
     def _gather_group_payloads(
         self,
@@ -811,6 +818,7 @@ class EngineDrivenTransferContext(TransferContext):
         block_ids: list[list[int]],
         out_buffers: list[list[torch.Tensor]] | None = None,
         group_chunk_indices: list[list[int]] | None = None,
+        transfer_workspace_slot: int = 0,
     ) -> list[list[torch.Tensor]]:
         """Gather every registered object group in protocol order."""
         num_chunks = _validate_group_block_ids(self._worker_groups, block_ids)
@@ -832,17 +840,25 @@ class EngineDrivenTransferContext(TransferContext):
                 chunk_idx < 0 or chunk_idx >= num_chunks for chunk_idx in indices
             ):
                 raise ValueError(f"group {group_idx} has invalid chunk indices")
+            gather_kwargs: dict[str, Any] = {
+                "layout_hints": self._layout_hints,
+                "engine_kv_format": group.engine_kv_format,
+                "out": (out_buffers[group_idx] if out_buffers is not None else None),
+                "chunk_indices": indices,
+                "blocks_per_window": group.layout.blocks_per_window,
+                "group_idx": group.layout.object_group_id,
+            }
+            if group.transfer_workspace is not None:
+                gather_kwargs.update(
+                    transfer_workspace=group.transfer_workspace,
+                    transfer_workspace_slot=transfer_workspace_slot,
+                )
             payloads.append(
                 gather_paged_kv_to_cpu(
                     {name: kv_caches[name] for name in group.layer_names},
                     block_ids[group_idx],
                     group.layout.blocks_per_chunk,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=group.engine_kv_format,
-                    out=(out_buffers[group_idx] if out_buffers is not None else None),
-                    chunk_indices=indices,
-                    blocks_per_window=group.layout.blocks_per_window,
-                    group_idx=group.layout.object_group_id,
+                    **gather_kwargs,
                 )
             )
         return payloads
@@ -1118,6 +1134,17 @@ class EngineDrivenTransferContext(TransferContext):
                         layout=layout,
                         layer_names=tuple(layer_names[idx] for idx in indices),
                         engine_kv_format=group_format,
+                        transfer_workspace=(
+                            create_paged_kv_transfer_workspace(
+                                group_kv,
+                                max_block_ids=4 * blocks_per_window,
+                                num_slots=self._transfer_workspace_slot_count,
+                                layout_hints=layout_hints,
+                                engine_kv_format=group_format,
+                            )
+                            if get_device(list(group_kv.values())).type == "cuda"
+                            else None
+                        ),
                     )
                 )
             self._worker_groups = tuple(worker_groups)
