@@ -1181,7 +1181,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return
 
         tracker = self._get_or_create_request_tracker(request)
-        lookup_token_ids = list(request.all_token_ids)
+        lookup_token_ids = tracker.get_token_ids()
         if self._has_recurrent_cache:
             lookup_token_ids = lookup_token_ids[
                 : _recurrent_safe_lookup_end(
