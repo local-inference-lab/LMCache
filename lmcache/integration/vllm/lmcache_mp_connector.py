@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import enum
+import hashlib
 import math
 import sys
 
@@ -48,7 +49,11 @@ from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
     effective_tokens_per_block,
 )
-from lmcache.integration.vllm.utils import mla_enabled, vllm_layout_hints
+from lmcache.integration.vllm.utils import (
+    extract_mm_features,
+    mla_enabled,
+    vllm_layout_hints,
+)
 from lmcache.utils import init_logger as lmcache_init_logger
 from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
 
@@ -100,6 +105,102 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+
+MM_KEY_TOKEN_FLAG = 1 << 40
+"""Bit set on every key token that stands in for a multimodal placeholder.
+No tokenizer vocabulary reaches 2**40, so a prompt with an image can never
+produce the same key tokens as a text-only prompt."""
+
+_MM_KEY_WORD_BYTES = 4
+
+
+def multimodal_key_tokens(identifier: str, length: int) -> list[int]:
+    """Key tokens standing in for one multimodal item's placeholder range.
+
+    vLLM fills the placeholder positions of every image with the same
+    ``<|media_pad|>``-style token id, so two images of equal size at the same
+    prompt position tokenize identically. The KV cache computed for those
+    positions depends on the image content, so cache keys must too: the
+    returned tokens spread the SHA-256 of the item's content identifier
+    (vLLM's ``MultiModalFeatureSpec.identifier``) over the range, eight 32-bit
+    words repeated, each tagged with :data:`MM_KEY_TOKEN_FLAG`. Every full
+    256-bit identifier is covered within the first eight positions; shorter
+    ranges keep a prefix of it.
+    """
+    if length <= 0:
+        return []
+    digest = hashlib.sha256(identifier.encode("utf-8")).digest()
+    words = [
+        MM_KEY_TOKEN_FLAG | int.from_bytes(digest[i : i + _MM_KEY_WORD_BYTES], "big")
+        for i in range(0, len(digest), _MM_KEY_WORD_BYTES)
+    ]
+    return [words[i % len(words)] for i in range(length)]
+
+
+class MultimodalKeyTokenIds(Sequence[int]):
+    """Read-only view of a request's token ids used for LMCache keys.
+
+    Positions covered by a multimodal placeholder yield
+    :func:`multimodal_key_tokens` of the item instead of the placeholder id;
+    every other position yields the request's own token id. The view follows
+    the underlying (growing) token list, so generated tokens appear as they
+    are appended. Without multimodal items it is a plain pass-through.
+    """
+
+    __slots__ = ("_token_ids", "_spans")
+
+    def __init__(
+        self,
+        token_ids: "ConstantList[int] | Sequence[int]",
+        mm_hashes: Sequence[str] = (),
+        mm_positions: Sequence[Any] = (),
+    ) -> None:
+        self._token_ids = token_ids
+        spans: list[tuple[int, int, list[int]]] = []
+        for identifier, position in zip(mm_hashes, mm_positions, strict=True):
+            start = int(position.offset)
+            length = int(position.length)
+            if length <= 0:
+                continue
+            key_tokens = multimodal_key_tokens(identifier, length)
+            spans.append((start, start + length, key_tokens))
+        spans.sort(key=lambda span: span[0])
+        self._spans = tuple(spans)
+
+    @property
+    def has_multimodal_items(self) -> bool:
+        return bool(self._spans)
+
+    def __len__(self) -> int:
+        return len(self._token_ids)
+
+    def _overlay(self, ids: list[int], start: int, stop: int) -> list[int]:
+        """Replace the placeholder positions of ``ids`` (= tokens[start:stop])."""
+        for span_start, span_stop, values in self._spans:
+            lo = max(span_start, start)
+            hi = min(span_stop, stop)
+            if lo >= hi:
+                continue
+            ids[lo - start : hi - start] = values[lo - span_start : hi - span_start]
+        return ids
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            if step != 1:
+                return [self[i] for i in range(start, stop, step)]
+            ids = list(self._token_ids[start:stop])
+            return self._overlay(ids, start, start + len(ids))
+        if index < 0:
+            index += len(self)
+        for span_start, span_stop, values in self._spans:
+            if span_start <= index < span_stop:
+                return values[index - span_start]
+        return self._token_ids[index]
+
+    def __iter__(self):
+        return iter(self[0 : len(self)])
 
 
 # Helper functions
@@ -248,8 +349,8 @@ class LMCacheMPRequestTracker:
 
     request_id: str
 
-    # Read-only list to track the token ids
-    all_token_ids: ConstantList[int]
+    # Read-only view of the token ids as used for cache keys
+    all_token_ids: MultimodalKeyTokenIds
 
     # Block ids will be updated at update_states_after_alloc and
     # during generation. Keyed by engine_group_idx; non-HMA models use 0.
@@ -276,7 +377,13 @@ class LMCacheMPRequestTracker:
     def __init__(self, request: "Request"):
         self.request_id = request.request_id
         self.cache_salt: str = request.cache_salt or ""
-        self.all_token_ids = request.all_token_ids
+        # Every LMCache key this tracker emits (lookup, retrieve, store, lock
+        # release, allocation records) derives from this view, so multimodal
+        # placeholder positions carry the item's content identity.
+        mm_hashes, mm_positions = extract_mm_features(request)
+        self.all_token_ids = MultimodalKeyTokenIds(
+            request.all_token_ids, mm_hashes, mm_positions
+        )
         self.allocated_block_ids = {}
         self.num_stored_tokens = 0
         self.num_vllm_hit_tokens = 0
@@ -1065,7 +1172,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if request.status == RequestStatus.PREEMPTED:
             return 0, False
 
-        lookup_token_ids = list(request.all_token_ids)
+        lookup_token_ids = list(tracker.all_token_ids)
         if self._has_recurrent_cache:
             safe_end = _recurrent_safe_lookup_end(
                 len(lookup_token_ids),
