@@ -1871,6 +1871,39 @@ def test_engine_context_shm_pool_info(
     assert ctx.shm_pool_info == expected_pool_info
 
 
+def test_engine_driven_status_reports_transfer_pool(
+    stub_lmcache_native: Any,
+) -> None:
+    """Status distinguishes the direct SHM transport from pickle fallback."""
+    # First Party
+    from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
+    from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
+        EngineDrivenTransferModule,
+    )
+
+    with patch(
+        "lmcache.v1.distributed.config.current_device_spec",
+        MagicMock(is_pin_supported=True),
+    ):
+        config = _make_storage_manager_config(
+            shm_name="ds4-transfer", pool_size=4096, use_lazy=False
+        )
+
+    with (
+        patch("lmcache.v1.multiprocess.engine_context.StorageManager"),
+        patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
+        patch("lmcache.v1.multiprocess.engine_context.SessionManager"),
+        patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
+    ):
+        ctx = MPCacheServerContext(storage_manager_config=config, chunk_size=16)
+
+    status = EngineDrivenTransferModule(ctx).report_status()
+    assert status["engine_driven_shm_pool"] == {
+        "shm_name": "lmcache_l1_pool_ds4-transfer",
+        "pool_size": 4096,
+    }
+
+
 def test_server_register_and_find_non_cuda_context_layout(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
