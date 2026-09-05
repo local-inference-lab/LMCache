@@ -17,9 +17,11 @@ from lmcache.v1.distributed.config import EvictionConfig
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
     _object_key_to_filename,
+    _object_key_to_relative_path,
 )
 from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
     FSNativeL2AdapterConfig,
+    _scan_existing_key_sizes,
 )
 from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
     NativeConnectorL2Adapter,
@@ -166,6 +168,166 @@ def test_current_object_group_keys_match_python_filename(
         assert completion[1], completion[2]
         expected_path = tmp_path / _object_key_to_filename(key)
         assert expected_path.read_bytes() == payload
+    finally:
+        client.close()
+
+
+def test_native_connector_rejects_negative_kv_rank(tmp_path) -> None:
+    """Native wire input enforces the non-negative ObjectKey rank invariant."""
+    LMCacheFSClient = _import_fs_client()
+    client = LMCacheFSClient(str(tmp_path), 1)
+    try:
+        completion = _submit_and_wait(
+            client,
+            "submit_batch_set",
+            "model@-0000001@0@78",
+            memoryview(bytearray(b"payload")),
+        )
+        assert completion[1] is False
+        assert "kv_rank must be non-negative" in completion[2]
+        assert list(tmp_path.rglob("*.data")) == []
+    finally:
+        client.close()
+
+
+def test_oversized_glm_key_survives_native_restart(tmp_path) -> None:
+    """Native FS stores and inventories the maximum supported tenant salt."""
+    LMCacheFSClient = _import_fs_client()
+    key = ObjectKey(
+        chunk_hash=bytes.fromhex("70f8501b00e17eb724cd5eb68e21c012" * 2),
+        model_name=(
+            "/model/snapshots/378ca54585c46542bad1f3cb3ed0d73ae51cdb62"
+            "##lmcache-dcp-layout-v1-d4-interleave4"
+        ),
+        kv_rank=0x04010401,
+        object_group_id=7,
+        cache_salt="tenant-" + "s" * 121,
+    )
+    wire_key = _object_key_to_string(key)
+    payload = bytearray(b"persistent-native-payload")
+    expected_path = tmp_path / _object_key_to_relative_path(key)
+
+    writer = LMCacheFSClient(str(tmp_path), 1)
+    try:
+        completion = _submit_and_wait(
+            writer, "submit_batch_set", wire_key, memoryview(payload)
+        )
+        assert completion[1], completion[2]
+    finally:
+        writer.close()
+
+    assert expected_path.read_bytes() == payload
+    assert all(
+        len(os.fsencode(component)) <= os.pathconf(tmp_path, "PC_NAME_MAX")
+        for component in expected_path.relative_to(tmp_path).parts
+    )
+    assert _scan_existing_key_sizes(str(tmp_path)) == {key: len(payload)}
+
+    reader = LMCacheFSClient(str(tmp_path), 1)
+    destination = bytearray(len(payload))
+    try:
+        exists_id = reader.submit_batch_exists([wire_key])
+        exists_completion = _wait_for_completion(reader, exists_id)
+        assert exists_completion[1], exists_completion[2]
+        assert exists_completion[3] == [True]
+        completion = _submit_and_wait(
+            reader, "submit_batch_get", wire_key, memoryview(destination)
+        )
+        assert completion[1], completion[2]
+        assert destination == payload
+    finally:
+        reader.close()
+
+
+def test_native_connector_bounds_long_chunk_hash(tmp_path) -> None:
+    """The C++ and Python encoders agree for a 128-byte chunk hash."""
+    LMCacheFSClient = _import_fs_client()
+    key = ObjectKey(
+        chunk_hash=bytes(range(128)),
+        model_name="org/model",
+        kv_rank=0x01020304,
+        object_group_id=7,
+        cache_salt="tenant-a",
+    )
+    expected_path = tmp_path / _object_key_to_relative_path(key)
+    payload = bytearray(b"long-native-hash")
+
+    writer = LMCacheFSClient(str(tmp_path), 1)
+    try:
+        completion = _submit_and_wait(
+            writer,
+            "submit_batch_set",
+            _object_key_to_string(key),
+            memoryview(payload),
+        )
+        assert completion[1], completion[2]
+    finally:
+        writer.close()
+
+    assert expected_path.read_bytes() == payload
+    assert all(
+        len(os.fsencode(component)) <= os.pathconf(tmp_path, "PC_NAME_MAX")
+        for component in expected_path.relative_to(tmp_path).parts
+    )
+    assert _scan_existing_key_sizes(str(tmp_path)) == {key: len(payload)}
+
+
+def test_native_connector_preserves_empty_hash_in_split_layout(tmp_path) -> None:
+    """Native storage and restart inventory agree on a split empty hash."""
+    LMCacheFSClient = _import_fs_client()
+    key = ObjectKey(
+        chunk_hash=b"",
+        model_name="org/model",
+        kv_rank=1 << 4096,
+        object_group_id=7,
+        cache_salt="tenant-a",
+    )
+    expected_path = tmp_path / _object_key_to_relative_path(key)
+    assert "h0" in expected_path.parts
+    payload = bytearray(b"empty-native-hash")
+
+    writer = LMCacheFSClient(str(tmp_path), 1)
+    try:
+        completion = _submit_and_wait(
+            writer,
+            "submit_batch_set",
+            _object_key_to_string(key),
+            memoryview(payload),
+        )
+        assert completion[1], completion[2]
+    finally:
+        writer.close()
+
+    assert expected_path.read_bytes() == payload
+    assert _scan_existing_key_sizes(str(tmp_path)) == {key: len(payload)}
+
+
+def test_native_connector_rejects_object_path_at_path_max(tmp_path) -> None:
+    """Native storage rejects an overlong complete path before filesystem I/O."""
+    LMCacheFSClient = _import_fs_client()
+    path_max = os.pathconf(tmp_path, "PC_PATH_MAX")
+    if path_max < 0:
+        pytest.skip("filesystem reports no fixed PC_PATH_MAX")
+    key = ObjectKey(
+        chunk_hash=b"hash",
+        model_name="m" * (path_max // 2 + 128),
+        kv_rank=0,
+    )
+    full_path = tmp_path / _object_key_to_relative_path(key)
+    assert len(os.fsencode(full_path)) >= path_max
+
+    client = LMCacheFSClient(str(tmp_path), 1)
+    try:
+        completion = _submit_and_wait(
+            client,
+            "submit_batch_set",
+            _object_key_to_string(key),
+            memoryview(bytearray(b"payload")),
+        )
+        assert completion[1] is False
+        assert "PATH_MAX" in completion[2]
+        assert list(tmp_path.rglob("*.data")) == []
+        assert not (tmp_path / ".lmcache-objects-v1").exists()
     finally:
         client.close()
 

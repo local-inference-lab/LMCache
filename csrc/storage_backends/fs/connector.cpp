@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "connector.h"
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -10,6 +11,54 @@
 
 namespace {
 std::atomic<uint64_t> next_temp_file_id{0};
+
+size_t query_path_limit(const std::filesystem::path& path, int selector,
+                        const char* limit_name) {
+  errno = 0;
+  const long limit = ::pathconf(path.c_str(), selector);
+  if (limit < 0) {
+    if (errno == 0) return 0;
+    throw std::runtime_error("FSConnector failed to query " +
+                             std::string(limit_name) + " for " + path.string() +
+                             ": " + strerror(errno));
+  }
+  return static_cast<size_t>(limit);
+}
+
+size_t minimum_finite_limit(size_t first, size_t second) {
+  if (first == 0) return second;
+  if (second == 0) return first;
+  return std::min(first, second);
+}
+
+bool path_is_representable(const std::filesystem::path& path, size_t name_max,
+                           size_t path_max) {
+  if (path_max > 0 && path.native().size() >= path_max) return false;
+  if (name_max == 0) return true;
+  for (const auto& component : path) {
+    if (component.native().size() > name_max) return false;
+  }
+  return true;
+}
+
+void require_representable_path(const std::filesystem::path& path,
+                                size_t name_max, size_t path_max) {
+  if (name_max > 0) {
+    for (const auto& component : path) {
+      if (component.native().size() > name_max) {
+        throw std::runtime_error("FSConnector path component uses " +
+                                 std::to_string(component.native().size()) +
+                                 " bytes, but NAME_MAX is " +
+                                 std::to_string(name_max));
+      }
+    }
+  }
+  if (path_max > 0 && path.native().size() >= path_max) {
+    throw std::runtime_error(
+        "FSConnector path uses " + std::to_string(path.native().size()) +
+        " bytes, but PATH_MAX is " + std::to_string(path_max));
+  }
+}
 
 void remove_temp_file(const std::filesystem::path& tmp_path) {
   std::error_code remove_ec;
@@ -75,6 +124,9 @@ std::string FSConnector::key_to_filename(const std::string& key) {
 
   const std::string& model_name = parts[0];
   const std::string& kv_rank_hex = parts[1];
+  if (kv_rank_hex.empty() || kv_rank_hex.front() == '-') {
+    throw std::runtime_error("FSConnector: kv_rank must be non-negative");
+  }
 
   // Replace '/' with '-SEP-' for filesystem safety
   std::string safe_model = replace_all(model_name, "/", PATH_SLASH_REPLACEMENT);
@@ -92,6 +144,95 @@ std::string FSConnector::key_to_filename(const std::string& key) {
   }
   result += FILE_EXT;
   return result;
+}
+
+std::string FSConnector::hex_encode(const std::string& value) {
+  static constexpr char HEX[] = "0123456789abcdef";
+  std::string encoded;
+  encoded.resize(value.size() * 2);
+  for (size_t index = 0; index < value.size(); ++index) {
+    const auto byte = static_cast<unsigned char>(value[index]);
+    encoded[2 * index] = HEX[byte >> 4];
+    encoded[2 * index + 1] = HEX[byte & 0x0f];
+  }
+  return encoded;
+}
+
+std::filesystem::path FSConnector::key_to_relative_path(
+    const std::string& key) {
+  const std::string legacy_filename = key_to_filename(key);
+  if (legacy_filename.size() <= LEGACY_FILENAME_MAX_BYTES) {
+    return legacy_filename;
+  }
+
+  std::vector<std::string> parts;
+  size_t start = 0;
+  for (size_t pos = 0; pos <= key.size(); ++pos) {
+    if (pos == key.size() || key[pos] == KEY_SEP) {
+      parts.emplace_back(key.substr(start, pos - start));
+      start = pos + 1;
+    }
+  }
+  if (parts.size() == 3) {
+    // Legacy keys have no object-group field from which to construct the
+    // reversible bounded layout. Filesystems with a larger NAME_MAX may still
+    // contain their flat objects, so preserve that exact compatibility path.
+    return legacy_filename;
+  }
+  if (parts.size() != 4 && parts.size() != 5) {
+    throw std::runtime_error(
+        "FSConnector: oversized keys require the current four- or five-field "
+        "ObjectKey encoding: " +
+        key);
+  }
+
+  const std::string model_hex = hex_encode(parts[0]);
+  const std::string salt_hex =
+      parts.size() == 5 ? hex_encode(parts[4]) : std::string();
+  const size_t model_count =
+      (model_hex.size() + ENCODED_COMPONENT_MAX_CHARS - 1) /
+      ENCODED_COMPONENT_MAX_CHARS;
+  const size_t salt_count =
+      (salt_hex.size() + ENCODED_COMPONENT_MAX_CHARS - 1) /
+      ENCODED_COMPONENT_MAX_CHARS;
+
+  std::filesystem::path relative_path = BOUNDED_PATH_VERSION;
+  relative_path /= "m" + std::to_string(model_count);
+  for (size_t offset = 0; offset < model_hex.size();
+       offset += ENCODED_COMPONENT_MAX_CHARS) {
+    relative_path /= model_hex.substr(offset, ENCODED_COMPONENT_MAX_CHARS);
+  }
+  relative_path /= "s" + std::to_string(salt_count);
+  for (size_t offset = 0; offset < salt_hex.size();
+       offset += ENCODED_COMPONENT_MAX_CHARS) {
+    relative_path /= salt_hex.substr(offset, ENCODED_COMPONENT_MAX_CHARS);
+  }
+
+  std::string leaf = "0x" + parts[1] + std::string(1, KEY_SEP) + parts[2] +
+                     std::string(1, KEY_SEP) + parts[3] + FILE_EXT;
+  if (leaf.size() <= LEGACY_FILENAME_MAX_BYTES) {
+    relative_path /= leaf;
+    return relative_path;
+  }
+
+  const std::string rank = "0x" + parts[1];
+  const std::array<std::pair<char, std::string>, 3> bounded_fields = {{
+      {'r', rank},
+      {'g', parts[2]},
+      {'h', parts[3]},
+  }};
+  for (const auto& [marker, value] : bounded_fields) {
+    const size_t component_count =
+        (value.size() + ENCODED_COMPONENT_MAX_CHARS - 1) /
+        ENCODED_COMPONENT_MAX_CHARS;
+    relative_path /= std::string(1, marker) + std::to_string(component_count);
+    for (size_t offset = 0; offset < value.size();
+         offset += ENCODED_COMPONENT_MAX_CHARS) {
+      relative_path /= value.substr(offset, ENCODED_COMPONENT_MAX_CHARS);
+    }
+  }
+  relative_path /= "object.data";
+  return relative_path;
 }
 
 // ---------------------------------------------------------------
@@ -162,7 +303,9 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
       relative_tmp_dir_(std::move(relative_tmp_dir)),
       use_odirect_(use_odirect),
       disk_block_size_(0),
-      read_ahead_size_(read_ahead_size) {
+      read_ahead_size_(read_ahead_size),
+      name_max_(0),
+      path_max_(0) {
   // Create base directory
   std::filesystem::create_directories(base_path_);
 
@@ -170,6 +313,20 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
   if (!relative_tmp_dir_.empty()) {
     auto tmp_path = std::filesystem::path(base_path_) / relative_tmp_dir_;
     std::filesystem::create_directories(tmp_path);
+  }
+
+  name_max_ = query_path_limit(base_path_, _PC_NAME_MAX, "NAME_MAX");
+  path_max_ = query_path_limit(base_path_, _PC_PATH_MAX, "PATH_MAX");
+  if (!relative_tmp_dir_.empty()) {
+    const auto tmp_path = std::filesystem::path(base_path_) / relative_tmp_dir_;
+    name_max_ = minimum_finite_limit(
+        name_max_, query_path_limit(tmp_path, _PC_NAME_MAX, "NAME_MAX"));
+    path_max_ = minimum_finite_limit(
+        path_max_, query_path_limit(tmp_path, _PC_PATH_MAX, "PATH_MAX"));
+  }
+  if (name_max_ > 0 && name_max_ < LEGACY_FILENAME_MAX_BYTES) {
+    throw std::runtime_error(
+        "FSConnector requires a filesystem NAME_MAX of at least 255 bytes");
   }
 
   // Query disk block size for O_DIRECT
@@ -194,13 +351,34 @@ WorkerFSConn FSConnector::create_connection() {
   conn.use_odirect = use_odirect_;
   conn.disk_block_size = disk_block_size_;
   conn.read_ahead_size = read_ahead_size_;
+  conn.name_max = name_max_;
+  conn.path_max = path_max_;
   return conn;
 }
 
 void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
                                 void* buf, size_t len, size_t chunk_size) {
-  std::string filename = key_to_filename(key);
-  auto file_path = conn.base_path / filename;
+  const auto relative_path = key_to_relative_path(key);
+  const auto canonical_path = conn.base_path / relative_path;
+  auto file_path = canonical_path;
+  bool found = false;
+  if (path_is_representable(canonical_path, conn.name_max, conn.path_max)) {
+    std::error_code exists_ec;
+    found = std::filesystem::exists(canonical_path, exists_ec);
+  }
+  if (!found && relative_path.has_parent_path()) {
+    const auto legacy_path = conn.base_path / key_to_filename(key);
+    if (path_is_representable(legacy_path, conn.name_max, conn.path_max)) {
+      std::error_code exists_ec;
+      if (std::filesystem::exists(legacy_path, exists_ec)) {
+        file_path = legacy_path;
+        found = true;
+      }
+    }
+  }
+  if (!found) {
+    require_representable_path(canonical_path, conn.name_max, conn.path_max);
+  }
 
   int flags = O_RDONLY;
   bool do_odirect = conn.use_odirect &&
@@ -247,16 +425,34 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
 void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
                                 const void* buf, size_t len,
                                 size_t chunk_size) {
-  std::string filename = key_to_filename(key);
-  auto file_path = conn.base_path / filename;
+  const auto relative_path = key_to_relative_path(key);
+  auto file_path = conn.base_path / relative_path;
 
   // Skip if already stored on disk
-  if (std::filesystem::exists(file_path)) {
+  if (path_is_representable(file_path, conn.name_max, conn.path_max) &&
+      std::filesystem::exists(file_path)) {
     return;
   }
+  if (relative_path.has_parent_path()) {
+    std::error_code exists_ec;
+    const auto legacy_path = conn.base_path / key_to_filename(key);
+    if (path_is_representable(legacy_path, conn.name_max, conn.path_max) &&
+        std::filesystem::exists(legacy_path, exists_ec)) {
+      return;
+    }
+  }
+  require_representable_path(file_path, conn.name_max, conn.path_max);
 
   const auto tmp_dir =
       conn.tmp_dir.empty() ? file_path.parent_path() : conn.tmp_dir;
+  const auto longest_tmp_path =
+      tmp_dir / (std::string(".lmcache-write") + TMP_EXT + "." +
+                 std::to_string(static_cast<uint64_t>(::getpid())) + "." +
+                 std::string(20, '9'));
+  require_representable_path(longest_tmp_path, conn.name_max, conn.path_max);
+  if (relative_path.has_parent_path()) {
+    std::filesystem::create_directories(file_path.parent_path());
+  }
   std::filesystem::path tmp_path;
   int flags = O_CREAT | O_EXCL | O_WRONLY;
   if (conn.use_odirect) {
@@ -267,9 +463,10 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
   for (size_t attempt = 0; attempt < 1024; ++attempt) {
     const uint64_t id =
         next_temp_file_id.fetch_add(1, std::memory_order_relaxed);
-    tmp_path = tmp_dir / (filename + TMP_EXT + "." +
+    tmp_path = tmp_dir / (std::string(".lmcache-write") + TMP_EXT + "." +
                           std::to_string(static_cast<uint64_t>(::getpid())) +
                           "." + std::to_string(id));
+    require_representable_path(tmp_path, conn.name_max, conn.path_max);
     fd = ::open(tmp_path.c_str(), flags, 0644);
     if (fd >= 0) break;
     if (errno != EEXIST) {
@@ -312,16 +509,47 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
 }
 
 bool FSConnector::do_single_exists(WorkerFSConn& conn, const std::string& key) {
-  std::string filename = key_to_filename(key);
-  auto file_path = conn.base_path / filename;
-  return std::filesystem::exists(file_path);
+  const auto relative_path = key_to_relative_path(key);
+  const auto file_path = conn.base_path / relative_path;
+  std::error_code exists_ec;
+  const bool canonical_fits =
+      path_is_representable(file_path, conn.name_max, conn.path_max);
+  if (canonical_fits && std::filesystem::exists(file_path, exists_ec)) {
+    return true;
+  }
+  if (relative_path.has_parent_path()) {
+    const auto legacy_path = conn.base_path / key_to_filename(key);
+    exists_ec.clear();
+    if (path_is_representable(legacy_path, conn.name_max, conn.path_max) &&
+        std::filesystem::exists(legacy_path, exists_ec)) {
+      return true;
+    }
+  }
+  if (!canonical_fits) {
+    require_representable_path(file_path, conn.name_max, conn.path_max);
+  }
+  return false;
 }
 
 bool FSConnector::do_single_delete(WorkerFSConn& conn, const std::string& key) {
-  std::string filename = key_to_filename(key);
-  auto file_path = conn.base_path / filename;
+  const auto relative_path = key_to_relative_path(key);
+  auto file_path = conn.base_path / relative_path;
   std::error_code ec;
-  return std::filesystem::remove(file_path, ec);
+  const bool canonical_fits =
+      path_is_representable(file_path, conn.name_max, conn.path_max);
+  if (canonical_fits && std::filesystem::remove(file_path, ec)) return true;
+  if (relative_path.has_parent_path()) {
+    const auto legacy_path = conn.base_path / key_to_filename(key);
+    ec.clear();
+    if (path_is_representable(legacy_path, conn.name_max, conn.path_max) &&
+        std::filesystem::remove(legacy_path, ec)) {
+      return true;
+    }
+  }
+  if (!canonical_fits) {
+    require_representable_path(file_path, conn.name_max, conn.path_max);
+  }
+  return false;
 }
 
 }  // namespace connector
