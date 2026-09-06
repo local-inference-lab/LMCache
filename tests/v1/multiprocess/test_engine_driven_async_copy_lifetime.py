@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Async device<->CPU copies must complete before their buffers are reused.
 
-Both engine-driven paths launch async copies and then hand the buffers to
-something that reads them. Two places got this wrong, and both failed
-silently: the KV was already committed or already scattered, so the only
-symptom was corrupted content much later.
+Pickle serialization must wait for gathered data, and raw-pointer scatter must
+retain locally pinned buffers until its copies complete, including on errors.
+Caller-owned pinned buffers keep their asynchronous transfer contract.
 
 These tests assert the ordering contract without a GPU, so they run in the
 CPU-only unit CI. The hardware reproductions live alongside them in
@@ -12,10 +11,12 @@ CPU-only unit CI. The hardware reproductions live alongside them in
 """
 
 # Standard
+from contextlib import nullcontext
 from typing import cast
 from unittest.mock import MagicMock, patch
 
 # Third Party
+import pytest
 import torch
 
 
@@ -65,6 +66,82 @@ def test_scatter_syncs_before_releasing_dynamically_pinned_chunks() -> None:
             "scatter must complete async H2D before releasing the temporaries "
             "it pinned; otherwise the host allocator reuses them mid-copy"
         )
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("fail_batch", [None, 1, 2])
+def test_scatter_drains_owned_temporaries_when_a_transfer_fails(
+    pinned: bool, fail_batch: int | None
+) -> None:
+    """Raw-pointer transfers cannot outlive locally pinned source buffers."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import base
+
+    kv = {f"layer_{i}": torch.zeros(2, 4, 4, 2, 8) for i in range(2)}
+    chunks = [MagicMock() for _ in range(5)]
+    for chunk in chunks:
+        chunk.is_pinned.return_value = pinned
+        chunk.pin_memory.return_value = chunk
+        chunk.data_ptr.return_value = 0
+    order: list[str] = []
+    launches = 0
+
+    def transfer(*_args: object, **_kwargs: object) -> None:
+        nonlocal launches
+        launches += 1
+        order.append("launch")
+        if launches == fail_batch:
+            raise RuntimeError("transfer batch failed")
+
+    with (
+        patch.object(base, "_LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR", False),
+        patch.object(base, "torch_dev") as dev,
+        patch("lmcache.device_ops") as ops,
+    ):
+        ops.multi_layer_block_kv_transfer.side_effect = transfer
+        dev.synchronize.side_effect = lambda: order.append("sync")
+        expected_error = (
+            pytest.raises(RuntimeError, match="transfer batch failed")
+            if fail_batch is not None
+            else nullcontext()
+        )
+        with expected_error:
+            base.scatter_cpu_to_paged_kv(
+                kv, [0, 1, 2, 3] * 5, cast(list[torch.Tensor], chunks), 4
+            )
+        order.append("caller")
+
+    expected_launches = fail_batch if fail_batch is not None else 2
+    assert order == (
+        ["launch"] * expected_launches + ([] if pinned else ["sync"]) + ["caller"]
+    )
+
+
+def test_scatter_does_not_sync_when_every_block_is_skipped() -> None:
+    """An entirely cached prefix does not launch or synchronize a transfer."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import base
+
+    kv = {f"layer_{i}": torch.zeros(2, 4, 4, 2, 8) for i in range(2)}
+    chunk = MagicMock()
+    chunk.is_pinned.return_value = False
+    chunk.pin_memory.return_value = chunk
+    chunk.data_ptr.return_value = 0
+
+    with (
+        patch.object(base, "_LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR", False),
+        patch.object(base, "torch_dev") as dev,
+        patch("lmcache.device_ops") as ops,
+    ):
+        base.scatter_cpu_to_paged_kv(
+            kv,
+            list(range(4)),
+            cast(list[torch.Tensor], [chunk]),
+            4,
+            skip_first_n_tokens=16,
+        )
+        ops.multi_layer_block_kv_transfer.assert_not_called()
+        dev.synchronize.assert_not_called()
 
 
 def test_pickle_store_syncs_before_commit_serializes() -> None:
