@@ -739,6 +739,12 @@ def scatter_cpu_to_paged_kv(
         ValueError: If ``block_ids`` is shorter than
             ``len(chunks) * blocks_per_chunk``, or group layers disagree on
             physical block stride.
+
+    Notes:
+        Raw-pointer transfers from locally pinned temporary buffers complete
+        before this function returns or propagates a transfer exception.
+        Caller-owned pinned buffers remain asynchronous: the caller must keep
+        them alive and synchronize before consuming the destination KV.
     """
     # First Party
     from lmcache import device_ops
@@ -823,6 +829,9 @@ def scatter_cpu_to_paged_kv(
     if not selected_block_ids:
         return
 
+    # Only the ptr-only branch below pins temporaries; the tensor branch
+    # hands torch the chunks directly and keeps them alive itself.
+    dynamically_pinned = False
     if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
         # Python fallback: accepts tensor list directly for all params.
         paged_arg = normalized
@@ -846,8 +855,8 @@ def scatter_cpu_to_paged_kv(
         # Defensive check: Ensure all incoming CPU chunks are pinned memory.
         # Otherwise, the underlying CUDA kernel may throw an Illegal
         # Memory Access error during H2D transfer.
-        pinned_copy = False
-        if not all(chunk.is_pinned() for chunk in chunks):
+        dynamically_pinned = not all(chunk.is_pinned() for chunk in chunks)
+        if dynamically_pinned:
             logger.warning(
                 "Received unpinned CPU tensors in scatter_cpu_to_paged_kv. "
                 "Dynamically pinning memory now, which may incur additional"
@@ -857,7 +866,6 @@ def scatter_cpu_to_paged_kv(
                 chunk.pin_memory() if not chunk.is_pinned() else chunk
                 for chunk in chunks
             ]
-            pinned_copy = True
 
         # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
         _ptrs_np = np.array(
@@ -875,35 +883,41 @@ def scatter_cpu_to_paged_kv(
         req_blocks_per_obj = bpw
         total_chunks = len(chunks)
 
-        for i in range(0, total_chunks, MAX_OBJECTS):
-            # Slice objects and block IDs for this batch
-            batch_objs_ptrs = objs_arg[i : i + MAX_OBJECTS]
+        h2d_started = False
+        try:
+            for i in range(0, total_chunks, MAX_OBJECTS):
+                # Slice objects and block IDs for this batch
+                batch_objs_ptrs = objs_arg[i : i + MAX_OBJECTS]
 
-            start_block = i * req_blocks_per_obj
-            end_block = min(
-                (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
-            )
-            batch_blocks = block_ids_arg[start_block:end_block]
-            batch_skip = max(0, skip_prefix_window - start_block)
-            if batch_skip >= len(batch_blocks):
-                continue
+                start_block = i * req_blocks_per_obj
+                end_block = min(
+                    (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
+                )
+                batch_blocks = block_ids_arg[start_block:end_block]
+                batch_skip = max(0, skip_prefix_window - start_block)
+                if batch_skip >= len(batch_blocks):
+                    continue
 
-            # Execute transfer for this batch
-            device_ops.multi_layer_block_kv_transfer(
-                paged_arg,
-                batch_objs_ptrs,
-                batch_blocks,
-                get_device(normalized),
-                lmcache_native.TransferDirection.H2D,
-                shape_desc,
-                window_tokens,
-                engine_kv_format,
-                batch_skip,
-            )
-        # Dynamically pinned tensors are local temporaries whose data pointers
-        # must remain valid until the asynchronous transfer has completed.
-        if pinned_copy:
-            torch_dev.synchronize()
+                # A native call can enqueue a copy before raising.
+                h2d_started = True
+                device_ops.multi_layer_block_kv_transfer(
+                    paged_arg,
+                    batch_objs_ptrs,
+                    batch_blocks,
+                    get_device(normalized),
+                    lmcache_native.TransferDirection.H2D,
+                    shape_desc,
+                    window_tokens,
+                    engine_kv_format,
+                    batch_skip,
+                )
+        finally:
+            if dynamically_pinned and h2d_started:
+                # Torch cannot track the source lifetime through raw pointers.
+                # Drain copies before releasing local temporaries, including
+                # when a subsequent batch raises. Caller-owned pinned buffers
+                # retain their asynchronous lifetime contract.
+                torch_dev.synchronize()
     # Fast path: The async GPU copy might still be in progress.
     # We intentionally omit synchronization here for performance.
     # WARNING: The caller MUST explicitly call `torch_dev.synchronize()`
