@@ -187,11 +187,19 @@ class ManagementModule:
         """
         return list(self._experimental_transfer)
 
-    def clear(self) -> None:
-        """Clear all stored KV cache data from the storage manager."""
+    def clear(self, *, force: bool = True) -> None:
+        """Clear resident L1 objects with the requested lease protection.
+
+        Args:
+            force: False retains objects with active readers or writers. True
+                also releases locked objects and requires an idle engine.
+
+        The argument-free CLEAR RPC retains its forced-clear behavior. HTTP
+        callers may explicitly select non-forced eviction without a wire change.
+        """
         with self._clear_lock:
             self._ctx.storage_manager.memcheck()
-            self._ctx.storage_manager.clear(force=True)
+            self._ctx.storage_manager.clear(force=force)
             self._ctx.storage_manager.memcheck()
 
     def debug(self) -> str:
