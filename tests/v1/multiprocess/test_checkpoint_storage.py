@@ -15,6 +15,8 @@ import time
 import uuid
 
 # Third Party
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 import pytest
 import zmq
 
@@ -49,7 +51,10 @@ from lmcache.v1.multiprocess.checkpoint_transfer import (
     UnsafeCheckpointCopyError,
 )
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
+from lmcache.v1.multiprocess.http_apis.cache_api import router as cache_router
+from lmcache.v1.multiprocess.http_apis.dependencies import build_context
 from lmcache.v1.multiprocess.modules.checkpoint import CheckpointModule
+from lmcache.v1.multiprocess.modules.management import ManagementModule
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessageQueueServer
 from lmcache.v1.multiprocess.posix_shm import shm_open_pool_as_mmap
 from lmcache.v1.multiprocess.protocol import (
@@ -57,6 +62,7 @@ from lmcache.v1.multiprocess.protocol import (
     get_handler_type,
     get_payload_classes,
 )
+from lmcache.v1.multiprocess.server import MPCacheServer
 
 
 @contextmanager
@@ -623,6 +629,53 @@ def test_shm_roundtrip_all_ranks_groups_and_read_lease_lifetime(store: Any) -> N
         assert storage.delete_l1_keys(keys)[0] == 0
         service.finish_retrieve(lease.lease_id)
         assert storage.delete_l1_keys(keys)[0] == len(keys)
+
+
+@pytest.mark.parametrize("expose_slots", [False, True])
+def test_http_nonforced_clear_preserves_checkpoint_read_and_write_leases(
+    store: Any, expose_slots: bool
+) -> None:
+    """HTTP eviction retains actual SHM owners before and after slot exposure."""
+    service, index, storage, mapping = store
+    entry = make_manifest()
+    publish_all(service, index, mapping, entry)
+    pending = make_manifest()
+    assert index.begin(pending)
+    writable = service.prepare_store(pending, 0)
+    assert writable is not None
+    fill(mapping, writable, 0)
+    lease_id = service.begin_retrieve(entry, 0)
+    assert lease_id is not None
+    if expose_slots:
+        assert isinstance(poll(service, lease_id), CheckpointSlots)
+    context = cast(MPCacheServerContext, SimpleNamespace(storage_manager=storage))
+    engine = MPCacheServer(context, [ManagementModule(context)])
+    app = FastAPI()
+    app.include_router(cache_router)
+    app.state.context = build_context(engine)
+    with TestClient(app) as client:
+        response = client.post("/cache/clear", json={"tier": "l1", "force": False})
+        assert response.status_code == 200, response.text
+        retained = [key for group in checkpoint_object_keys(entry, 0) for key in group]
+        evicted = [key for group in checkpoint_object_keys(entry, 1) for key in group]
+        assert storage.get_readable_keys(retained) == retained
+        assert storage.get_readable_keys(evicted) == []
+        lease = poll(service, lease_id)
+        assert isinstance(lease, CheckpointSlots)
+        for group_id, group in enumerate(lease.groups):
+            for page_id, slot in enumerate(group):
+                assert mapping[slot.offset : slot.offset + slot.length] == (
+                    bytes([group_id * 4 + page_id]) * slot.length
+                )
+        service.finish_retrieve(lease_id)
+        assert not service.finish_store(writable.lease_id, True)
+        committed = [
+            key for group in checkpoint_object_keys(pending, 0) for key in group
+        ]
+        assert storage.get_readable_keys(committed) == committed
+        response = client.post("/cache/clear", json={"force": False})
+        assert response.status_code == 200
+        assert storage.get_readable_keys(retained + committed) == []
 
 
 def test_failed_rank_prevents_publication_after_other_ranks_complete(
