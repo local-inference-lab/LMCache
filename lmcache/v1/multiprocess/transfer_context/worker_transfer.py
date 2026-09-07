@@ -57,16 +57,19 @@ def _supports_async_primitives() -> bool:
     """Probe whether the worker device supports the async store primitives.
 
     The async engine-driven store path needs a stream, an event exposing
-    ``record``/``synchronize``/``wait``, and pinned (page-locked) host memory.
-    When any of these is unavailable (e.g. a CPU-only backend), the factory
-    falls back to the synchronous :class:`EngineDrivenTransferContext`. This
-    dispatch is internal and capability-based; there is no user-facing
-    async/sync flag.
+    ``record``/``synchronize``/``wait``, per-thread device binding, and pinned
+    (page-locked) host memory. When any of these is unavailable (e.g. a CPU-only
+    backend), the factory falls back to the synchronous
+    :class:`EngineDrivenTransferContext`. This dispatch is internal and
+    capability-based; there is no user-facing async/sync flag.
 
     Returns:
         True if all required async primitives are available, else False.
     """
-    if not hasattr(torch_dev, "Stream") or not hasattr(torch_dev, "Event"):
+    if not all(
+        callable(getattr(torch_dev, attr, None))
+        for attr in ("Stream", "Event", "set_device")
+    ):
         return False
     # CPU-only stub exposes Stream/Event but has no real async capability.
     if hasattr(torch_dev, "is_available") and not torch_dev.is_available():
