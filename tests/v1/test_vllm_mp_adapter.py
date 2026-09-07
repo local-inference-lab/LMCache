@@ -742,6 +742,68 @@ def test_retrieve_keeps_event_until_future_finishes(fake_adapter):
     assert event_ref() is None
 
 
+@pytest.mark.parametrize("healthy", [True, False])
+@pytest.mark.parametrize("complete_immediately", [True, False])
+def test_aborted_retrieve_uses_only_receive_completion(
+    fake_adapter,
+    healthy: bool,
+    complete_immediately: bool,
+) -> None:
+    """An engine-finished retrieve must never also finish as a send."""
+    adapter, _send_mock, _future = fake_adapter
+    retrieve_future = MagicMock(name="retrieve_future")
+    retrieve_future.query.return_value = complete_immediately
+    retrieve_future.result.return_value = True
+    transfer_ctx = MagicMock()
+    transfer_ctx.submit_retrieve.return_value = retrieve_future
+    adapter.transfer_ctx = transfer_ctx
+    adapter.submit_retrieve_request("req-1", _op([[7]]), event=FakeCudaEvent())
+    if not healthy:
+        FakeHeartbeatThread.instances[0].health_event.clear()
+
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == set()
+    if complete_immediately:
+        assert finished_retrieves == {"req-1"}
+    else:
+        assert finished_retrieves == set()
+        retrieve_future.query.return_value = True
+        finished_stores, finished_retrieves = adapter.get_finished(set())
+        assert finished_stores == set()
+        assert finished_retrieves == {"req-1"}
+
+    # Repeated engine completion notifications remain exactly-once and cannot
+    # reintroduce a late finished_sending after the receive releases blocks.
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+    assert finished_stores == set()
+    assert finished_retrieves == set()
+
+
+@pytest.mark.parametrize("healthy", [True, False])
+def test_engine_finished_dropped_retrieve_uses_only_receive_completion(
+    fake_adapter,
+    healthy: bool,
+) -> None:
+    """A dropped retrieve and engine finish cannot produce dual completion."""
+    adapter, _send_mock, _future = fake_adapter
+    transfer_ctx = MagicMock()
+    adapter.transfer_ctx = transfer_ctx
+    FakeHeartbeatThread.start_hook = lambda heartbeat: heartbeat.health_event.clear()
+    adapter.submit_retrieve_request("req-1", _op([[7]]), event=FakeCudaEvent())
+    transfer_ctx.submit_retrieve.assert_not_called()
+    if healthy:
+        FakeHeartbeatThread.instances[0].simulate_successful_ping()
+
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == set()
+    assert finished_retrieves == {"req-1"}
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+    assert finished_stores == set()
+    assert finished_retrieves == set()
+
+
 def test_finished_sending_dedup_history_is_bounded(fake_adapter) -> None:
     """Unique completions cannot grow dedup history without limit."""
     adapter, _send_mock, _future = fake_adapter
