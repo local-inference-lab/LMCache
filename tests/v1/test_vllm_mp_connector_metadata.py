@@ -20,6 +20,8 @@ from lmcache.integration.vllm.lmcache_mp_connector import (
     LMCacheMPRequestState,
     LMCacheMPRequestTracker,
     _recurrent_safe_lookup_end,
+    _validate_mamba_scheduler_step,
+    validate_mamba_step_alignment,
 )
 
 CHUNK_TOKENS = 64
@@ -47,6 +49,139 @@ def test_recurrent_lookup_excludes_final_prompt_token(
 def test_recurrent_lookup_rejects_non_positive_chunk_size() -> None:
     with pytest.raises(ValueError, match="chunk_tokens must be positive"):
         _recurrent_safe_lookup_end(128, 0)
+
+
+def _mamba_config(
+    *,
+    max_batched: int,
+    max_scheduled: int | None,
+    long_prefill_threshold: int,
+    block_size: int = 1536,
+    cache_mode: str = "align",
+    supports_multi_block_prefill: bool = False,
+) -> SimpleNamespace:
+    """Build the scheduler/cache subset consumed by the alignment validator."""
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(
+            mamba_cache_mode=cache_mode,
+            block_size=block_size,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=max_batched,
+            max_num_scheduled_tokens=max_scheduled,
+            long_prefill_token_threshold=long_prefill_threshold,
+        ),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    kv_cache_spec=SimpleNamespace(
+                        supports_multi_block_prefill=(supports_multi_block_prefill)
+                    )
+                )
+            ]
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_batched", "max_scheduled", "long_prefill_threshold"),
+    [
+        (1540, 1536, 0),
+        (3076, 3072, 1536),
+        (6148, 6144, 1024),
+        (1536, None, 0),
+    ],
+)
+def test_mamba_alignment_allows_large_aggregate_batch_with_per_request_cap(
+    max_batched: int,
+    max_scheduled: int | None,
+    long_prefill_threshold: int,
+) -> None:
+    """Aggregate capacity may span blocks when each request spans at most one."""
+    config = _mamba_config(
+        max_batched=max_batched,
+        max_scheduled=max_scheduled,
+        long_prefill_threshold=long_prefill_threshold,
+    )
+
+    validate_mamba_step_alignment(config, config.kv_cache_config)
+
+
+def test_mamba_alignment_allows_single_request_multi_block_prefill() -> None:
+    config = _mamba_config(
+        max_batched=3076,
+        max_scheduled=3072,
+        long_prefill_threshold=3072,
+        supports_multi_block_prefill=True,
+    )
+
+    validate_mamba_step_alignment(config, config.kv_cache_config)
+
+
+def test_mamba_alignment_allows_sub_block_steps_with_intermediate_snapshots() -> None:
+    """Kimi-K3 can carry private state until a wider cache boundary is reached."""
+    config = _mamba_config(
+        max_batched=1566,
+        max_scheduled=1536,
+        long_prefill_threshold=1536,
+        block_size=1792,
+        supports_multi_block_prefill=True,
+    )
+
+    validate_mamba_step_alignment(config, config.kv_cache_config)
+
+
+@pytest.mark.parametrize(
+    ("max_batched", "max_scheduled", "long_prefill_threshold"),
+    [
+        (3076, 3072, 0),
+        (3076, 3072, 2048),
+        (1536, 1532, 1532),
+    ],
+)
+def test_mamba_alignment_rejects_multi_boundary_request_or_short_budget(
+    max_batched: int,
+    max_scheduled: int | None,
+    long_prefill_threshold: int,
+) -> None:
+    config = _mamba_config(
+        max_batched=max_batched,
+        max_scheduled=max_scheduled,
+        long_prefill_threshold=long_prefill_threshold,
+    )
+
+    with pytest.raises(ValueError, match="--long-prefill-token-threshold 1536"):
+        validate_mamba_step_alignment(config, config.kv_cache_config)
+
+
+def test_mamba_alignment_does_not_constrain_non_align_cache_mode() -> None:
+    config = _mamba_config(
+        max_batched=8192,
+        max_scheduled=8192,
+        long_prefill_threshold=0,
+        cache_mode="none",
+    )
+
+    validate_mamba_step_alignment(config, config.kv_cache_config)
+
+
+def test_mamba_scheduler_step_allows_two_blocks_across_two_requests() -> None:
+    """A 3,072-token aggregate is safe when each request advances 1,536."""
+    assert _validate_mamba_scheduler_step(
+        {"request-a": 1536, "request-b": 1536}, 1536
+    ) == (3072, 1536)
+
+
+def test_mamba_scheduler_step_rejects_one_request_crossing_two_blocks() -> None:
+    with pytest.raises(RuntimeError, match="request-a.*3072.*per_request_limit=1536"):
+        _validate_mamba_scheduler_step({"request-a": 3072}, 1536)
+
+
+def test_mamba_scheduler_step_allows_capability_qualified_multi_block_request() -> None:
+    assert _validate_mamba_scheduler_step({"request-a": 3072}, 3072) == (
+        3072,
+        3072,
+    )
 
 
 def _tracker(

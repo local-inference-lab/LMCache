@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import enum
@@ -165,41 +165,121 @@ def _has_preemption_reqs(scheduler_output: SchedulerOutput) -> bool:
     return False
 
 
-def validate_mamba_step_alignment(vllm_config: VllmConfig) -> None:
+def _supports_mamba_multi_block_prefill(kv_cache_config: Any | None) -> bool:
+    """Return whether every recurrent cache group snapshots intermediate blocks."""
+    if kv_cache_config is None:
+        return False
+    specs = [
+        group.kv_cache_spec
+        for group in (getattr(kv_cache_config, "kv_cache_groups", ()) or ())
+        if _is_mamba_spec(group.kv_cache_spec)
+        or hasattr(group.kv_cache_spec, "supports_multi_block_prefill")
+    ]
+    return bool(specs) and all(
+        getattr(spec, "supports_multi_block_prefill", False) for spec in specs
+    )
+
+
+def validate_mamba_step_alignment(
+    vllm_config: VllmConfig,
+    kv_cache_config: Any | None = None,
+) -> None:
     """Reject scheduler configs that can skip Mamba state snapshots.
 
     In ``mamba_cache_mode="align"`` vLLM snapshots the recurrent state only at
-    the end of each scheduler step, and a step that advances more than one
-    block fills the skipped block-table positions with the null block
+    the end of each request's scheduler step. A request that advances more than
+    one block fills skipped block-table positions with the null block
     (``MambaManager.allocate_new_blocks``). LMCache keys chunks by token hash,
-    so a skipped boundary would be stored as null-block garbage under a valid
-    key and silently corrupt any request that later resumes from that prefix.
-    Requiring ``block_size <= max_num_batched_tokens < 2 * block_size`` makes
-    vLLM's block-aligned splitting (``Scheduler._mamba_block_aligned_split``)
-    advance every mid-prefill step by exactly one block, so every chunk
-    boundary holds a real snapshot.
+    so storing one of those positions would silently associate null-block data
+    with a valid prefix.
+
+    ``max_num_batched_tokens`` and ``max_num_scheduled_tokens`` are aggregate
+    batch budgets, so they may safely exceed one block. Models without
+    intermediate snapshot support must cap each request at one block via
+    ``long_prefill_token_threshold``. Capable models may advance farther because
+    their prefill kernel materializes every crossed boundary in the same step.
 
     Args:
         vllm_config: The vLLM config; only Mamba-hybrid models in ``align``
             cache mode are constrained, others pass.
+        kv_cache_config: Resolved cache groups used to detect model support for
+            intermediate recurrent-state snapshots.
 
     Raises:
-        ValueError: If ``max_num_batched_tokens`` is not in
-            ``[block_size, 2 * block_size)``.
+        ValueError: If a recurrent implementation without intermediate-state
+            snapshot support cannot safely reach/cache one block boundary per
+            step, or if one request can advance more than one block per step.
     """
     if getattr(vllm_config.cache_config, "mamba_cache_mode", "none") != "align":
         return
     block_size = vllm_config.cache_config.block_size
-    max_batched = vllm_config.scheduler_config.max_num_batched_tokens
-    if not (block_size <= max_batched < 2 * block_size):
+    scheduler_config = vllm_config.scheduler_config
+    max_batched = scheduler_config.max_num_batched_tokens
+    max_scheduled = scheduler_config.max_num_scheduled_tokens
+    if max_scheduled is None:
+        max_scheduled = max_batched
+    long_prefill_threshold = scheduler_config.long_prefill_token_threshold
+    max_prefill_tokens_per_request = (
+        min(max_scheduled, long_prefill_threshold)
+        if long_prefill_threshold > 0
+        else max_scheduled
+    )
+    supports_multi_block_prefill = _supports_mamba_multi_block_prefill(kv_cache_config)
+    if not supports_multi_block_prefill and (
+        max_scheduled < block_size or max_prefill_tokens_per_request > block_size
+    ):
         raise ValueError(
-            f"Mamba-hybrid models with LMCache require "
-            f"block_size <= max_num_batched_tokens < 2 * block_size so every "
-            f"prefill step advances exactly one block and every block boundary "
-            f"gets a state snapshot; got max_num_batched_tokens={max_batched}, "
-            f"block_size={block_size}. Set --max-num-batched-tokens "
-            f"{block_size}."
+            "Mamba-hybrid models with LMCache require an aggregate scheduler "
+            "budget of at least one block and a per-request prefill cap of at "
+            "most one block unless every recurrent group supports intermediate "
+            "snapshots; got "
+            f"max_num_batched_tokens={max_batched}, "
+            f"max_num_scheduled_tokens={max_scheduled}, "
+            f"long_prefill_token_threshold={long_prefill_threshold}, "
+            f"block_size={block_size}. Keep the aggregate budgets as desired "
+            f"and set --long-prefill-token-threshold {block_size}."
         )
+
+
+def _validate_mamba_scheduler_step(
+    num_scheduled_tokens: Mapping[str, int], per_request_limit: int
+) -> tuple[int, int]:
+    """Validate the per-request recurrent-state snapshot invariant.
+
+    The startup validator constrains vLLM's scheduler configuration, while
+    this hot-path check protects LMCache metadata from future scheduler
+    regressions or configuration paths that bypass that validation. Aggregate
+    work may span multiple blocks, but no individual request may advance past
+    more than one recurrent-state snapshot boundary in a single step.
+
+    Args:
+        num_scheduled_tokens: Tokens scheduled for each request in this step.
+        per_request_limit: Largest safe per-request token count for one step.
+
+    Returns:
+        A tuple of total scheduled tokens and the largest per-request count.
+
+    Raises:
+        ValueError: If ``per_request_limit`` is not positive.
+        RuntimeError: If a request exceeds the configured safe limit.
+    """
+    if per_request_limit <= 0:
+        raise ValueError(f"per_request_limit must be positive, got {per_request_limit}")
+
+    total_tokens = sum(num_scheduled_tokens.values())
+    max_tokens_per_request = max(num_scheduled_tokens.values(), default=0)
+    unsafe_requests = {
+        request_id: num_tokens
+        for request_id, num_tokens in num_scheduled_tokens.items()
+        if num_tokens > per_request_limit
+    }
+    if unsafe_requests:
+        raise RuntimeError(
+            "LMCache refused an unsafe Mamba scheduler step: got "
+            f"{unsafe_requests} with per_request_limit={per_request_limit}."
+        )
+
+    return total_tokens, max_tokens_per_request
 
 
 def build_parallel_strategy_from_vllm_config(
@@ -643,7 +723,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config, role, kv_cache_config)
 
         # Fail fast, before the server handshake below.
-        validate_mamba_step_alignment(vllm_config)
+        resolved_kv_cache_config = getattr(self, "_kv_cache_config", None)
+        validate_mamba_step_alignment(vllm_config, resolved_kv_cache_config)
         validate_kv_cache_groups(getattr(self, "_kv_cache_config", None))
 
         assert vllm_config.kv_transfer_config is not None
@@ -744,7 +825,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             raise ValueError(f"Unknown KVConnectorRole: {self.role}")
 
-        kv_cache_config = getattr(self, "_kv_cache_config", None)
+        kv_cache_config = resolved_kv_cache_config
         vllm_groups = (
             getattr(kv_cache_config, "kv_cache_groups", ()) or ()
             if kv_cache_config is not None
@@ -753,6 +834,20 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._has_recurrent_cache = any(
             _is_mamba_spec(group.kv_cache_spec) for group in vllm_groups
         )
+        self._mamba_step_token_limit = None
+        if getattr(vllm_config.cache_config, "mamba_cache_mode", "none") == "align":
+            if _supports_mamba_multi_block_prefill(kv_cache_config):
+                scheduler_config = vllm_config.scheduler_config
+                max_scheduled = scheduler_config.max_num_scheduled_tokens
+                if max_scheduled is None:
+                    max_scheduled = scheduler_config.max_num_batched_tokens
+                threshold = scheduler_config.long_prefill_token_threshold
+                self._mamba_step_token_limit = (
+                    min(max_scheduled, threshold) if threshold > 0 else max_scheduled
+                )
+            else:
+                self._mamba_step_token_limit = vllm_config.cache_config.block_size
+        self._logged_mamba_multi_request_batch = False
         # Tokens covered by one paged chunk (one block ID) of each engine
         # group, from the group's KV cache spec. Hybrid models can mix
         # different values (e.g. gemma-4: sliding-window groups 32,
@@ -1202,6 +1297,26 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
+        if self._mamba_step_token_limit is not None:
+            total_tokens, max_tokens_per_request = _validate_mamba_scheduler_step(
+                scheduler_output.num_scheduled_tokens,
+                self._mamba_step_token_limit,
+            )
+            if (
+                total_tokens > self._mamba_step_token_limit
+                and not self._logged_mamba_multi_request_batch
+            ):
+                logger.info(
+                    "LMCache validated a multi-block Mamba scheduler step: "
+                    "aggregate_tokens=%d, requests=%d, "
+                    "max_tokens_per_request=%d, per_request_limit=%d",
+                    total_tokens,
+                    len(scheduler_output.num_scheduled_tokens),
+                    max_tokens_per_request,
+                    self._mamba_step_token_limit,
+                )
+                self._logged_mamba_multi_request_batch = True
+
         metadata = LMCacheMPConnectorMetadata()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
 
