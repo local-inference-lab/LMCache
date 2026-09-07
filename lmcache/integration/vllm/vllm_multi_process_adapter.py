@@ -1854,8 +1854,14 @@ class LMCacheMPWorkerAdapter:
         self,
         finished_store_keys: set[str | int],
         finished_req_ids_from_engine: set[str],
+        receiving_req_ids: set[str],
     ) -> set[str]:
-        """Return engine-finished requests after every store job is terminal."""
+        """Return engine-finished requests after every store job is terminal.
+
+        A request with an active retrieve is completed through
+        ``finished_recving``.  Consume its send completion without returning it
+        so an abort cannot put the same request in both completion channels.
+        """
         self._retire_store_futures(finished_store_keys)
         self.previously_finished.update(finished_req_ids_from_engine)
         ret_stores: set[str] = set()
@@ -1863,7 +1869,10 @@ class LMCacheMPWorkerAdapter:
             if self._has_inflight_store(req_id):
                 continue
             self.previously_finished.discard(req_id)
-            if self._returned_finished.add_if_absent(req_id):
+            if (
+                self._returned_finished.add_if_absent(req_id)
+                and req_id not in receiving_req_ids
+            ):
                 ret_stores.add(req_id)
         return ret_stores
 
@@ -1899,6 +1908,9 @@ class LMCacheMPWorkerAdapter:
         # Health loss blocks new submissions, but submitted futures remain
         # device-aware and must reach terminal completion before reporting.
         if not self.is_healthy:
+            receiving_req_ids = finished_req_ids_from_engine.intersection(
+                self.retrieve_futures
+            )
             finished_stores = self._poll_store_futures()
             finished_retrieves = self._poll_retrieve_futures()
             for store_key in finished_stores:
@@ -1916,18 +1928,18 @@ class LMCacheMPWorkerAdapter:
             dropped = self._dropped_retrieves
             self._dropped_retrieves = set()
             finished_retrieves.update(dropped)
+            receiving_req_ids.update(finished_req_ids_from_engine.intersection(dropped))
 
             ret_stores = self._process_finished_stores(
-                finished_stores, finished_req_ids_from_engine
+                finished_stores,
+                finished_req_ids_from_engine,
+                receiving_req_ids,
             )
-            # A request may have a pending retrieve AND appear in
-            # finished_req_ids_from_engine (it ran without loading KV after
-            # the server died).  The scheduler processes finished_recving
-            # first and deletes the request, so we must not also report it
-            # in finished_sending.
-            ret_stores -= finished_retrieves
             return ret_stores, finished_retrieves
 
+        receiving_req_ids = finished_req_ids_from_engine.intersection(
+            self.retrieve_futures
+        )
         finished_stores = self._poll_store_futures()
         finished_retrieves = self._poll_retrieve_futures()
 
@@ -1948,10 +1960,13 @@ class LMCacheMPWorkerAdapter:
         dropped = self._dropped_retrieves
         self._dropped_retrieves = set()
         finished_retrieves.update(dropped)
+        receiving_req_ids.update(finished_req_ids_from_engine.intersection(dropped))
 
         # Update the internal states
         ret_stores = self._process_finished_stores(
-            finished_stores, finished_req_ids_from_engine
+            finished_stores,
+            finished_req_ids_from_engine,
+            receiving_req_ids,
         )
 
         # the invocation of `get_finished` means that
