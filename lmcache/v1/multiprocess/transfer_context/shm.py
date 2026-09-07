@@ -21,6 +21,10 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.multiprocess.protocols.checkpoint import (
+    CheckpointCapabilities,
+    CheckpointLeaseResponse,
+)
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
@@ -143,6 +147,67 @@ class EngineDrivenContextShm(EngineDrivenContext):
             self._shm = None
             self._shm_buffer = None
             raise
+
+    def checkpoint_slot_views(
+        self,
+        capabilities: CheckpointCapabilities,
+        lease: CheckpointLeaseResponse,
+        page_sizes: tuple[tuple[int, ...], ...],
+    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+        """Borrow validated uint8 views from an already registered SHM pool.
+
+        Args:
+            capabilities: Exact server pool identity negotiated for checkpoints.
+            lease: Complete ready lease whose pages remain pinned by the server.
+            page_sizes: Expected byte lengths in manifest group/page order.
+
+        Returns:
+            Zero-copy byte views. The caller must drain CUDA copies and release
+            all views before finishing the lease or closing this context.
+
+        Raises:
+            ValueError: If identity, widths, bounds or non-overlap checks fail.
+            RuntimeError: If CUDA DMA would use an unregistered host mapping.
+        """
+        if (
+            self._shm_buffer is None
+            or capabilities.format_version != 1
+            or capabilities.shm_name.lstrip("/") != self._shm_name.lstrip("/")
+            or capabilities.pool_size != self._pool_size
+            or lease.status != "ready"
+            or len(lease.slots) != len(page_sizes)
+        ):
+            raise ValueError("Checkpoint lease does not identify this SHM pool/layout")
+        if torch_dev.is_available() and not self._pinned:
+            raise RuntimeError("Checkpoint DMA requires a registered SHM mapping")
+        ranges = []
+        for slots, sizes in zip(lease.slots, page_sizes, strict=True):
+            if len(slots) != len(sizes):
+                raise ValueError(
+                    "Checkpoint lease page counts disagree with the manifest"
+                )
+            for (offset, size), expected in zip(slots, sizes, strict=True):
+                if (
+                    offset < 0
+                    or size <= 0
+                    or size != expected
+                    or offset + size > self._pool_size
+                ):
+                    raise ValueError("Checkpoint SHM page width or bounds are invalid")
+                ranges.append((offset, offset + size))
+        ranges.sort()
+        if any(
+            end > start
+            for (_, end), (start, _) in zip(ranges, ranges[1:], strict=False)
+        ):
+            raise ValueError("Checkpoint SHM pages must not overlap")
+        return tuple(
+            tuple(
+                self._make_tensor_view(offset, size, [size], "uint8")
+                for offset, size in group
+            )
+            for group in lease.slots
+        )
 
     def _make_tensor_view(
         self,
