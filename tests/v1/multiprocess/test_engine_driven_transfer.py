@@ -2,6 +2,7 @@
 # Standard
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
 from unittest.mock import MagicMock, PropertyMock, patch
 import os
@@ -23,6 +24,10 @@ from lmcache.v1.multiprocess.posix_shm import (
     shm_unlink,
 )
 from lmcache.v1.multiprocess.protocol import RequestType
+from lmcache.v1.multiprocess.protocols.checkpoint import (
+    CheckpointCapabilities,
+    CheckpointLeaseResponse,
+)
 from lmcache.v1.multiprocess.protocols.engine import (
     PrepareRetrieveResponse,
     PrepareStoreResponse,
@@ -3011,6 +3016,56 @@ def _create_shm_segment(shm_name: str, size: int) -> int:
     (Linux/macOS), instead of hard-coding ``/dev/shm`` paths.
     """
     return shm_create_readwrite(shm_name, size)
+
+
+def test_checkpoint_shm_views_validate_identity_bounds_and_nonoverlap() -> None:
+    """Reject incompatible leases before creating any DMA-visible byte view."""
+    name = f"lmcache_checkpoint_views_{os.getpid()}"
+    addr = _create_shm_segment(name, 4096)
+    try:
+        context = EngineDrivenContextShm(
+            metadata=EngineDrivenContextMetadata(
+                layout_desc=MemoryLayoutDesc([torch.Size([128])], [torch.uint8]),
+                block_size=1,
+                use_mla=False,
+            ),
+            mq_client=MagicMock(),
+            mq_timeout=1,
+            shm_name=name,
+            pool_size=4096,
+        )
+        try:
+            capability = CheckpointCapabilities(1, name, 4096, False)
+            lease = CheckpointLeaseResponse(
+                "ready", "lease", (((0, 128),), ((256, 128),))
+            )
+            sizes = ((128,), (128,))
+            views = context.checkpoint_slot_views(capability, lease, sizes)
+            views[0][0].fill_(37)
+            with shm_open_pool_as_mmap(name, 4096) as mapping:
+                assert mapping[:128] == bytes([37]) * 128
+            del views
+            for incompatible in (
+                replace(capability, shm_name="other"),
+                replace(capability, pool_size=8192),
+                replace(capability, format_version=0),
+            ):
+                with pytest.raises(ValueError):
+                    context.checkpoint_slot_views(incompatible, lease, sizes)
+            for invalid in (
+                replace(lease, status="pending"),
+                replace(lease, slots=(((0, 128),),)),
+                replace(lease, slots=(((0, 128),), ((64, 128),))),
+                replace(lease, slots=(((0, 128),), ((4096, 128),))),
+                replace(lease, slots=(((0, 128),), ((256, 127),))),
+            ):
+                with pytest.raises(ValueError):
+                    context.checkpoint_slot_views(capability, invalid, sizes)
+        finally:
+            context.close()
+    finally:
+        shm_munmap(addr, 4096)
+        shm_unlink(name)
 
 
 def test_engine_driven_context_shm_tensor_view_from_buffer() -> None:

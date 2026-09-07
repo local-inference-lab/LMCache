@@ -11,6 +11,7 @@ This module provides the initialize_protocols() function that:
 # First Party
 from lmcache.v1.multiprocess.protocols import (
     blend,
+    checkpoint,
     controller,
     debug,
     engine,
@@ -37,6 +38,7 @@ _PROTOCOL_MODULES = [
     ("blend", blend),
     ("observability", observability),
     ("p2p", p2p),
+    ("checkpoint", checkpoint),
 ]
 
 
