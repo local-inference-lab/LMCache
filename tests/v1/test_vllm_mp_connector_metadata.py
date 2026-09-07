@@ -20,6 +20,7 @@ from lmcache.integration.vllm.lmcache_mp_connector import (
     LMCacheMPRequestState,
     LMCacheMPRequestTracker,
     _recurrent_safe_lookup_end,
+    validate_mamba_step_alignment,
 )
 
 CHUNK_TOKENS = 64
@@ -47,6 +48,46 @@ def test_recurrent_lookup_excludes_final_prompt_token(
 def test_recurrent_lookup_rejects_non_positive_chunk_size() -> None:
     with pytest.raises(ValueError, match="chunk_tokens must be positive"):
         _recurrent_safe_lookup_end(128, 0)
+
+
+@pytest.mark.parametrize(
+    ("cadence", "budget", "valid"),
+    [
+        (None, 1536, True),
+        (0, 1536, True),
+        (1536, 3071, True),
+        (1536, 3072, False),
+        (4608, 4608, True),
+        (4608, 9215, True),
+        (4608, 1536, False),
+        (4608, 9216, False),
+        (2048, 1536, True),
+        (2048, 4608, False),
+        (-1536, 1536, True),
+    ],
+)
+def test_mamba_alignment_uses_supported_snapshot_cadence(
+    cadence: int | None, budget: int, valid: bool
+) -> None:
+    """물리 페이지와 별개인 snapshot 주기의 허용 범위를 검증한다."""
+    cache = SimpleNamespace(mamba_cache_mode="align", block_size=1536)
+    if cadence is not None:
+        cache.mamba_block_size = cadence
+    config = SimpleNamespace(
+        cache_config=cache,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=budget),
+    )
+    if valid:
+        validate_mamba_step_alignment(config)
+    else:
+        with pytest.raises(ValueError, match="snapshot"):
+            validate_mamba_step_alignment(config)
+
+
+def test_cadence_validator_leaves_non_align_mode_unconstrained() -> None:
+    """align 외의 모드는 recurrent cadence 제한을 적용하지 않는다."""
+    config = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="none"))
+    validate_mamba_step_alignment(config)
 
 
 def _tracker(

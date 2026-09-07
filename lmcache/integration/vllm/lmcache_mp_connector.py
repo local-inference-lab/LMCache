@@ -174,10 +174,11 @@ def validate_mamba_step_alignment(vllm_config: VllmConfig) -> None:
     (``MambaManager.allocate_new_blocks``). LMCache keys chunks by token hash,
     so a skipped boundary would be stored as null-block garbage under a valid
     key and silently corrupt any request that later resumes from that prefix.
-    Requiring ``block_size <= max_num_batched_tokens < 2 * block_size`` makes
-    vLLM's block-aligned splitting (``Scheduler._mamba_block_aligned_split``)
-    advance every mid-prefill step by exactly one block, so every chunk
-    boundary holds a real snapshot.
+    ``mamba_block_size``가 물리 attention 페이지 크기의 양의 정수배이면
+    해당 recurrent snapshot 주기를 검증 단위로 사용한다. 나머지 설정은
+    물리 페이지 단위를 유지한다. ``block_size <= max_num_batched_tokens
+    < 2 * block_size``를 요구하여 블록 정렬 스케줄러가 중간 프리필 스텝마다
+    snapshot 경계를 하나씩 진행하도록 한다.
 
     Args:
         vllm_config: The vLLM config; only Mamba-hybrid models in ``align``
@@ -190,6 +191,10 @@ def validate_mamba_step_alignment(vllm_config: VllmConfig) -> None:
     if getattr(vllm_config.cache_config, "mamba_cache_mode", "none") != "align":
         return
     block_size = vllm_config.cache_config.block_size
+    cadence = getattr(vllm_config.cache_config, "mamba_block_size", None)
+    # recurrent snapshot 간격은 물리 attention 페이지보다 클 수 있다.
+    if cadence and cadence > 0 and cadence % block_size == 0:
+        block_size = cadence
     max_batched = vllm_config.scheduler_config.max_num_batched_tokens
     if not (block_size <= max_batched < 2 * block_size):
         raise ValueError(
