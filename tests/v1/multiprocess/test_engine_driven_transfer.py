@@ -75,6 +75,49 @@ class ServerModuleFactory(Protocol):
     ]: ...
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Requires CUDA transfer kernels"
+)
+@pytest.mark.parametrize("direction", ["gather", "scatter"])
+@pytest.mark.parametrize(
+    ("block_size", "head_size", "page_stride"),
+    [(4, 64, 384), (1536, 576, 1007616)],
+)
+def test_padded_mla_pages_preserve_block_addresses(
+    direction: str, block_size: int, head_size: int, page_stride: int
+) -> None:
+    """Logical draft pages must not read or overwrite neighboring pool pages."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    pool = torch.full((8, page_stride), 0xA5, dtype=torch.uint8, device="cuda")
+    cache = pool.as_strided((8, block_size, head_size), (page_stride, head_size, 1))
+    caches = {"draft": cache}
+    if direction == "gather":
+        for block in range(8):
+            cache[block].fill_(block + 1)
+        chunks = gather_paged_kv_to_cpu(caches, [2, 5], blocks_per_chunk=1)
+        torch.cuda.synchronize()
+        for chunk, expected in zip(chunks, (3, 6), strict=True):
+            assert (chunk == expected).all()
+    else:
+        chunks = [
+            torch.full(
+                (1, block_size, head_size), value, dtype=torch.uint8, pin_memory=True
+            )
+            for value in (11, 13)
+        ]
+        scatter_cpu_to_paged_kv(caches, [2, 5], chunks, blocks_per_chunk=1)
+        torch.cuda.synchronize()
+        assert (cache[2] == 11).all()
+        assert (cache[5] == 13).all()
+        assert (pool[:, block_size * head_size :] == 0xA5).all()
+        assert (pool[[0, 1, 3, 4, 6, 7]] == 0xA5).all()
+
+
 def _make_kv_caches(
     num_layers: int = 2,
     num_blocks: int = 6,

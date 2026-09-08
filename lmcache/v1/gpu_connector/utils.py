@@ -494,7 +494,7 @@ def resolve_block_stride_and_log_layout(
     kv_caches: DiscoverableKVCache,
     engine_kv_format: "lmc_ops.EngineKVFormat",
     layer_idx: int,
-    group_idx: int,
+    group_idx: int | None,
 ) -> Optional[int]:
     """Resolve the per-block stride for a KV layer group and log its layout.
 
@@ -516,7 +516,8 @@ def resolve_block_stride_and_log_layout(
         kv_caches: Full KV cache structure (already normalised).
         engine_kv_format: Format of ``kv_caches``.
         layer_idx: 0-based layer index used as the layout probe.
-        group_idx: 0-based group index, used only for logging.
+        group_idx: 0-based group index for logging, or ``None`` to skip the
+            audit log when resolving geometry on a transfer path.
 
     Returns:
         ``stride(0)`` for block-axis formats; ``None`` otherwise.
@@ -574,6 +575,9 @@ def resolve_block_stride_and_log_layout(
                     f"dtype={rep.dtype}."
                 )
         block_stride_elems = None
+
+    if group_idx is None:
+        return block_stride_elems
 
     # Best-effort layout audit log; the log line itself must not raise.
     shape = tuple(rep.shape)
