@@ -261,9 +261,9 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
         for task in metadata.tasks:
             if task.task_id in self._pending or task.task_id in self._rejected:
                 raise ValueError("Checkpoint copy task was submitted twice")
-            event = torch_dev.Event()
-            event.record()
             try:
+                event = torch_dev.Event()
+                event.record()
                 future = self._worker.submit(
                     CheckpointTransferJob(
                         task.manifest,
@@ -276,10 +276,10 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
             except UnsafeCheckpointCopyError:
                 raise
             except Exception:
-                # submit raises before accepting a copy. Report a terminal
+                # Event setup and submit fail before accepting a copy. Report a terminal
                 # result for this task and continue draining the batch; other
                 # ranks may already hold leases for every task in the batch.
-                logger.exception("Recurrent checkpoint copy submission failed")
+                logger.exception("Recurrent checkpoint copy setup or submission failed")
                 future = None
             if future is None:
                 self._rejected.add(task.task_id)

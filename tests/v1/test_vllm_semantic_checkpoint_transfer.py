@@ -223,8 +223,10 @@ def test_failed_begin_releases_source_pin_after_request_cancellation(
         assert manager.reset_prefix_cache()
 
 
+@pytest.mark.parametrize("failure_stage", ["submit", "event_create", "event_record"])
 def test_submission_exception_reports_each_unsent_task(
     monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
 ) -> None:
     """A rejected submission cannot strand the other ranks' source leases."""
     # First Party
@@ -241,9 +243,24 @@ def test_submission_exception_reports_each_unsent_task(
 
     def submit(job: CheckpointTransferJob) -> Future[bool]:
         submitted.append(job.manifest.generation)
-        if len(submitted) == 2:
+        if failure_stage == "submit" and len(submitted) == 2:
             raise RuntimeError("executor rejected checkpoint submission")
         return completed
+
+    event_calls = 0
+
+    def make_event() -> SimpleNamespace:
+        nonlocal event_calls
+        event_calls += 1
+        second_task = event_calls == 2
+        if second_task and failure_stage == "event_create":
+            raise RuntimeError("checkpoint event creation failed")
+
+        def record() -> None:
+            if second_task and failure_stage == "event_record":
+                raise RuntimeError("checkpoint event recording failed")
+
+        return SimpleNamespace(record=record)
 
     # Isolate the connector's worker protocol; real allocator/RPC ownership is
     # covered by the collective roundtrip test in this module.
@@ -262,13 +279,14 @@ def test_submission_exception_reports_each_unsent_task(
     monkeypatch.setattr(
         connector.torch_dev,
         "Event",
-        lambda: SimpleNamespace(record=lambda: None),
+        make_event,
     )
     LMCacheRecurrentCheckpointConnector.start_load_kv(worker, None)
     result = LMCacheRecurrentCheckpointConnector.build_connector_worker_meta(worker)
     assert set(result.results) == {task.task_id for task in tasks}
     assert result.results["0"] == {0: True}
     assert result.results["1"] == {0: False}
+    assert result.results["2"] == {0: True}
     assert not LMCacheRecurrentCheckpointConnector.build_connector_worker_meta(
         worker
     ).results
