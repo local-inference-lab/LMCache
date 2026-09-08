@@ -151,6 +151,7 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
         self._pending: dict[str, Future[bool]] = {}
         self._rejected: set[str] = set()
         self._role = role
+        self._rank: int | None = None
         if role == KVConnectorRole.SCHEDULER:
             clients = self._transport.scheduler_adapter.mq_clients
             if len(clients) != 1:
@@ -255,20 +256,31 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(metadata, RecurrentCheckpointMetadata):
             raise ValueError("Missing recurrent checkpoint task metadata")
         assert self._worker is not None
+        if self._rank is None:
+            raise RuntimeError("Recurrent checkpoint worker state must be bound")
         for task in metadata.tasks:
             if task.task_id in self._pending or task.task_id in self._rejected:
                 raise ValueError("Checkpoint copy task was submitted twice")
             event = torch_dev.Event()
             event.record()
-            future = self._worker.submit(
-                CheckpointTransferJob(
-                    task.manifest,
-                    self._rank,
-                    task.direction,
-                    task.block_ids,
-                    event,
+            try:
+                future = self._worker.submit(
+                    CheckpointTransferJob(
+                        task.manifest,
+                        self._rank,
+                        task.direction,
+                        task.block_ids,
+                        event,
+                    )
                 )
-            )
+            except UnsafeCheckpointCopyError:
+                raise
+            except Exception:
+                # submit raises before accepting a copy. Report a terminal
+                # result for this task and continue draining the batch; other
+                # ranks may already hold leases for every task in the batch.
+                logger.exception("Recurrent checkpoint copy submission failed")
+                future = None
             if future is None:
                 self._rejected.add(task.task_id)
             else:
@@ -294,6 +306,8 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
 
     def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata:
         """Return only drained rank completions and the initialization descriptor."""
+        if self._rank is None or self._worker_layout is None:
+            raise RuntimeError("Recurrent checkpoint worker state must be bound")
         results = {task: {self._rank: False} for task in self._rejected}
         self._rejected.clear()
         for task, future in tuple(self._pending.items()):
@@ -312,7 +326,6 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
             del self._pending[task]
         layouts = {}
         if not self._layout_sent:
-            assert self._worker_layout is not None
             layouts[self._rank] = self._worker_layout
             self._layout_sent = True
         return RecurrentCheckpointWorkerMetadata(layouts, results)

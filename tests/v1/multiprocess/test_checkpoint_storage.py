@@ -678,6 +678,40 @@ def test_http_nonforced_clear_preserves_checkpoint_read_and_write_leases(
         assert storage.get_readable_keys(retained + committed) == []
 
 
+@pytest.mark.parametrize("reservation", ["short", "raises"])
+@pytest.mark.parametrize("rollback", ["storage", "index"])
+def test_store_reservation_rollback_failure_releases_admission(
+    store: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    reservation: str,
+    rollback: str,
+) -> None:
+    """Cleanup failures cannot leave an unissued copy counted as a live lease."""
+    service, index, storage, _mapping = store
+    entry = make_manifest()
+    assert index.begin(entry)
+
+    def fail(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("injected reservation rollback failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            storage,
+            "reserve_write",
+            fail if reservation == "raises" else lambda *_args, **_kwargs: {},
+        )
+        patch.setattr(
+            storage if rollback == "storage" else index,
+            "abort_write" if rollback == "storage" else "abort",
+            fail,
+        )
+        with pytest.raises(RuntimeError, match="injected"):
+            service.prepare_store(entry, 0)
+    assert service.report_status()["store_leases"] == 0
+    if rollback == "storage":
+        assert not index.is_pending(entry)
+
+
 def test_failed_rank_prevents_publication_after_other_ranks_complete(
     store: Any,
 ) -> None:

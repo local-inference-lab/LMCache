@@ -236,6 +236,7 @@ class CheckpointPayloadStore:
                 return None
             self._store_ranks.add(identity)
         reserved: list[ObjectKey] = []
+        admitted = False
         try:
             slots = []
             for group, keys in zip(groups, key_groups, strict=True):
@@ -246,10 +247,6 @@ class CheckpointPayloadStore:
                 )
                 reserved.extend(objects)
                 if len(objects) != len(keys):
-                    self._storage.abort_write(reserved)
-                    self._index.abort(manifest.generation)
-                    with self._lock:
-                        self._store_ranks.remove(identity)
                     return None
                 slots.append(
                     tuple(_slot(objects[key], group.page_bytes) for key in keys)
@@ -257,13 +254,18 @@ class CheckpointPayloadStore:
             lease_id = uuid.uuid4().hex
             with self._lock:
                 self._stores[lease_id] = _StoreLease(manifest, rank, reserved)
+            admitted = True
             return CheckpointSlots(lease_id, tuple(slots))
-        except Exception:
-            self._storage.abort_write(reserved)
-            self._index.abort(manifest.generation)
-            with self._lock:
-                self._store_ranks.discard(identity)
-            raise
+        finally:
+            if not admitted:
+                try:
+                    self._storage.abort_write(reserved)
+                finally:
+                    try:
+                        self._index.abort(manifest.generation)
+                    finally:
+                        with self._lock:
+                            self._store_ranks.discard(identity)
 
     def finish_store(self, lease_id: str, success: bool) -> bool:
         """Commit or discard pages after the producer's CUDA event completes.
