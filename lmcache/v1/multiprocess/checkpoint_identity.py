@@ -13,6 +13,58 @@ import sys
 from lmcache.v1.multiprocess.checkpoint_index import CheckpointPrefix
 
 
+def _content_digest(prefix: CheckpointPrefix, discriminator: bytes) -> str:
+    encoded = json.dumps(
+        {
+            "namespace": prefix.namespace,
+            "start_tokens": prefix.start_tokens,
+            "prefix_hash": prefix.prefix_hash.hex(),
+            "tail_tokens": prefix.tail_tokens,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    return hashlib.sha256(
+        b"lmcache-recurrent-content-v1\0" + discriminator + b"\0" + encoded
+    ).hexdigest()
+
+
+def checkpoint_page_content_key(prefix: CheckpointPrefix, discriminator: str) -> str:
+    """Return a stable SHA256 key for one semantically immutable cache page.
+
+    ``prefix`` must end at the last token represented by the page. The caller's
+    discriminator separates attention pages from endpoint and auxiliary state;
+    rank and storage-group isolation are added by the storage layer.
+    """
+    return _content_digest(prefix, discriminator.encode())
+
+
+def checkpoint_generation(prefix: CheckpointPrefix, payload: bytes) -> str:
+    """Return an idempotent generation ID for one exact immutable manifest.
+
+    Args:
+        prefix: Authenticated exact token-prefix identity.
+        payload: Canonical manifest payload describing the byte layout.
+
+    Returns:
+        A stable versioned SHA256 identifier no longer than the wire limit.
+
+    Generation identity is metadata-only and intentionally excludes transient
+    request IDs, GPU block addresses, and storage capacity. Publishing the same
+    token prefix and byte layout again can therefore stop before reserving SHM
+    or copying GPU pages, including after a durable-index restart.
+    """
+    prefix_digest = _content_digest(prefix, "manifest".encode())
+    digest = hashlib.sha256(
+        b"lmcache-recurrent-generation-v1\0"
+        + bytes.fromhex(prefix_digest)
+        + b"\0"
+        + payload
+    ).hexdigest()
+    return f"recurrent-content-v1:{digest}"
+
+
 def checkpoint_namespace(identity: dict[str, object], cache_salt: str) -> str:
     """Authenticate the execution contract and a request's cache isolation salt.
 
@@ -64,6 +116,7 @@ class CheckpointTokenRoots:
     namespace: str
     roots: tuple[CheckpointPrefix, ...]
     chunk_tokens: int
+    end_hashes: tuple[bytes, ...]
 
     @classmethod
     def build(
@@ -88,6 +141,7 @@ class CheckpointTokenRoots:
             b"lmcache-recurrent-token-roots-v1\0" + chunk_tokens.to_bytes(4, "little")
         ).digest()
         roots = []
+        end_hashes = []
         for start in range(0, len(token_ids), chunk_tokens):
             tail = tuple(token_ids[start : start + chunk_tokens])
             root = CheckpointPrefix(namespace, start, chain, tail)
@@ -98,7 +152,8 @@ class CheckpointTokenRoots:
             if sys.byteorder != "little":
                 packed.byteswap()
             chain = hashlib.sha256(chain + packed.tobytes()).digest()
-        return cls(namespace, tuple(roots), chunk_tokens)
+            end_hashes.append(chain)
+        return cls(namespace, tuple(roots), chunk_tokens, tuple(end_hashes))
 
     def prefix(self, num_tokens: int) -> CheckpointPrefix:
         """Return the exact stored key for a nonempty covered token prefix.
@@ -121,3 +176,47 @@ class CheckpointTokenRoots:
             root.prefix_hash,
             root.tail_tokens[: num_tokens - root.start_tokens],
         )
+
+    def content_key(self, num_tokens: int, discriminator: str) -> str:
+        """Hash an exact token boundary without serializing preceding pages.
+
+        Full hash chunks reuse the chain digest produced by :meth:`build`.
+        Only a final partial chunk is packed once per call, keeping page-key
+        generation linear with a small constant even for long prompts.
+        """
+        return self.content_keys(((num_tokens, discriminator),))[0]
+
+    def content_keys(self, boundaries: Sequence[tuple[int, str]]) -> tuple[str, ...]:
+        """Hash several page identities, reusing each token-boundary digest."""
+        digests: dict[int, bytes] = {}
+        keys = []
+        for num_tokens, discriminator in boundaries:
+            token_digest = digests.get(num_tokens)
+            if token_digest is None:
+                token_digest = self._token_digest(num_tokens)
+                digests[num_tokens] = token_digest
+            encoded = json.dumps(
+                [self.namespace, num_tokens, discriminator],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+            keys.append(
+                hashlib.sha256(
+                    b"lmcache-recurrent-page-v1\0" + token_digest + b"\0" + encoded
+                ).hexdigest()
+            )
+        return tuple(keys)
+
+    def _token_digest(self, num_tokens: int) -> bytes:
+        if num_tokens <= 0 or not self.roots or num_tokens > self.roots[-1].num_tokens:
+            raise ValueError("Checkpoint boundary is outside the token sequence")
+        root_index = (num_tokens - 1) // self.chunk_tokens
+        if num_tokens == self.roots[root_index].num_tokens:
+            return self.end_hashes[root_index]
+        prefix = self.prefix(num_tokens)
+        packed = array("I", prefix.tail_tokens)
+        if packed.itemsize != 4:
+            raise ValueError("Checkpoint tokens require 32-bit unsigned integers")
+        if sys.byteorder != "little":
+            packed.byteswap()
+        return hashlib.sha256(prefix.prefix_hash + packed.tobytes()).digest()

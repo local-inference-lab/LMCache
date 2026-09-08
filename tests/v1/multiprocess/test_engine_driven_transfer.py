@@ -3074,6 +3074,7 @@ def test_checkpoint_shm_views_validate_identity_bounds_and_nonoverlap() -> None:
             )
             sizes = ((128,), (128,))
             views = context.checkpoint_slot_views(capability, lease, sizes)
+            assert views[0][0] is not None
             views[0][0].fill_(37)
             with shm_open_pool_as_mmap(name, 4096) as mapping:
                 assert mapping[:128] == bytes([37]) * 128

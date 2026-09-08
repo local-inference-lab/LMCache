@@ -32,8 +32,10 @@ class CheckpointLeaseResponse:
     """Transfer admission with per-group byte offsets and lengths in SHM.
 
     ``pending`` requires polling; ``miss`` permits no copy. Only ``ready``
-    includes pinned slots. A worker must validate slot widths against its
-    manifest and keep the lease until every submitted copy has completed.
+    includes pinned slots. A store slot of ``(-1, 0)`` means that immutable
+    content is already resident and needs no producer copy; retrieval never
+    uses that marker. A worker must validate slot widths against its manifest
+    and keep the lease until every submitted copy has completed.
     """
 
     status: Literal["pending", "miss", "ready"]

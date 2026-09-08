@@ -983,7 +983,7 @@ class EngineDrivenTransferContext(TransferContext):
         capabilities: CheckpointCapabilities,
         lease: CheckpointLeaseResponse,
         page_sizes: tuple[tuple[int, ...], ...],
-    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+    ) -> tuple[tuple[torch.Tensor | None, ...], ...]:
         """Borrow checkpoint bytes from the worker's registered SHM mapping.
 
         Args:

@@ -11,6 +11,7 @@ import uuid
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.checkpoint_identity import (
     CheckpointTokenRoots,
+    checkpoint_generation,
     checkpoint_namespace,
 )
 from lmcache.v1.multiprocess.checkpoint_index import CheckpointManifest
@@ -225,8 +226,16 @@ class CheckpointSchedulerBridge:
         if pinned is None:
             return
         try:
+            roots = self._roots(request)
             positions = self._manager.boundary_checkpoint_page_positions(
                 checkpoint.num_tokens
+            )
+            content_keys, auxiliary_key = self._page_content_keys(
+                roots,
+                checkpoint.num_tokens,
+                positions,
+                checkpoint.draft_prefix_len,
+                checkpoint.kind,
             )
             page_bytes = self._layout["page_bytes"]
             groups = [
@@ -234,6 +243,7 @@ class CheckpointSchedulerBridge:
                     "name": f"engine-kv-group:{i}",
                     "page_bytes": page_bytes,
                     "positions": list(pages),
+                    "content_keys": list(content_keys[i]),
                 }
                 for i, pages in enumerate(positions)
             ]
@@ -242,23 +252,26 @@ class CheckpointSchedulerBridge:
                     "name": "target-draft-auxiliary",
                     "page_bytes": page_bytes,
                     "positions": [0],
+                    "content_keys": [auxiliary_key],
                 }
             )
+            prefix = roots.prefix(checkpoint.num_tokens)
+            payload = json.dumps(
+                {
+                    "schema_version": 2,
+                    "worker_layout": self._layout,
+                    "page_groups": groups,
+                    "draft_prefix_len": checkpoint.draft_prefix_len,
+                    "kind": checkpoint.kind,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
             manifest = CheckpointManifest(
-                uuid.uuid4().hex,
-                self._roots(request).prefix(checkpoint.num_tokens),
+                checkpoint_generation(prefix, payload),
+                prefix,
                 self._world_size,
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "worker_layout": self._layout,
-                        "page_groups": groups,
-                        "draft_prefix_len": checkpoint.draft_prefix_len,
-                        "kind": checkpoint.kind,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode(),
+                payload,
             )
             task = self._make_task(manifest, checkpoint, "STORE")
             self._tasks[task.task_id] = _PendingTask(
@@ -272,6 +285,51 @@ class CheckpointSchedulerBridge:
         except BaseException:
             self._cache.release(pinned)
             raise
+
+    def _page_content_keys(
+        self,
+        roots: CheckpointTokenRoots,
+        num_tokens: int,
+        positions: tuple[tuple[int, ...], ...],
+        draft_prefix_len: int,
+        kind: str,
+    ) -> tuple[tuple[tuple[str, ...], ...], str]:
+        """Authenticate reusable attention pages and unique recurrent endpoints."""
+        # Import against the source-locked vLLM boundary allocator only when
+        # semantic checkpoint storage is active.
+        # Third Party
+        from vllm.v1.kv_cache_interface import MambaSpec, iter_layer_specs
+
+        managers = self._manager.coordinator.single_type_managers
+        specs = self._manager.kv_cache_config.kv_cache_groups
+        if len(managers) != len(positions) or len(specs) != len(positions):
+            raise ValueError("Checkpoint cache-group geometry changed during store")
+        boundaries: list[tuple[int, str]] = []
+        widths = []
+        for group_id, (manager, spec, pages) in enumerate(
+            zip(managers, specs, positions, strict=True)
+        ):
+            recurrent = all(
+                isinstance(layer_spec, MambaSpec)
+                for layer_spec in iter_layer_specs(spec.kv_cache_spec)
+            )
+            widths.append(len(pages))
+            for position in pages:
+                page_end = (
+                    num_tokens
+                    if recurrent
+                    else min((position + 1) * manager.block_size, num_tokens)
+                )
+                boundaries.append(
+                    (
+                        page_end,
+                        f"{'recurrent' if recurrent else 'attention'}:{group_id}",
+                    )
+                )
+        boundaries.append((num_tokens, f"auxiliary:{draft_prefix_len}:{kind}"))
+        flat_keys = iter(roots.content_keys(boundaries))
+        keys = tuple(tuple(next(flat_keys) for _ in range(width)) for width in widths)
+        return keys, next(flat_keys)
 
     def take_tasks(self) -> list[CheckpointEngineTask]:
         """Return each admitted collective copy exactly once, without waiting on RPC."""

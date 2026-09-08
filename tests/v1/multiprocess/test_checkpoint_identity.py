@@ -13,7 +13,9 @@ import pytest
 # First Party
 from lmcache.v1.multiprocess.checkpoint_identity import (
     CheckpointTokenRoots,
+    checkpoint_generation,
     checkpoint_namespace,
+    checkpoint_page_content_key,
 )
 from lmcache.v1.multiprocess.checkpoint_index import CheckpointIndex, CheckpointManifest
 
@@ -76,3 +78,45 @@ def test_token_roots_match_arbitrary_boundaries_without_quadratic_tails() -> Non
 def test_token_root_rejects_non_token_wire_values(tokens: list[object]) -> None:
     with pytest.raises(ValueError, match="wire limits"):
         CheckpointTokenRoots.build("authenticated", cast(list[int], tokens))
+
+
+def test_generation_is_content_stable_and_manifest_sensitive() -> None:
+    prefix = CheckpointTokenRoots.build("authenticated", range(5000)).prefix(4500)
+    payload = b'{"schema_version":1,"layout":"a"}'
+    generation = checkpoint_generation(prefix, payload)
+    assert generation == checkpoint_generation(prefix, payload)
+    assert generation != checkpoint_generation(prefix, payload + b" ")
+    assert generation != checkpoint_generation(
+        replace(prefix, tail_tokens=prefix.tail_tokens[:-1]), payload
+    )
+    assert len(generation) <= 128
+
+
+def test_page_content_key_is_prefix_stable_and_role_separated() -> None:
+    roots = CheckpointTokenRoots.build("authenticated", range(9000))
+    prefix = roots.prefix(8192)
+    key = checkpoint_page_content_key(prefix, "attention:0")
+    assert key == checkpoint_page_content_key(prefix, "attention:0")
+    assert key != checkpoint_page_content_key(roots.prefix(8193), "attention:0")
+    assert key != checkpoint_page_content_key(prefix, "recurrent:0")
+    assert len(key) == 64
+
+
+def test_token_roots_content_key_is_stable_at_full_and_partial_chunks() -> None:
+    roots = CheckpointTokenRoots.build("authenticated", range(9000))
+    for boundary in (4096, 4097, 8192, 9000):
+        key = roots.content_key(boundary, "attention:0")
+        assert key == roots.content_key(boundary, "attention:0")
+        assert key != roots.content_key(boundary, "attention:1")
+        assert len(key) == 64
+    changed = CheckpointTokenRoots.build("authenticated", [*range(8999), 42])
+    assert roots.content_key(8192, "attention:0") == changed.content_key(
+        8192, "attention:0"
+    )
+    assert roots.content_key(9000, "attention:0") != changed.content_key(
+        9000, "attention:0"
+    )
+    assert roots.content_keys(((9000, "attention:0"), (9000, "auxiliary"))) == (
+        roots.content_key(9000, "attention:0"),
+        roots.content_key(9000, "auxiliary"),
+    )
