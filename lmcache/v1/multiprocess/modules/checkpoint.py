@@ -29,7 +29,10 @@ def _ready(slots: CheckpointSlots) -> CheckpointLeaseResponse:
         "ready",
         slots.lease_id,
         tuple(
-            tuple((slot.offset, slot.length) for slot in group)
+            tuple(
+                (slot.offset, slot.length) if slot is not None else (-1, 0)
+                for slot in group
+            )
             for group in slots.groups
         ),
     )

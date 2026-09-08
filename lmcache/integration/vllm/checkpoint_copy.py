@@ -114,6 +114,10 @@ class CheckpointPageCopier:
             lease,
             tuple(tuple(group.page_bytes for _ in group.positions) for group in groups),
         )
+        if job.direction == "RETRIEVE" and any(
+            page is None for group in buffers for page in group
+        ):
+            raise ValueError("Checkpoint retrieval cannot omit payload pages")
         # One enqueue burst per lease prevents interleaving producer waits with
         # another task's copies on the shared stream. No model-thread barrier.
         with (
@@ -126,6 +130,8 @@ class CheckpointPageCopier:
                     self._stream.wait_event(job.producer_event)
                 for ids, pages in zip(job.block_ids, buffers, strict=True):
                     for block, page in zip(ids, pages, strict=True):
+                        if page is None:
+                            continue
                         if job.direction == "STORE":
                             page.copy_(self._pool[block], non_blocking=True)
                         else:

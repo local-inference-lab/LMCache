@@ -40,7 +40,7 @@ def test_only_complete_distinct_rank_set_is_visible() -> None:
     index = CheckpointIndex()
     entry = manifest()
     assert index.begin(entry)
-    assert index.begin(entry)
+    assert not index.begin(entry)
     for rank in (0, 0, 1, 2, 2):
         assert not index.acknowledge(entry.generation, rank)
         assert index.find((entry.prefix,)) is None
@@ -49,6 +49,24 @@ def test_only_complete_distinct_rank_set_is_visible() -> None:
     assert index.acknowledge(entry.generation, 3)
     assert index.find((entry.prefix,)) == entry
     assert not index.acknowledge(entry.generation, 3)
+    index.close()
+
+
+def test_identical_published_manifest_is_idempotent_across_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "checkpoint-index.sqlite3"
+    entry = manifest("recurrent-content-v1:" + "a" * 64)
+    index = CheckpointIndex(path)
+    publish(index, entry)
+    assert not index.begin(entry)
+    index.close()
+
+    index = CheckpointIndex(path)
+    assert not index.begin(entry)
+    with pytest.raises(ValueError, match="changed after publication"):
+        index.begin(replace(entry, payload=b'{"schema_version":1,"changed":true}'))
+    assert index.find((entry.prefix,)) == entry
     index.close()
 
 

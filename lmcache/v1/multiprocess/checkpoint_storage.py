@@ -52,6 +52,7 @@ class CheckpointPageGroup:
     name: str
     page_bytes: int
     positions: tuple[int, ...]
+    content_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name or len(self.name) > 256:
@@ -66,6 +67,17 @@ class CheckpointPageGroup:
         ):
             raise ValueError(
                 "checkpoint page positions must be nonempty and increasing"
+            )
+        if self.content_keys and (
+            len(self.content_keys) != len(self.positions)
+            or any(
+                len(key) != 64
+                or any(character not in "0123456789abcdef" for character in key)
+                for key in self.content_keys
+            )
+        ):
+            raise ValueError(
+                "checkpoint content keys must be one lowercase SHA256 per page"
             )
 
 
@@ -90,7 +102,12 @@ def checkpoint_page_groups(
         raise ValueError("checkpoint manifest requires 1..4096 storage groups")
     try:
         groups = tuple(
-            CheckpointPageGroup(row["name"], row["page_bytes"], tuple(row["positions"]))
+            CheckpointPageGroup(
+                row["name"],
+                row["page_bytes"],
+                tuple(row["positions"]),
+                tuple(row.get("content_keys", ())),
+            )
             for row in rows
         )
     except (KeyError, TypeError) as exc:
@@ -110,16 +127,18 @@ def checkpoint_object_keys(
         rank: Physical tensor-parallel worker rank in the manifest's world.
 
     Returns:
-        Per-group keys ordered by logical page position. Each key includes the
-        generation, rank, storage role and namespace; generations cannot mix.
-        Rank/storage pairs have separate eviction namespaces because their
-        logical positions are not aligned distributed token-chunk families.
-        The manifest and complete-payload retrieval enforce generation atomicity.
+        Per-group keys ordered by logical page position. Schema-1 keys include
+        the generation; schema-2 keys include authenticated page content. Both
+        include rank, storage role and namespace. Rank/storage pairs have
+        separate eviction namespaces because their logical positions are not
+        aligned distributed token-chunk families. The manifest and complete-
+        payload retrieval enforce generation atomicity.
 
     Compatibility:
-        Version-2 payload keys intentionally miss version-1 filesystem objects.
-        Missing payloads invalidate their manifest and require recomputation;
-        neither mixed generations nor partially restored state are returned.
+        Schema-1 manifests retain generation-scoped v2 object keys. Schema-2
+        manifests use content-addressed v3 keys and intentionally miss the old
+        filesystem objects. Missing payloads invalidate their manifest and
+        require recomputation; generations never return partial state.
 
     Raises:
         ValueError: If rank or the manifest's byte layout is invalid.
@@ -127,6 +146,9 @@ def checkpoint_object_keys(
     if not 0 <= rank < manifest.world_size:
         raise ValueError("checkpoint payload rank is out of range")
     groups = checkpoint_page_groups(manifest)
+    payload_version = json.loads(manifest.payload).get("schema_version")
+    if payload_version == 2 and any(not group.content_keys for group in groups):
+        raise ValueError("version-2 checkpoint groups require content keys")
     namespaces = tuple(
         hashlib.sha256(
             json.dumps([manifest.prefix.namespace, rank, group_id, group.name]).encode()
@@ -136,14 +158,19 @@ def checkpoint_object_keys(
     return tuple(
         tuple(
             ObjectKey(
-                hashlib.sha256(
-                    json.dumps([manifest.generation, group.name, position]).encode()
-                ).digest(),
-                f"recurrent-checkpoint-v2-{namespaces[group_id]}",
+                (
+                    bytes.fromhex(group.content_keys[page_id])
+                    if group.content_keys
+                    else hashlib.sha256(
+                        json.dumps([manifest.generation, group.name, position]).encode()
+                    ).digest()
+                ),
+                f"recurrent-checkpoint-v{3 if group.content_keys else 2}-"
+                f"{namespaces[group_id]}",
                 rank,
                 group_id,
             )
-            for position in group.positions
+            for page_id, position in enumerate(group.positions)
         )
         for group_id, group in enumerate(groups)
     )
@@ -169,7 +196,7 @@ class CheckpointSlots:
     """Pinned SHM descriptors grouped in the manifest's storage/page order."""
 
     lease_id: str
-    groups: tuple[tuple[ShmSlotDescriptor, ...], ...]
+    groups: tuple[tuple[ShmSlotDescriptor | None, ...], ...]
 
 
 @dataclass
@@ -256,10 +283,12 @@ class CheckpointPayloadStore:
             self._store_ranks.add(identity)
         reserved: list[ObjectKey] = []
 
-        def attempt() -> AdmissionAttempt[tuple[tuple[ShmSlotDescriptor, ...], ...]]:
+        def attempt() -> AdmissionAttempt[
+            tuple[tuple[ShmSlotDescriptor | None, ...], ...]
+        ]:
             if not self._index.is_pending(manifest):
                 return AdmissionAttempt.failure(AdmissionFailure.CONFLICT)
-            slots = []
+            slots: list[tuple[ShmSlotDescriptor | None, ...]] = []
             for group, keys in zip(groups, key_groups, strict=True):
                 detailed = self._storage.reserve_write_detailed(
                     list(keys),
@@ -272,10 +301,21 @@ class CheckpointPayloadStore:
                     if obj is not None
                 }
                 reserved.extend(objects)
-                if len(objects) != len(keys):
+                existing_candidates = [
+                    key
+                    for key in keys
+                    if detailed.get(key, (L1Error.KEY_NOT_EXIST, None))[0]
+                    is L1Error.KEY_NOT_WRITABLE
+                ]
+                readable = set(self._storage.get_readable_keys(existing_candidates))
+                if len(objects) + len(readable) != len(keys):
                     self._storage.abort_write(reserved)
                     reserved.clear()
-                    missing = [key for key in keys if key not in objects]
+                    missing = [
+                        key
+                        for key in keys
+                        if key not in objects and key not in readable
+                    ]
                     capacity_only = all(
                         detailed.get(key, (L1Error.KEY_NOT_WRITABLE, None))[0]
                         is L1Error.OUT_OF_MEMORY
@@ -287,7 +327,12 @@ class CheckpointPayloadStore:
                         else AdmissionFailure.CONFLICT
                     )
                 slots.append(
-                    tuple(_slot(objects[key], group.page_bytes) for key in keys)
+                    tuple(
+                        _slot(objects[key], group.page_bytes)
+                        if key in objects
+                        else None
+                        for key in keys
+                    )
                 )
             return AdmissionAttempt.success(tuple(slots))
 

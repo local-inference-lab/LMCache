@@ -55,10 +55,11 @@ class CheckpointPrefix:
 class CheckpointManifest:
     """One all-rank payload generation for an exact token prefix.
 
-    ``generation`` is a caller-generated, globally unique identifier shared by
-    all producer ranks. ``payload`` is versioned JSON describing immutable
-    storage object keys and layouts; consumers validate its schema separately.
-    The directory never merges manifests or payloads from different generations.
+    ``generation`` is an immutable identifier shared by all producer ranks; it
+    may be content-derived to make exact publication idempotent. ``payload`` is
+    versioned JSON describing immutable storage object keys and layouts;
+    consumers validate its schema separately. The directory never merges
+    manifests or payloads from different generations.
     """
 
     generation: str
@@ -74,7 +75,7 @@ class CheckpointManifest:
         if not self.payload or len(self.payload) > 16 * 1024 * 1024:
             raise ValueError("checkpoint manifest must contain at most 16 MiB")
         decoded = json.loads(self.payload)
-        if not isinstance(decoded, dict) or decoded.get("schema_version") != 1:
+        if not isinstance(decoded, dict) or decoded.get("schema_version") not in (1, 2):
             raise ValueError("unsupported checkpoint manifest schema")
 
 
@@ -150,8 +151,10 @@ class CheckpointIndex:
             manifest: Immutable generation and expected rank count.
 
         Returns:
-            False if the unpublished-generation capacity is exhausted; True on
-            admission or an identical pending registration.
+            False if the unpublished-generation capacity is exhausted or the
+            identical manifest is already pending/published; True only when a
+            new generation is admitted. Duplicate suppression happens before
+            any SHM reservation or GPU copy.
 
         Raises:
             ValueError: If the generation is reused for a different manifest or
@@ -162,12 +165,25 @@ class CheckpointIndex:
             if pending is not None:
                 if pending.manifest != manifest:
                     raise ValueError("checkpoint generation changed during store")
-                return True
-            if self._db.execute(
-                "SELECT 1 FROM checkpoints WHERE generation=?",
+                return False
+            published = self._db.execute(
+                "SELECT namespace,start_tokens,prefix_hash,tail,world_size,payload "
+                "FROM checkpoints WHERE generation=?",
                 (manifest.generation,),
-            ).fetchone():
-                raise ValueError("checkpoint generation is already published")
+            ).fetchone()
+            if published is not None:
+                prefix = manifest.prefix
+                expected = (
+                    prefix.namespace,
+                    prefix.start_tokens,
+                    prefix.prefix_hash,
+                    json.dumps(prefix.tail_tokens).encode(),
+                    manifest.world_size,
+                    manifest.payload,
+                )
+                if published != expected:
+                    raise ValueError("checkpoint generation changed after publication")
+                return False
             if len(self._pending) >= self._max_pending:
                 return False
             self._pending[manifest.generation] = _PendingManifest(manifest)

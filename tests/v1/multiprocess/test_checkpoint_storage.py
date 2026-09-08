@@ -9,6 +9,7 @@ from mmap import mmap
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
+import hashlib
 import json
 import threading
 import time
@@ -140,6 +141,51 @@ def make_manifest() -> CheckpointManifest:
     )
 
 
+def make_content_manifest(
+    generation: str,
+    *,
+    prefix_token: int,
+    attention_keys: tuple[str, ...],
+) -> CheckpointManifest:
+    """Build a v2 manifest whose attention pages can span generations."""
+    unique = lambda label: hashlib.sha256(label.encode()).hexdigest()
+    return CheckpointManifest(
+        generation,
+        CheckpointPrefix(
+            "weights-and-layout-and-salt",
+            4096,
+            b"a" * 32,
+            (1, 2, prefix_token),
+        ),
+        1,
+        json.dumps(
+            {
+                "schema_version": 2,
+                "page_groups": [
+                    {
+                        "name": "target.attention.0",
+                        "page_bytes": 128,
+                        "positions": [0, 1, 2],
+                        "content_keys": list(attention_keys),
+                    },
+                    {
+                        "name": "target.recurrent.0",
+                        "page_bytes": 256,
+                        "positions": [16],
+                        "content_keys": [unique(f"recurrent-{prefix_token}")],
+                    },
+                    {
+                        "name": "target-draft-auxiliary",
+                        "page_bytes": 96,
+                        "positions": [0],
+                        "content_keys": [unique(f"auxiliary-{prefix_token}")],
+                    },
+                ],
+            }
+        ).encode(),
+    )
+
+
 @contextmanager
 def open_checkpoint_rpc() -> Iterator[
     tuple[MessageQueueClient, CheckpointModule, mmap, str]
@@ -229,6 +275,50 @@ def test_checkpoint_rpc_roundtrip_uses_metadata_and_shared_bytes() -> None:
             assert call(RequestType.CHECKPOINT_FINISH_RETRIEVE, lease.lease_id)
         status = module.report_status()["recurrent_checkpoints"]
         assert status["store_leases"] == status["retrieve_leases"] == 0
+
+
+def test_content_addressed_pages_skip_resident_duplicate_copies(store) -> None:
+    service, index, _storage, mapping = store
+    shared = tuple(
+        hashlib.sha256(f"attention-{i}".encode()).hexdigest() for i in range(3)
+    )
+    first = make_content_manifest(
+        "recurrent-content-v1:" + "1" * 64,
+        prefix_token=3,
+        attention_keys=shared,
+    )
+    second = make_content_manifest(
+        "recurrent-content-v1:" + "2" * 64,
+        prefix_token=4,
+        attention_keys=shared,
+    )
+
+    assert index.begin(first)
+    first_lease = service.prepare_store(first, 0)
+    assert first_lease is not None
+    assert all(slot is not None for group in first_lease.groups for slot in group)
+    for group_id, group in enumerate(first_lease.groups):
+        for slot in group:
+            assert slot is not None
+            mapping[slot.offset : slot.offset + slot.length] = (
+                bytes([group_id + 1]) * slot.length
+            )
+    assert service.finish_store(first_lease.lease_id, True)
+
+    assert index.begin(second)
+    second_lease = service.prepare_store(second, 0)
+    assert second_lease is not None
+    assert second_lease.groups[0] == (None, None, None)
+    assert all(slot is not None for group in second_lease.groups[1:] for slot in group)
+    for group_id, group in enumerate(second_lease.groups[1:], start=1):
+        for slot in group:
+            assert slot is not None
+            mapping[slot.offset : slot.offset + slot.length] = (
+                bytes([group_id + 1]) * slot.length
+            )
+    assert service.finish_store(second_lease.lease_id, True)
+    assert checkpoint_object_keys(first, 0)[0] == checkpoint_object_keys(second, 0)[0]
+    assert checkpoint_object_keys(first, 0)[1:] != checkpoint_object_keys(second, 0)[1:]
 
 
 def test_background_checkpoint_copy_retains_lease_until_callback_drains() -> None:
@@ -570,6 +660,7 @@ def test_payload_capacity_miss_preserves_a_pinned_checkpoint(store: Any) -> None
         assert index.find((entry.prefix,)) == entry
         for group_id, group in enumerate(read.groups):
             for page_id, slot in enumerate(group):
+                assert slot is not None
                 assert mapping[slot.offset : slot.offset + slot.length] == (
                     bytes([group_id * 4 + page_id]) * slot.length
                 )
@@ -584,6 +675,7 @@ def test_payload_capacity_miss_preserves_a_pinned_checkpoint(store: Any) -> None
 def fill(mapping: mmap, lease: CheckpointSlots, rank: int) -> None:
     for group_id, group in enumerate(lease.groups):
         for page_id, slot in enumerate(group):
+            assert slot is not None
             mapping[slot.offset : slot.offset + slot.length] = (
                 bytes([rank * 16 + group_id * 4 + page_id]) * slot.length
             )
@@ -625,6 +717,7 @@ def test_shm_roundtrip_all_ranks_groups_and_read_lease_lifetime(store: Any) -> N
         assert isinstance(lease, CheckpointSlots)
         for group_id, group in enumerate(lease.groups):
             for page_id, slot in enumerate(group):
+                assert slot is not None
                 assert (
                     mapping[slot.offset : slot.offset + slot.length]
                     == bytes([rank * 16 + group_id * 4 + page_id]) * slot.length
@@ -668,6 +761,7 @@ def test_http_nonforced_clear_preserves_checkpoint_read_and_write_leases(
         assert isinstance(lease, CheckpointSlots)
         for group_id, group in enumerate(lease.groups):
             for page_id, slot in enumerate(group):
+                assert slot is not None
                 assert mapping[slot.offset : slot.offset + slot.length] == (
                     bytes([group_id * 4 + page_id]) * slot.length
                 )
@@ -843,6 +937,7 @@ def test_sustained_checkpoint_stores_reclaim_capacity_without_losing_a_read(
         service.finish_retrieve(restored.lease_id)
         for group_id, group in enumerate(pinned.groups):
             for page_id, slot in enumerate(group):
+                assert slot is not None
                 assert mapping[slot.offset : slot.offset + slot.length] == (
                     bytes([group_id * 4 + page_id]) * slot.length
                 )
@@ -884,6 +979,7 @@ def test_filesystem_restore_after_directory_and_storage_restart(
             assert isinstance(lease, CheckpointSlots)
             for group_id, group in enumerate(lease.groups):
                 for page_id, slot in enumerate(group):
+                    assert slot is not None
                     assert (
                         mapping[slot.offset : slot.offset + slot.length]
                         == bytes([rank * 16 + group_id * 4 + page_id]) * slot.length

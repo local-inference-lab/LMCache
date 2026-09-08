@@ -153,7 +153,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
         capabilities: CheckpointCapabilities,
         lease: CheckpointLeaseResponse,
         page_sizes: tuple[tuple[int, ...], ...],
-    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+    ) -> tuple[tuple[torch.Tensor | None, ...], ...]:
         """Borrow validated uint8 views from an already registered SHM pool.
 
         Args:
@@ -187,6 +187,8 @@ class EngineDrivenContextShm(EngineDrivenContext):
                     "Checkpoint lease page counts disagree with the manifest"
                 )
             for (offset, size), expected in zip(slots, sizes, strict=True):
+                if (offset, size) == (-1, 0):
+                    continue
                 if (
                     offset < 0
                     or size <= 0
@@ -203,7 +205,11 @@ class EngineDrivenContextShm(EngineDrivenContext):
             raise ValueError("Checkpoint SHM pages must not overlap")
         return tuple(
             tuple(
-                self._make_tensor_view(offset, size, [size], "uint8")
+                (
+                    None
+                    if (offset, size) == (-1, 0)
+                    else self._make_tensor_view(offset, size, [size], "uint8")
+                )
                 for offset, size in group
             )
             for group in lease.slots
