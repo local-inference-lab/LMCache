@@ -18,6 +18,11 @@ import uuid
 import torch
 
 # First Party
+from lmcache.v1.distributed.admission import (
+    AdmissionAttempt,
+    AdmissionFailure,
+    reserve_with_eviction_backpressure,
+)
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
@@ -25,6 +30,7 @@ from lmcache.v1.distributed.api import (
     PrefetchRequestSpec,
     TrimPolicy,
 )
+from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.multiprocess.checkpoint_index import CheckpointIndex, CheckpointManifest
 from lmcache.v1.multiprocess.transfer_context.shm import ShmSlotDescriptor
 
@@ -106,21 +112,34 @@ def checkpoint_object_keys(
     Returns:
         Per-group keys ordered by logical page position. Each key includes the
         generation, rank, storage role and namespace; generations cannot mix.
+        Rank/storage pairs have separate eviction namespaces because their
+        logical positions are not aligned distributed token-chunk families.
+        The manifest and complete-payload retrieval enforce generation atomicity.
+
+    Compatibility:
+        Version-2 payload keys intentionally miss version-1 filesystem objects.
+        Missing payloads invalidate their manifest and require recomputation;
+        neither mixed generations nor partially restored state are returned.
 
     Raises:
         ValueError: If rank or the manifest's byte layout is invalid.
     """
     if not 0 <= rank < manifest.world_size:
         raise ValueError("checkpoint payload rank is out of range")
-    namespace = hashlib.sha256(manifest.prefix.namespace.encode()).hexdigest()
     groups = checkpoint_page_groups(manifest)
+    namespaces = tuple(
+        hashlib.sha256(
+            json.dumps([manifest.prefix.namespace, rank, group_id, group.name]).encode()
+        ).hexdigest()
+        for group_id, group in enumerate(groups)
+    )
     return tuple(
         tuple(
             ObjectKey(
                 hashlib.sha256(
                     json.dumps([manifest.generation, group.name, position]).encode()
                 ).digest(),
-                f"recurrent-checkpoint-v1-{namespace}",
+                f"recurrent-checkpoint-v2-{namespaces[group_id]}",
                 rank,
                 group_id,
             )
@@ -236,26 +255,64 @@ class CheckpointPayloadStore:
                 return None
             self._store_ranks.add(identity)
         reserved: list[ObjectKey] = []
-        admitted = False
-        try:
+
+        def attempt() -> AdmissionAttempt[tuple[tuple[ShmSlotDescriptor, ...], ...]]:
+            if not self._index.is_pending(manifest):
+                return AdmissionAttempt.failure(AdmissionFailure.CONFLICT)
             slots = []
             for group, keys in zip(groups, key_groups, strict=True):
-                objects = self._storage.reserve_write(
+                detailed = self._storage.reserve_write_detailed(
                     list(keys),
                     MemoryLayoutDesc([torch.Size([group.page_bytes])], [torch.uint8]),
                     "new",
                 )
+                objects = {
+                    key: obj
+                    for key, (_error, obj) in detailed.items()
+                    if obj is not None
+                }
                 reserved.extend(objects)
                 if len(objects) != len(keys):
-                    return None
+                    self._storage.abort_write(reserved)
+                    reserved.clear()
+                    missing = [key for key in keys if key not in objects]
+                    capacity_only = all(
+                        detailed.get(key, (L1Error.KEY_NOT_WRITABLE, None))[0]
+                        is L1Error.OUT_OF_MEMORY
+                        for key in missing
+                    )
+                    return AdmissionAttempt.failure(
+                        AdmissionFailure.CAPACITY
+                        if capacity_only
+                        else AdmissionFailure.CONFLICT
+                    )
                 slots.append(
                     tuple(_slot(objects[key], group.page_bytes) for key in keys)
                 )
+            return AdmissionAttempt.success(tuple(slots))
+
+        admitted = False
+        try:
+            outcome = reserve_with_eviction_backpressure(
+                attempt=attempt,
+                get_generation=self._storage.get_capacity_generation,
+                request_eviction=self._storage.request_immediate_eviction,
+                wait_for_change=self._storage.wait_for_capacity_change,
+                timeout_seconds=self._storage.store_admission_timeout_seconds,
+                on_wait=self._storage.record_admission_wait,
+                on_retry=self._storage.record_admission_retry,
+                on_success_after_eviction=(
+                    self._storage.record_admission_success_after_eviction
+                ),
+                on_timeout=self._storage.record_admission_timeout,
+            )
+            if outcome.value is None:
+                return None
             lease_id = uuid.uuid4().hex
             with self._lock:
                 self._stores[lease_id] = _StoreLease(manifest, rank, reserved)
             admitted = True
-            return CheckpointSlots(lease_id, tuple(slots))
+            return CheckpointSlots(lease_id, outcome.value)
         finally:
             if not admitted:
                 try:

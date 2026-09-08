@@ -28,6 +28,10 @@ from lmcache.v1.distributed.config import (
     L1MemoryManagerConfig,
     StorageManagerConfig,
 )
+from lmcache.v1.distributed.eviction_policy import (
+    IsolatedLRUEvictionPolicy,
+    LRUEvictionPolicy,
+)
 from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
 from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
@@ -697,7 +701,7 @@ def test_store_reservation_rollback_failure_releases_admission(
     with monkeypatch.context() as patch:
         patch.setattr(
             storage,
-            "reserve_write",
+            "reserve_write_detailed",
             fail if reservation == "raises" else lambda *_args, **_kwargs: {},
         )
         patch.setattr(
@@ -785,6 +789,70 @@ def test_generation_namespace_and_rank_have_disjoint_payload_keys() -> None:
         }
         assert not (keys & seen)
         seen.update(keys)
+
+
+@pytest.mark.parametrize("policy_type", [LRUEvictionPolicy, IsolatedLRUEvictionPolicy])
+def test_checkpoint_payloads_remain_eligible_for_lru_eviction(policy_type: Any) -> None:
+    """Variable-page checkpoint groups must not require nonexistent siblings."""
+    policy = policy_type()
+    entry = make_manifest()
+    all_keys: list[ObjectKey] = []
+    for rank in range(entry.world_size):
+        for group in checkpoint_object_keys(entry, rank):
+            policy.on_keys_created(list(group))
+            all_keys.extend(group)
+
+    actions = policy.get_eviction_actions(1.0, cache_salt="")
+    assert {key for action in actions for key in action.keys} == set(all_keys)
+
+    # The manifest/retrieval contract owns all-rank completeness. An unrelated
+    # pinned page cannot make every other checkpoint object permanently resident.
+    pinned = all_keys[0]
+    actions = policy.get_eviction_actions(
+        1.0, key_eligible_filter=lambda key: key != pinned, cache_salt=""
+    )
+    assert {key for action in actions for key in action.keys} == set(all_keys) - {
+        pinned
+    }
+
+
+def test_sustained_checkpoint_stores_reclaim_capacity_without_losing_a_read(
+    store: Any,
+) -> None:
+    """A bounded RAM pool accepts generations while preserving a live SHM lease."""
+    service, index, storage, mapping = store
+    pinned_entry = replace(make_manifest(), world_size=1)
+    publish_all(service, index, mapping, pinned_entry)
+    pinned = poll(service, service.begin_retrieve(pinned_entry, 0))
+    assert isinstance(pinned, CheckpointSlots)
+    payload = json.loads(pinned_entry.payload)
+    for group in payload["page_groups"]:
+        group["page_bytes"] = 128 * 1024
+    try:
+        for sequence in range(16):
+            entry = replace(
+                pinned_entry,
+                generation=uuid.uuid4().hex,
+                prefix=replace(pinned_entry.prefix, tail_tokens=(sequence + 100,)),
+                payload=json.dumps(payload).encode(),
+            )
+            publish_all(service, index, mapping, entry)
+            assert index.find((entry.prefix,)) == entry
+        restored = poll(service, service.begin_retrieve(entry, 0))
+        assert isinstance(restored, CheckpointSlots)
+        service.finish_retrieve(restored.lease_id)
+        for group_id, group in enumerate(pinned.groups):
+            for page_id, slot in enumerate(group):
+                assert mapping[slot.offset : slot.offset + slot.length] == (
+                    bytes([group_id * 4 + page_id]) * slot.length
+                )
+        status = storage.report_status()["l1_manager"]
+        assert status["memory_used_bytes"] <= status["memory_total_bytes"]
+        assert storage.get_admission_stats()["exhausted_timeouts"] == 0
+    finally:
+        service.finish_retrieve(pinned.lease_id)
+    assert service.report_status()["store_leases"] == 0
+    assert service.report_status()["retrieve_leases"] == 0
 
 
 @pytest.mark.parametrize("native", [False, True])
