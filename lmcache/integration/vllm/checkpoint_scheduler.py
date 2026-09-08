@@ -8,6 +8,7 @@ import json
 import uuid
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.checkpoint_identity import (
     CheckpointTokenRoots,
     checkpoint_namespace,
@@ -17,6 +18,8 @@ from lmcache.v1.multiprocess.checkpoint_storage import checkpoint_page_groups
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocols.base import RequestType
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     # Third Party
@@ -279,7 +282,21 @@ class CheckpointSchedulerBridge:
             if pending.begin is not None:
                 if not pending.begin.query():
                     continue
-                if not pending.begin.result():
+                try:
+                    accepted = pending.begin.result()
+                except Exception:
+                    logger.exception("Recurrent checkpoint begin operation failed")
+                    # No worker has received this task. Its GPU source pin can
+                    # be released even if the server's begin reply was lost.
+                    try:
+                        self._client.submit_request(
+                            RequestType.CHECKPOINT_ABORT,
+                            [pending.task.manifest.generation],
+                        )
+                    except Exception:
+                        logger.exception("Recurrent checkpoint abort submission failed")
+                    accepted = False
+                if not accepted:
                     self._cache.release(pending.checkpoint)
                     del self._tasks[task_id]
                     if pending.request_id in self._cancelled:

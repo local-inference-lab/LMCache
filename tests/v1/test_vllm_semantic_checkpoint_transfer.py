@@ -2,7 +2,9 @@
 """Atomic external checkpoint ownership with the real vLLM allocator and LMCache RPC."""
 
 # Standard
+from concurrent.futures import Future
 from types import SimpleNamespace
+from typing import cast
 import time
 
 # Third Party
@@ -35,6 +37,7 @@ from lmcache.integration.vllm.checkpoint_scheduler import (  # noqa: E402
 )
 from lmcache.integration.vllm.recurrent_checkpoint_connector import (  # noqa: E402
     LMCacheRecurrentCheckpointConnector,
+    RecurrentCheckpointMetadata,
     RecurrentCheckpointWorkerMetadata,
 )
 from lmcache.v1.multiprocess.checkpoint_transfer import (  # noqa: E402
@@ -168,6 +171,123 @@ def make_manager() -> KVCacheManager:
         scheduler_block_size=4,
         enable_boundary_checkpoints=True,
     )
+
+
+def test_failed_begin_releases_source_pin_after_request_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An RPC exception before dispatch owns no worker copy or source pin."""
+    with open_checkpoint_rpc() as (client, _module, _mapping, _name):
+        manager = make_manager()
+        bridge = CheckpointSchedulerBridge(
+            manager,
+            client,
+            {
+                "target_revision": "a" * 40,
+                "draft_revision": "",
+                "source_revision": "b" * 40,
+                "parallel": {"tp": 4, "dcp": 1},
+            },
+            4,
+        )
+        bridge.accept_layouts(
+            {rank: {"schema_version": 1, "page_bytes": 128} for rank in range(4)}
+        )
+        request = make_request("failed-begin")
+        checkpoint = manager.reserve_external_boundary_checkpoint(
+            request,
+            11,
+            manager.boundary_checkpoint_page_positions(11),
+            draft_prefix_len=11,
+            kind="prompt",
+            num_ranks=4,
+        )
+        assert checkpoint is not None
+        for rank in range(4):
+            manager.acknowledge_external_boundary_checkpoint(
+                checkpoint.checkpoint_id, rank
+            )
+        failed: Future[bool] = Future()
+        failed.set_exception(RuntimeError("checkpoint begin transport failure"))
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                client,
+                "submit_request",
+                lambda *_: SimpleNamespace(query=lambda: True, result=failed.result),
+            )
+            bridge.store(request, checkpoint)
+        bridge.finish_request(request.request_id)
+        assert not manager.reset_prefix_cache()
+        assert bridge.take_tasks() == []
+        assert not bridge.has_pending
+        assert manager.reset_prefix_cache()
+
+
+def test_submission_exception_reports_each_unsent_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected submission cannot strand the other ranks' source leases."""
+    # First Party
+    from lmcache.integration.vllm import recurrent_checkpoint_connector as connector
+    from tests.v1.multiprocess.test_checkpoint_storage import make_manifest
+
+    tasks = [
+        CheckpointEngineTask(str(i), make_manifest(), "STORE", ((0,),))
+        for i in range(3)
+    ]
+    submitted: list[str] = []
+    completed: Future[bool] = Future()
+    completed.set_result(True)
+
+    def submit(job: CheckpointTransferJob) -> Future[bool]:
+        submitted.append(job.manifest.generation)
+        if len(submitted) == 2:
+            raise RuntimeError("executor rejected checkpoint submission")
+        return completed
+
+    # Isolate the connector's worker protocol; real allocator/RPC ownership is
+    # covered by the collective roundtrip test in this module.
+    worker = cast(
+        LMCacheRecurrentCheckpointConnector,
+        SimpleNamespace(
+            _connector_metadata=RecurrentCheckpointMetadata(tasks),
+            _worker=SimpleNamespace(submit=submit),
+            _rank=0,
+            _pending={},
+            _rejected=set(),
+            _layout_sent=False,
+            _worker_layout={"schema_version": 1, "page_bytes": 128},
+        ),
+    )
+    monkeypatch.setattr(
+        connector.torch_dev,
+        "Event",
+        lambda: SimpleNamespace(record=lambda: None),
+    )
+    LMCacheRecurrentCheckpointConnector.start_load_kv(worker, None)
+    result = LMCacheRecurrentCheckpointConnector.build_connector_worker_meta(worker)
+    assert set(result.results) == {task.task_id for task in tasks}
+    assert result.results["0"] == {0: True}
+    assert result.results["1"] == {0: False}
+    assert not LMCacheRecurrentCheckpointConnector.build_connector_worker_meta(
+        worker
+    ).results
+
+
+def test_worker_metadata_requires_bound_rank() -> None:
+    """Unbound worker state must fail before emitting an invalid rank ID."""
+    worker = cast(
+        LMCacheRecurrentCheckpointConnector,
+        SimpleNamespace(
+            _rank=None,
+            _pending={},
+            _rejected=set(),
+            _layout_sent=False,
+            _worker_layout=None,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="bound"):
+        LMCacheRecurrentCheckpointConnector.build_connector_worker_meta(worker)
 
 
 @pytest.mark.parametrize(
