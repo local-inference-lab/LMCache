@@ -2,6 +2,7 @@
 """MPCacheServer compositor and unified cache server entry point."""
 
 # Standard
+from pathlib import Path
 import argparse
 import shutil
 import signal
@@ -51,6 +52,7 @@ from lmcache.v1.multiprocess.engine_module import (
     InstanceLivenessTarget,
     ThreadPoolType,
 )
+from lmcache.v1.multiprocess.modules.checkpoint import CheckpointModule
 from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
     EngineDrivenTransferModule,
 )
@@ -144,11 +146,19 @@ class MPCacheServer:
                 }
         return None
 
-    def clear(self) -> None:
-        """Used by ``/cache/clear``; delegates to :class:`ManagementModule`."""
+    def clear(self, *, force: bool = True) -> None:
+        """Clear resident L1 objects through :class:`ManagementModule`.
+
+        Args:
+            force: Whether to free locked objects too. False preserves in-flight
+                transfers; True requires an idle engine.
+
+        Raises:
+            RuntimeError: If no management module is registered.
+        """
         for module in self._modules:
             if isinstance(module, ManagementModule):
-                module.clear()
+                module.clear(force=force)
                 return
         raise RuntimeError("MPCacheServer.clear: no ManagementModule registered")
 
@@ -218,6 +228,24 @@ def _build_modules(
         )
 
     logger.info("Supported transfer mode: %s", mp_config.supported_transfer_mode)
+
+    has_checkpoint_storage = (
+        mp_config.supported_transfer_mode in ("engine_driven", "auto")
+        and bool(ctx.shm_pool_info["shm_name"])
+        and ctx.shm_pool_info["pool_size"] > 0
+    )
+    if mp_config.checkpoint_index_path is not None and not has_checkpoint_storage:
+        raise ValueError("Checkpoint manifest storage requires engine-driven SHM")
+    checkpoint_modules: list[EngineModule] = []
+    if has_checkpoint_storage:
+        checkpoint_modules.append(
+            CheckpointModule(
+                ctx,
+                Path(mp_config.checkpoint_index_path)
+                if mp_config.checkpoint_index_path is not None
+                else None,
+            )
+        )
 
     # Targets the reaper scans (and reap-notifies). The transfer modules own
     # per-instance liveness; BlendModule is appended below as a state mirror.
@@ -315,6 +343,7 @@ def _build_modules(
         p2p_controller,
         management,
         *transfer_modules,
+        *checkpoint_modules,
         *experimental_modules,
         *blend_modules,
     ]

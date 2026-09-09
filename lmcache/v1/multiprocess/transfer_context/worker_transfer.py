@@ -26,6 +26,10 @@ from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType
+from lmcache.v1.multiprocess.protocols.checkpoint import (
+    CheckpointCapabilities,
+    CheckpointLeaseResponse,
+)
 from lmcache.v1.multiprocess.protocols.engine import RegisterEngineDrivenContextResponse
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
@@ -957,6 +961,34 @@ class EngineDrivenTransferContext(TransferContext):
                 "Engine-driven retrieve reservation release was not acknowledged"
             )
         return committed
+
+    def checkpoint_slot_views(
+        self,
+        capabilities: CheckpointCapabilities,
+        lease: CheckpointLeaseResponse,
+        page_sizes: tuple[tuple[int, ...], ...],
+    ) -> tuple[tuple[torch.Tensor | None, ...], ...]:
+        """Borrow checkpoint bytes from the worker's registered SHM mapping.
+
+        Args:
+            capabilities: Checkpoint protocol and pool identity from the server.
+            lease: Complete server-owned read or write lease.
+            page_sizes: Required byte sizes in manifest group/page order.
+
+        Returns:
+            Borrowed uint8 tensor views; retain the lease until DMA drains.
+
+        Raises:
+            ValueError: If the registered transport is not SHM or the lease is invalid.
+        """
+        # First Party
+        from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
+
+        if not isinstance(self._engine_driven_context, EngineDrivenContextShm):
+            raise ValueError("Semantic checkpoint transfers require engine-driven SHM")
+        return self._engine_driven_context.checkpoint_slot_views(
+            capabilities, lease, page_sizes
+        )
 
     def register(
         self,
