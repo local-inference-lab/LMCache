@@ -295,7 +295,8 @@ class EvictionConfig:
 
     emergency_evict_for_prefetch: bool = field(default=False)
     """ Allow non-warm L2 prefetches to synchronously make room in L1 by
-    evicting LRU objects through the fail-closed writeback path. """
+    evicting eligible LRU objects. Write-through discards unlocked RAM copies;
+    writeback persists each eviction batch before releasing it. """
 
 
 @dataclass
@@ -374,12 +375,6 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
     """
     if config.eviction_config.periodic_flush_interval < 0:
         raise ValueError("periodic_flush_interval must be >= 0")
-    if (
-        config.eviction_config.emergency_evict_for_prefetch
-        and not config.eviction_config.write_back_on_evict
-    ):
-        raise ValueError("emergency_evict_for_prefetch requires write_back_on_evict")
-
     if (
         config.l1_manager_config.gds_l1_config is not None
         and config.l1_manager_config.memory_config.devdax_path
@@ -582,7 +577,7 @@ def add_storage_manager_args(
         "--emergency-evict-for-prefetch",
         action="store_true",
         help="Allow non-warm L2 prefetches to make room in L1 by evicting "
-        "LRU objects through --write-back-on-evict.",
+        "eligible LRU objects. With --write-back-on-evict, persist victims first.",
     )
     eviction_group.add_argument(
         "--store-admission-timeout-seconds",

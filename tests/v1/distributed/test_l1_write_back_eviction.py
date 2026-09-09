@@ -240,20 +240,46 @@ def test_emergency_prefetch_defaults_off_and_cli_is_plumbed() -> None:
     assert config.emergency_evict_for_prefetch is True
 
 
-def test_emergency_prefetch_requires_writeback() -> None:
-    with pytest.raises(ValueError, match="requires write_back_on_evict"):
-        StorageManagerConfig(
-            l1_manager_config=L1ManagerConfig(
-                memory_config=L1MemoryManagerConfig(
-                    size_in_bytes=POOL_BYTES,
-                    use_lazy=False,
-                )
-            ),
-            eviction_config=EvictionConfig(
-                eviction_policy="LRU",
-                emergency_evict_for_prefetch=True,
-            ),
-        )
+def test_emergency_prefetch_accepts_write_through() -> None:
+    config = StorageManagerConfig(
+        l1_manager_config=L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(
+                size_in_bytes=POOL_BYTES,
+                use_lazy=False,
+            )
+        ),
+        eviction_config=EvictionConfig(
+            eviction_policy="LRU",
+            emergency_evict_for_prefetch=True,
+        ),
+    )
+    assert config.eviction_config.write_back_on_evict is False
+    assert config.eviction_config.emergency_evict_for_prefetch is True
+
+
+def test_emergency_write_through_preserves_readers_and_writers(
+    l1_manager: L1Manager,
+) -> None:
+    adapter = _SyncStoreAdapter()
+    controller = _controller(l1_manager, {0: adapter}, enabled=False)
+    keys = _make_keys(8)
+    _store_keys(l1_manager, keys[:7])
+    assert l1_manager.reserve_read(keys[:1])[keys[0]][0] == L1Error.SUCCESS
+    pending = l1_manager.reserve_write(keys[7:], [False], OBJECT_LAYOUT)
+    assert pending[keys[7]][0] == L1Error.SUCCESS
+
+    free = controller.emergency_evict_bytes(3 * 1024 * 1024, requester="write-through")
+
+    assert free >= 3 * 1024 * 1024
+    assert adapter.stored_batches == []
+    assert l1_manager.unsafe_read(keys[:1])[keys[0]][0] == L1Error.SUCCESS
+    status = l1_manager.report_status()
+    assert status["read_locked_count"] == 1
+    assert status["write_locked_count"] == 1
+    assert status["total_object_count"] < len(keys)
+    l1_manager.finish_read(keys[:1])
+    l1_manager.finish_write(keys[7:])
+    assert _readable_keys(l1_manager, [keys[0], keys[7]]) == [keys[0], keys[7]]
 
 
 def test_disabled_controller_keeps_discard_behavior(l1_manager: L1Manager) -> None:
@@ -1051,8 +1077,10 @@ def test_storage_manager_reconnects_emergency_evictor_on_adapter_changes(
         manager.close()
 
 
+@pytest.mark.parametrize("writeback", [False, True])
 def test_storage_manager_emergency_prefetch_restores_under_l1_pressure(
     tmp_path,
+    writeback: bool,
 ) -> None:
     pytest.importorskip("lmcache.lmcache_fs")
     config = StorageManagerConfig(
@@ -1067,7 +1095,7 @@ def test_storage_manager_emergency_prefetch_restores_under_l1_pressure(
         eviction_config=EvictionConfig(
             eviction_policy="LRU",
             trigger_watermark=1.0,
-            write_back_on_evict=True,
+            write_back_on_evict=writeback,
             emergency_evict_for_prefetch=True,
         ),
         l2_adapter_config=L2AdaptersConfig(
