@@ -22,6 +22,7 @@ import pytest
 import zmq
 
 # First Party
+from lmcache.v1.distributed.admission import AdmissionFailure
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.config import (
     EvictionConfig,
@@ -67,6 +68,7 @@ from lmcache.v1.multiprocess.protocol import (
     get_handler_type,
     get_payload_classes,
 )
+from lmcache.v1.multiprocess.protocols.checkpoint import CheckpointLeaseResponse
 from lmcache.v1.multiprocess.server import MPCacheServer
 
 
@@ -321,6 +323,104 @@ def test_content_addressed_pages_skip_resident_duplicate_copies(store) -> None:
     assert checkpoint_object_keys(first, 0)[1:] != checkpoint_object_keys(second, 0)[1:]
 
 
+@pytest.mark.parametrize("first_succeeds", [True, False])
+def test_content_addressed_pages_coalesce_with_inflight_writer(
+    store, first_succeeds: bool
+) -> None:
+    """Overlapping boundary generations wait for shared immutable pages.
+
+    A successful owner makes the shared attention pages no-copy objects for the
+    waiter. If the owner aborts, the waiter reserves and writes those pages.
+    Neither outcome may discard the waiter's complete generation.
+    """
+    service, index, _storage, mapping = store
+    shared = tuple(
+        hashlib.sha256(f"inflight-attention-{i}".encode()).hexdigest() for i in range(3)
+    )
+    first = make_content_manifest(
+        "recurrent-content-v1:" + "3" * 64,
+        prefix_token=31,
+        attention_keys=shared,
+    )
+    second = make_content_manifest(
+        "recurrent-content-v1:" + "4" * 64,
+        prefix_token=32,
+        attention_keys=shared,
+    )
+
+    assert index.begin(first)
+    assert index.begin(second)
+    first_lease = service.prepare_store(first, 0)
+    assert first_lease is not None
+    fill(mapping, first_lease, 1)
+
+    assert service.prepare_store(second, 0) is AdmissionFailure.BUSY
+    assert service.finish_store(first_lease.lease_id, first_succeeds) is first_succeeds
+    second_lease = service.prepare_store(second, 0)
+
+    assert second_lease is not None
+    if first_succeeds:
+        assert second_lease.groups[0] == (None, None, None)
+    else:
+        assert all(slot is not None for slot in second_lease.groups[0])
+    for group_id, group in enumerate(second_lease.groups):
+        for slot in group:
+            if slot is not None:
+                mapping[slot.offset : slot.offset + slot.length] = (
+                    bytes([group_id + 2]) * slot.length
+                )
+    assert service.finish_store(second_lease.lease_id, True)
+    assert index.find((second.prefix,)) == second
+
+
+def test_transfer_worker_retries_inflight_content_without_blocking_rpc() -> None:
+    """A producer retries busy content while the owning GPU copy completes."""
+    with open_checkpoint_rpc() as (client, module, mapping, _name):
+        shared = tuple(
+            hashlib.sha256(f"worker-inflight-{i}".encode()).hexdigest()
+            for i in range(3)
+        )
+        first = make_content_manifest(
+            "recurrent-content-v1:" + "5" * 64,
+            prefix_token=41,
+            attention_keys=shared,
+        )
+        second = make_content_manifest(
+            "recurrent-content-v1:" + "6" * 64,
+            prefix_token=42,
+            attention_keys=shared,
+        )
+        first_started = threading.Event()
+        release_first = threading.Event()
+
+        def copy_pages(
+            job: CheckpointTransferJob, lease: CheckpointLeaseResponse
+        ) -> None:
+            if job.manifest == first:
+                first_started.set()
+                assert release_first.wait(timeout=5)
+            for group_id, group in enumerate(lease.slots):
+                for offset, size in group:
+                    if offset >= 0:
+                        mapping[offset : offset + size] = bytes([group_id + 3]) * size
+
+        worker = CheckpointTransferWorker(client, copy_pages, workers=2)
+        assert module.begin(first)
+        assert module.begin(second)
+        first_result = worker.submit(CheckpointTransferJob(first, 0, "STORE", ()))
+        assert first_result is not None and first_started.wait(timeout=5)
+        second_result = worker.submit(CheckpointTransferJob(second, 0, "STORE", ()))
+        assert second_result is not None
+        time.sleep(0.05)
+        assert not second_result.done()
+        release_first.set()
+        assert first_result.result(timeout=5)
+        assert second_result.result(timeout=5)
+        assert module.find((first.prefix,)) == first
+        assert module.find((second.prefix,)) == second
+        worker.close()
+
+
 def test_background_checkpoint_copy_retains_lease_until_callback_drains() -> None:
     """A blocked copy is not published and cannot surrender its buffer to close."""
     with open_checkpoint_rpc() as (client, module, mapping, _name):
@@ -398,7 +498,7 @@ def test_checkpoint_lease_budget_never_recycles_live_copy_buffers(store) -> None
     entry = make_manifest()
     assert index.begin(entry)
     lease = service.prepare_store(entry, 0)
-    assert lease is not None
+    assert isinstance(lease, CheckpointSlots)
     assert service.begin_retrieve(entry, 0) is None
     assert service.prepare_store(entry, 1) is None
     assert service.report_status()["store_leases"] == 1
@@ -700,7 +800,7 @@ def publish_all(
     assert index.begin(entry)
     for rank in range(entry.world_size):
         lease = service.prepare_store(entry, rank)
-        assert lease is not None
+        assert isinstance(lease, CheckpointSlots)
         fill(mapping, lease, rank)
         assert service.finish_store(lease.lease_id, True) == (
             rank == entry.world_size - 1
