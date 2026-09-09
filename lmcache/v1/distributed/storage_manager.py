@@ -212,8 +212,10 @@ class StorageManager:
                 "periodic_flush_interval is enabled but no L2 adapter exposes "
                 "a timeout-capable store_objects_sync; periodic backup is idle"
             )
-        if self._eviction_config.emergency_evict_for_prefetch and not (
-            self._eviction_controller.has_bounded_l2_flush_adapter()
+        if (
+            self._eviction_config.emergency_evict_for_prefetch
+            and self._eviction_config.write_back_on_evict
+            and not self._eviction_controller.has_bounded_l2_flush_adapter()
         ):
             logger.warning(
                 "emergency_evict_for_prefetch is enabled but no L2 adapter "
@@ -1313,6 +1315,7 @@ class StorageManager:
         if not (
             self._eviction_config.write_back_on_evict
             or self._eviction_config.periodic_flush_interval > 0
+            or self._eviction_config.emergency_evict_for_prefetch
         ):
             return
         with self._adapters_lock:
@@ -1321,7 +1324,8 @@ class StorageManager:
         if self._eviction_config.emergency_evict_for_prefetch:
             self._prefetch_controller.set_l1_eviction_controller(
                 self._eviction_controller
-                if self._eviction_controller.has_bounded_l2_flush_adapter()
+                if not self._eviction_config.write_back_on_evict
+                or self._eviction_controller.has_bounded_l2_flush_adapter()
                 else None
             )
 
