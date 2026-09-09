@@ -5,6 +5,7 @@
 from pathlib import Path
 
 # First Party
+from lmcache.v1.distributed.admission import AdmissionFailure
 from lmcache.v1.multiprocess.checkpoint_index import (
     CheckpointIndex,
     CheckpointManifest,
@@ -135,8 +136,14 @@ class CheckpointModule:
 
         Invalid layouts, ranks or duplicate active rank stores raise ValueError.
         """
-        slots = self._payloads.prepare_store(manifest, rank)
-        return _ready(slots) if slots is not None else CheckpointLeaseResponse("miss")
+        admission = self._payloads.prepare_store(manifest, rank)
+        if admission is AdmissionFailure.BUSY:
+            return CheckpointLeaseResponse("busy")
+        return (
+            _ready(admission)
+            if isinstance(admission, CheckpointSlots)
+            else CheckpointLeaseResponse("miss")
+        )
 
     def finish_store(self, lease_id: str, success: bool) -> bool:
         """Finish drained D2H work; True means all ranks published the manifest."""

@@ -18,6 +18,7 @@ class AdmissionFailure(str, Enum):
     """Stable failure reasons returned by grouped store admission."""
 
     CAPACITY = "capacity"
+    BUSY = "busy"
     CONFLICT = "conflict"
     INVALID_LAYOUT = "invalid_layout"
     TIMEOUT = "capacity_timeout"
@@ -76,7 +77,8 @@ def reserve_with_eviction_backpressure(
     """Retry capacity failures until eviction, shutdown, or a deadline.
 
     ``attempt`` must abort every partial reservation before returning failure.
-    Conflict and layout failures return immediately without requesting eviction.
+    Conflict, busy-writer and layout failures return immediately without
+    requesting eviction.
 
     Args:
         attempt: Atomic reservation attempt.

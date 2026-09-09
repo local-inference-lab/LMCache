@@ -199,7 +199,7 @@ class CheckpointTransferWorker:
                 timeout=self._rpc_timeout
             )
 
-        if lease.status == "miss":
+        if lease.status in ("miss", "busy"):
             return
         if store:
             call(RequestType.CHECKPOINT_FINISH_STORE, lease.lease_id, False)
@@ -227,6 +227,16 @@ class CheckpointTransferWorker:
             else RequestType.CHECKPOINT_BEGIN_RETRIEVE
         )
         lease: CheckpointLeaseResponse = self._call(request, job.manifest, job.rank)
+        if store:
+            deadline = time.monotonic() + self._rpc_timeout
+            retry_delay = 0.001
+            while lease.status == "busy":
+                remaining = deadline - time.monotonic()
+                if self._closing or remaining <= 0:
+                    return False
+                time.sleep(min(retry_delay, remaining))
+                lease = self._call(request, job.manifest, job.rank)
+                retry_delay = min(retry_delay * 2, 0.01)
         if not store:
             # Poll in the background; the scheduler can continue serving other
             # requests. A pending lookup owns no worker-visible byte slots yet.
