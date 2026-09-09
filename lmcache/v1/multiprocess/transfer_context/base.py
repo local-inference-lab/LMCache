@@ -52,7 +52,10 @@ class PagedKVTransferWorkspace:
     The paged-cache pointer table is immutable for the lifetime of a registered
     engine. Block IDs change for every cache object, so each in-flight store
     receives a distinct pinned-host and device staging pair. One staging tensor
-    holds the four objects supported by a native transfer launch.
+    holds the four objects supported by a native transfer launch. Larger stores
+    use a call-owned pinned-host snapshot so batches never overwrite metadata
+    still being consumed by an asynchronous H2D copy. The caller must not reuse
+    a workspace slot before its transfer completion event has finished.
     """
 
     paged_buffer_ptrs: torch.Tensor
@@ -749,6 +752,25 @@ def gather_paged_kv_to_cpu(
                 block_ids_device = transfer_workspace.block_ids_device[
                     transfer_workspace_slot
                 ]
+                required_device_ids = min(4 * bpw, len(selected_block_ids))
+                if required_device_ids > block_ids_device.numel():
+                    raise ValueError(
+                        f"transfer workspace holds {block_ids_device.numel()} "
+                        f"block IDs, but the launch requires {required_device_ids}"
+                    )
+                if len(selected_block_ids) > block_ids_host.numel():
+                    block_ids_host = torch.empty(
+                        len(selected_block_ids),
+                        dtype=torch.int64,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                # Host writes are not ordered by the CUDA stream. Keep every
+                # batch's source immutable until its H2D copy completes; copy_
+                # records pinned-allocation lifetime on that stream.
+                block_ids_host[: len(selected_block_ids)].numpy()[:] = (
+                    selected_block_ids
+                )
 
             # This safely points to either the pre-pinned chunks
             # OR the temporary staged_chunks
@@ -773,16 +795,9 @@ def gather_paged_kv_to_cpu(
                 else:
                     assert block_ids_host is not None
                     assert block_ids_device is not None
-                    batch_ids = selected_block_ids[start_block:end_block]
-                    batch_count = len(batch_ids)
-                    if batch_count > block_ids_host.numel():
-                        raise ValueError(
-                            f"transfer workspace holds {block_ids_host.numel()} "
-                            f"block IDs, but the launch requires {batch_count}"
-                        )
-                    block_ids_host[:batch_count].numpy()[:] = batch_ids
+                    batch_count = end_block - start_block
                     block_ids_device[:batch_count].copy_(
-                        block_ids_host[:batch_count], non_blocking=True
+                        block_ids_host[start_block:end_block], non_blocking=True
                     )
                     batch_blocks = block_ids_device[:batch_count]
 
