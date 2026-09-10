@@ -293,9 +293,10 @@ def test_delete_reconciles_missing_file_from_usage_ledger(tmp_path) -> None:
         kv_rank=0,
         cache_salt="tenant-a",
     )
+    objects: Any = [_BufferObj(b"payload")]
     writer = NativeConnectorL2Adapter(LMCacheFSClient(str(tmp_path), 1))
     try:
-        assert writer.store_objects_sync([key], [_BufferObj(b"payload")]) == (
+        assert writer.store_objects_sync([key], objects) == (
             True,
             1,
             7,
