@@ -446,6 +446,44 @@ def test_restart_restores_compiled_fs_usage_and_evicts_oldest(tmp_path) -> None:
         adapter.close()
 
 
+def test_delete_reconciles_missing_file_from_usage_ledger(tmp_path) -> None:
+    """Deleting an already-missing native object retires its tracked bytes."""
+    LMCacheFSClient = _import_fs_client()
+    key = ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(1),
+        model_name="restart/model",
+        kv_rank=0,
+        cache_salt="tenant-a",
+    )
+    writer = NativeConnectorL2Adapter(LMCacheFSClient(str(tmp_path), 1))
+    try:
+        assert writer.store_objects_sync([key], [_BufferObj(b"payload")]) == (
+            True,
+            1,
+            7,
+        )
+    finally:
+        writer.close()
+
+    adapter = create_l2_adapter(
+        FSNativeL2AdapterConfig(
+            base_path=str(tmp_path),
+            num_workers=1,
+            max_capacity_gb=10 / (1024**3),
+        )
+    )
+    try:
+        (tmp_path / _object_key_to_filename(key)).unlink()
+        assert adapter.get_usage().total_bytes_used == 7
+
+        adapter.delete([key])
+
+        assert adapter.get_usage().total_bytes_used == 0
+        assert adapter.get_existing_key_sizes() == {}
+    finally:
+        adapter.close()
+
+
 def test_odirect_read_does_not_split_for_read_ahead(tmp_path) -> None:
     """O_DIRECT reads should ignore read_ahead_size and use one aligned read."""
     if not hasattr(os, "O_DIRECT"):
