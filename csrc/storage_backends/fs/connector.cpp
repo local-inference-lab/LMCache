@@ -321,7 +321,14 @@ bool FSConnector::do_single_delete(WorkerFSConn& conn, const std::string& key) {
   std::string filename = key_to_filename(key);
   auto file_path = conn.base_path / filename;
   std::error_code ec;
-  return std::filesystem::remove(file_path, ec);
+  const bool removed = std::filesystem::remove(file_path, ec);
+  if (ec) {
+    throw std::runtime_error("delete failed for " + file_path.string() + ": " +
+                             ec.message());
+  }
+  // Deletion is idempotent: an already-absent object is reconciled just as a
+  // removed object is. The adapter uses this result to retire its byte ledger.
+  return removed || !std::filesystem::exists(file_path);
 }
 
 }  // namespace connector
