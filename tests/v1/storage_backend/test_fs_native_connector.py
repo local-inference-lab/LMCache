@@ -446,12 +446,15 @@ def test_restart_restores_compiled_fs_usage_and_evicts_oldest(tmp_path) -> None:
         adapter.close()
 
 
-def test_delete_reconciles_missing_file_from_usage_ledger(tmp_path) -> None:
+@pytest.mark.parametrize("model_name", ["restart/model", "org/" + "model" * 60])
+def test_delete_reconciles_missing_file_from_usage_ledger(
+    tmp_path, model_name: str
+) -> None:
     """Deleting an already-missing native object retires its tracked bytes."""
     LMCacheFSClient = _import_fs_client()
     key = ObjectKey(
         chunk_hash=ObjectKey.IntHash2Bytes(1),
-        model_name="restart/model",
+        model_name=model_name,
         kv_rank=0,
         cache_salt="tenant-a",
     )
@@ -474,13 +477,39 @@ def test_delete_reconciles_missing_file_from_usage_ledger(tmp_path) -> None:
         )
     )
     try:
-        (tmp_path / _object_key_to_filename(key)).unlink()
+        (tmp_path / _object_key_to_relative_path(key)).unlink()
         assert adapter.get_usage().total_bytes_used == 7
 
         adapter.delete([key])
 
         assert adapter.get_usage().total_bytes_used == 0
         assert adapter.get_existing_key_sizes() == {}
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("model_name", ["restart/model", "org/" + "model" * 60])
+def test_delete_error_does_not_retire_tracked_bytes(tmp_path, model_name: str) -> None:
+    """A nonempty directory at an object path is an error, not a missing key."""
+    LMCacheFSClient = _import_fs_client()
+    key = ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(2),
+        model_name=model_name,
+        kv_rank=0,
+        cache_salt="tenant-a",
+    )
+    objects: Any = [_BufferObj(b"payload")]
+    adapter = NativeConnectorL2Adapter(LMCacheFSClient(str(tmp_path), 1))
+    try:
+        assert adapter.store_objects_sync([key], objects) == (True, 1, 7)
+        path = tmp_path / _object_key_to_relative_path(key)
+        path.unlink()
+        path.mkdir()
+        (path / "unrelated").write_bytes(b"must not remove")
+        adapter.delete([key])
+        assert adapter.get_usage().total_bytes_used == 7
+        assert adapter.get_existing_key_sizes() == {key: 7}
+        assert (path / "unrelated").read_bytes() == b"must not remove"
     finally:
         adapter.close()
 
