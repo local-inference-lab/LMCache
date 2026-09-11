@@ -161,10 +161,11 @@ _BLOCK_AXIS_BY_FORMAT: dict[Any, int] = {
 async def clear_cache(
     request: Request, body: ClearRequest | None = None
 ) -> dict[str, object]:
-    """Force-clear a tier's resident cache.
+    """Clear L1 objects, respecting active locks when ``force`` is false.
 
-    Clears all objects in the tier, including those with active read/write
-    locks; in-flight store/prefetch operations may be corrupted.
+    ``force=false`` evicts only unlocked objects. Read and write leases retain
+    their SHM allocations until their owners finish. ``force=true`` may corrupt
+    in-flight transfers and is suitable only for an idle engine.
 
     The body is optional: an absent (or empty) body defaults to
     ``{"tier": "l1", "force": true}``.
@@ -182,12 +183,8 @@ async def clear_cache(
                 f"tier {body.tier.value!r} not supported; only {_CLEAR_TIER.value!r}"
             ),
         )
-    # TODO(cache-control): ``body.force`` is accepted for API forward-compat but
-    # not honored -- the engine's CLEAR path always force-clears. Wiring it
-    # through would require extending the ZMQ ``RequestType.CLEAR`` payload
-    # (which currently carries no fields) so the cross-process op can pass force.
-    get_context(request).engine.clear()
-    logger.info("Cache cleared via HTTP API")
+    get_context(request).engine.clear(force=body.force)
+    logger.info("Cache cleared via HTTP API (force=%s)", body.force)
     return {"status": "ok", "cleared": {"tier": _CLEAR_TIER.value}}
 
 

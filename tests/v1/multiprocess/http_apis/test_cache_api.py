@@ -587,10 +587,12 @@ class TestPrefetchEndpoint:
 @dataclass
 class _ClearEngine:
     clear_calls: int = 0
+    clear_forces: list[bool] = field(default_factory=list)
     cache_contexts: Optional[dict] = None
 
-    def clear(self) -> None:
+    def clear(self, *, force: bool = True) -> None:
         self.clear_calls += 1
+        self.clear_forces.append(force)
 
 
 def _make_clear_app(engine: Optional[_ClearEngine]) -> FastAPI:
@@ -603,6 +605,14 @@ def _make_clear_app(engine: Optional[_ClearEngine]) -> FastAPI:
 
 
 class TestClearEndpoint:
+    @pytest.mark.parametrize("force", [False, True])
+    def test_clear_forwards_explicit_force(self, force: bool) -> None:
+        engine = _ClearEngine()
+        with TestClient(_make_clear_app(engine)) as client:
+            response = client.post("/cache/clear", json={"force": force})
+        assert response.status_code == 200
+        assert engine.clear_forces == [force]
+
     def test_clear_l1(self):
         engine = _ClearEngine()
         client = TestClient(_make_clear_app(engine))
@@ -610,6 +620,7 @@ class TestClearEndpoint:
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"status": "ok", "cleared": {"tier": "l1"}}
         assert engine.clear_calls == 1
+        assert engine.clear_forces == [True]
 
     def test_clear_no_body_defaults_to_l1(self):
         """The body is optional; an absent body defaults to tier l1."""
@@ -619,6 +630,7 @@ class TestClearEndpoint:
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"status": "ok", "cleared": {"tier": "l1"}}
         assert engine.clear_calls == 1
+        assert engine.clear_forces == [True]
 
     def test_clear_unsupported_tier(self):
         client = TestClient(_make_clear_app(_ClearEngine()))
