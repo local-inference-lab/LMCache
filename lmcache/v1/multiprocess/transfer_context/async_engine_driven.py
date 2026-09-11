@@ -3,6 +3,7 @@
 
 # Standard
 from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 from typing import Any
 import threading
 
@@ -80,7 +81,18 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         """
         super().__init__()
         self._commit_workers = max(1, int(commit_workers))
+        self._transfer_workspace_slot_count = self._commit_workers
         self._copy_stream: Any = torch_dev.Stream()
+        # The pointer tables are immutable, while block-ID staging has one slot
+        # per background worker. Keep a store's producer wait and gather burst
+        # contiguous on the shared copy stream and retain its slot until the
+        # CUDA completion event fires.
+        self._copy_enqueue_lock = threading.Lock()
+        self._transfer_workspace_slots: Queue[int] = Queue(
+            maxsize=self._transfer_workspace_slot_count
+        )
+        for slot in range(self._transfer_workspace_slot_count):
+            self._transfer_workspace_slots.put_nowait(slot)
         self._commit_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=self._commit_workers,
             thread_name_prefix="lmcache_engine_driven_commit",
@@ -465,6 +477,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 ok = False
                 prepared_store = False
                 group_out_buffers: list[list[torch.Tensor]] | None = None
+                transfer_workspace_slot: int | None = None
                 try:
                     prepared = engine_driven_context.prepare_store_grouped(
                         key, instance_id
@@ -477,19 +490,25 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         ok = True
                         return
 
-                    with torch.inference_mode(), torch_dev.stream(self._copy_stream):
-                        event.wait(stream=self._copy_stream)
-                        # A later group can fail after an earlier group has
-                        # already enqueued a device-to-host copy.
-                        gather_may_be_inflight = True
-                        gathered_groups = self._gather_group_payloads(
-                            kv_caches,
-                            block_ids,
-                            out_buffers=group_out_buffers,
-                            group_chunk_indices=group_chunk_indices,
-                        )
-                        gather_done = torch_dev.Event()
-                        gather_done.record(self._copy_stream)
+                    transfer_workspace_slot = self._transfer_workspace_slots.get()
+                    with self._copy_enqueue_lock:
+                        with (
+                            torch.inference_mode(),
+                            torch_dev.stream(self._copy_stream),
+                        ):
+                            event.wait(stream=self._copy_stream)
+                            # A later group can fail after an earlier group has
+                            # already enqueued a device-to-host copy.
+                            gather_may_be_inflight = True
+                            gathered_groups = self._gather_group_payloads(
+                                kv_caches,
+                                block_ids,
+                                out_buffers=group_out_buffers,
+                                group_chunk_indices=group_chunk_indices,
+                                transfer_workspace_slot=transfer_workspace_slot,
+                            )
+                            gather_done = torch_dev.Event()
+                            gather_done.record(self._copy_stream)
 
                     with self._inflight_lock:
                         self._inflight_gather_events.add(gather_done)
@@ -497,6 +516,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     gather_launched.set()
                     gather_done.synchronize()
                     gather_may_be_inflight = False
+                    self._transfer_workspace_slots.put(transfer_workspace_slot)
+                    transfer_workspace_slot = None
 
                     # SHM payload tensors are already written in place; pickle
                     # transport serializes the group-major gathered tensors.
@@ -538,6 +559,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             self._abort_store_safely(key, instance_id)
                     ok = False
                 finally:
+                    if transfer_workspace_slot is not None:
+                        self._transfer_workspace_slots.put(transfer_workspace_slot)
                     with self._inflight_lock:
                         if gather_done is not None:
                             self._inflight_gather_events.discard(gather_done)
