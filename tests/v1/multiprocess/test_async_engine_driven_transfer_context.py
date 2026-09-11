@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Callable
 from unittest.mock import MagicMock
@@ -21,6 +21,7 @@ from lmcache.v1.multiprocess.transfer_context import (
 from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
     AsyncEngineDrivenTransferContext,
 )
+from lmcache.v1.multiprocess.transfer_context.base import PagedKVTransferWorkspace
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
 )
@@ -162,7 +163,7 @@ def _new_context(
     return ctx
 
 
-def _install_two_group_state(ctx: AsyncEngineDrivenTransferContext) -> None:
+def _install_two_group_state(ctx: EngineDrivenTransferContext) -> None:
     """Install two minimal hybrid-KV group descriptors on a test context."""
     ctx._worker_groups = (
         worker_transfer._EngineDrivenWorkerGroup(
@@ -600,6 +601,97 @@ def test_multigroup_shm_store_runs_prepare_and_gather_in_background(
         (["layer_1"], [20, 21], 2, [0]),
     ]
     assert committed.is_set()
+    ctx.close()
+
+
+def test_multigroup_gather_passes_reserved_workspace_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registered CUDA metadata receives the store's exclusive staging slot."""
+    gather_calls: list[dict[str, object]] = []
+
+    def _gather(
+        _kv_caches: dict[str, torch.Tensor],
+        _block_ids: list[int],
+        _blocks_in_chunk: int,
+        **kwargs: object,
+    ) -> list[torch.Tensor]:
+        gather_calls.append(kwargs)
+        return [torch.zeros(1)]
+
+    monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _gather)
+    ctx = EngineDrivenTransferContext()
+    _install_two_group_state(ctx)
+    workspace = PagedKVTransferWorkspace(
+        paged_buffer_ptrs=torch.zeros(1, dtype=torch.int64),
+        block_ids_host=tuple(torch.zeros(4, dtype=torch.int64) for _ in range(3)),
+        block_ids_device=tuple(torch.zeros(4, dtype=torch.int64) for _ in range(3)),
+    )
+    ctx._worker_groups = (  # noqa: SLF001 - focused transfer-context test
+        replace(ctx._worker_groups[0], transfer_workspace=workspace),
+        ctx._worker_groups[1],
+    )
+
+    ctx._gather_group_payloads(  # noqa: SLF001 - focused transfer-context test
+        {"layer_0": torch.zeros(1), "layer_1": torch.zeros(1)},
+        [[10], [20, 21]],
+        transfer_workspace_slot=2,
+    )
+
+    assert gather_calls[0]["transfer_workspace"] is workspace
+    assert gather_calls[0]["transfer_workspace_slot"] == 2
+    assert "transfer_workspace" not in gather_calls[1]
+    assert "transfer_workspace_slot" not in gather_calls[1]
+
+
+def test_concurrent_multigroup_stores_hold_distinct_workspace_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staging slot is not reused while its CUDA gather remains in flight."""
+    gather_gate = threading.Event()
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=3)
+    ctx._engine_driven_context = _FakeGroupedStoreContext(  # type: ignore[assignment]
+        commit_impl=lambda chunks: chunks == [],
+        prepare_result=(
+            [[torch.zeros(1)], [torch.zeros(1)]],
+            [[0], [0]],
+        ),
+    )
+    _install_two_group_state(ctx)
+    observed_slots: list[int] = []
+    observed_lock = threading.Lock()
+
+    def _gather_groups(
+        *_args: object, transfer_workspace_slot: int, **_kwargs: object
+    ) -> list[list[torch.Tensor]]:
+        with observed_lock:
+            observed_slots.append(transfer_workspace_slot)
+        return [[torch.zeros(1)], [torch.zeros(1)]]
+
+    monkeypatch.setattr(ctx, "_gather_group_payloads", _gather_groups)
+    futures = [
+        ctx.submit_store(
+            f"hybrid-{idx}",
+            object(),
+            1,
+            {"layer_0": torch.zeros(1), "layer_1": torch.zeros(1)},
+            [[10], [20, 21]],
+            _FakeEvent(gather_gate),
+            1,
+        )
+        for idx in range(3)
+    ]
+
+    deadline = time.monotonic() + 1
+    while len(observed_slots) < 3 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert sorted(observed_slots) == [0, 1, 2]
+    assert ctx._transfer_workspace_slots.empty()  # noqa: SLF001
+
+    gather_gate.set()
+    assert all(future.result(timeout=1) is True for future in futures)
+    assert ctx._transfer_workspace_slots.qsize() == 3  # noqa: SLF001
     ctx.close()
 
 
