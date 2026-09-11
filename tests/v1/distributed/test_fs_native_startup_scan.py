@@ -12,6 +12,7 @@ import pytest
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
     _object_key_to_filename,
+    _object_key_to_relative_path,
 )
 from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
     _scan_existing_key_sizes,
@@ -63,6 +64,42 @@ def test_scan_tiebreaks_equal_mtime_by_filename(tmp_path) -> None:
 
     expected = sorted(keys, key=_object_key_to_filename)
     assert list(inventory) == expected
+
+
+def test_scan_inventories_bounded_long_key(tmp_path) -> None:
+    """Restart accounting decodes a long model identity and 128-byte salt."""
+    key = ObjectKey(
+        chunk_hash=bytes.fromhex("70f8501b00e17eb724cd5eb68e21c012" * 2),
+        model_name=(
+            "/model/snapshots/378ca54585c46542bad1f3cb3ed0d73ae51cdb62"
+            "##lmcache-dcp-layout-v1-d4-interleave4"
+        ),
+        kv_rank=0x04010401,
+        object_group_id=7,
+        cache_salt="tenant-" + "s" * 121,
+    )
+    path = tmp_path / _object_key_to_relative_path(key)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"bounded")
+
+    assert _scan_existing_key_sizes(str(tmp_path)) == {key: 7}
+
+
+def test_scan_inventories_split_path_with_empty_hash(tmp_path) -> None:
+    """Restart inventory decodes the explicit zero-component hash field."""
+    key = ObjectKey(
+        chunk_hash=b"",
+        model_name="org/model",
+        kv_rank=1 << 4096,
+        object_group_id=7,
+        cache_salt="tenant-a",
+    )
+    path = tmp_path / _object_key_to_relative_path(key)
+    assert "h0" in path.parts
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"bounded")
+
+    assert _scan_existing_key_sizes(str(tmp_path)) == {key: 7}
 
 
 def test_scan_missing_directory_is_empty(tmp_path) -> None:
@@ -117,6 +154,30 @@ def test_scan_skips_entry_removed_before_stat(monkeypatch) -> None:
     monkeypatch.setattr(os, "scandir", lambda _path: _FakeScandir([entry]))
 
     assert _scan_existing_key_sizes("/cache") == {}
+
+
+def test_scan_fails_closed_when_bounded_root_cannot_be_inspected(
+    monkeypatch,
+) -> None:
+    """A bounded-tree stat error cannot silently reduce restart capacity."""
+    monkeypatch.setattr(os, "scandir", lambda _path: _FakeScandir([]))
+    real_stat = os.stat
+
+    def fail_bounded_root(path, *, follow_symlinks=True):
+        if str(path).endswith(".lmcache-objects-v1"):
+            raise PermissionError("denied")
+        return real_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "stat", fail_bounded_root)
+    with pytest.raises(RuntimeError, match="bounded cache root"):
+        _scan_existing_key_sizes("/cache")
+
+
+def test_scan_rejects_non_directory_bounded_root(tmp_path) -> None:
+    """A conflicting bounded-root file fails before native client startup."""
+    (tmp_path / ".lmcache-objects-v1").write_bytes(b"conflict")
+    with pytest.raises(RuntimeError, match="not a directory"):
+        _scan_existing_key_sizes(str(tmp_path))
 
 
 def test_scan_rejects_duplicate_decoded_keys(tmp_path) -> None:
