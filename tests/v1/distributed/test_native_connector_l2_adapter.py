@@ -1310,6 +1310,30 @@ class TestDeleteInterface:
         finally:
             adapter.close()
 
+    def test_delete_skips_store_that_has_not_completed(self):
+        client = MockNativeConnector()
+        client.suppress_set_completion = True
+        adapter = NativeConnectorL2Adapter(client)
+        key = create_object_key(1)
+        try:
+            adapter.submit_store_task([key], [create_memory_obj()])
+            assert adapter.has_inflight_store_for_keys([key])
+
+            adapter.delete([key])
+
+            task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
+            assert wait_for_event_fd(
+                adapter.get_lookup_and_lock_event_fd(), timeout=5.0
+            )
+            assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
+            adapter.submit_unlock([key])
+
+            client.complete_suppressed_sets()
+            assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+            adapter.pop_completed_store_tasks()
+        finally:
+            adapter.close()
+
     def test_delete_batch(self, adapter):
         keys = [create_object_key(i) for i in range(5)]
         objs = [create_memory_obj(fill_value=float(i)) for i in range(5)]

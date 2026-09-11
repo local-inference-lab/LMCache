@@ -534,22 +534,31 @@ bool FSConnector::do_single_exists(WorkerFSConn& conn, const std::string& key) {
 bool FSConnector::do_single_delete(WorkerFSConn& conn, const std::string& key) {
   const auto relative_path = key_to_relative_path(key);
   auto file_path = conn.base_path / relative_path;
-  std::error_code ec;
+  const auto remove_or_missing = [](const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    if (ec) {
+      throw std::runtime_error("delete failed for " + path.string() + ": " +
+                               ec.message());
+    }
+  };
   const bool canonical_fits =
       path_is_representable(file_path, conn.name_max, conn.path_max);
-  if (canonical_fits && std::filesystem::remove(file_path, ec)) return true;
+  bool representable = canonical_fits;
+  if (canonical_fits) remove_or_missing(file_path);
   if (relative_path.has_parent_path()) {
     const auto legacy_path = conn.base_path / key_to_filename(key);
-    ec.clear();
-    if (path_is_representable(legacy_path, conn.name_max, conn.path_max) &&
-        std::filesystem::remove(legacy_path, ec)) {
-      return true;
+    if (path_is_representable(legacy_path, conn.name_max, conn.path_max)) {
+      remove_or_missing(legacy_path);
+      representable = true;
     }
   }
-  if (!canonical_fits) {
+  if (!representable) {
     require_representable_path(file_path, conn.name_max, conn.path_max);
   }
-  return false;
+  // Both readable representations must be absent before retiring the byte
+  // ledger. An already-missing file satisfies the same idempotent contract.
+  return true;
 }
 
 }  // namespace connector
