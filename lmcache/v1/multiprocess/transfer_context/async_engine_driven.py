@@ -3,9 +3,11 @@
 
 # Standard
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from typing import Any
 import os
 import threading
+import time
 
 # Third Party
 import torch
@@ -14,13 +16,20 @@ import torch
 from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.multiprocess.transfer_context.base import (
+    gather_paged_kv_to_cpu,
+    scatter_cpu_to_paged_kv,
+)
 from lmcache.v1.multiprocess.transfer_context.pickle import (
     EngineDrivenContextPickle,
 )
+from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
+    _collapse_chunks_for_single_destination,
+    _drop_skipped_chunks,
     _single_group_block_ids,
 )
 
@@ -34,7 +43,37 @@ logger = init_logger(__name__)
 DEFAULT_ENGINE_DRIVEN_COMMIT_WORKERS = 4
 
 
-# TODO: async retrieve path TBD, but benefit might be very limited
+# Poll period of one WAIT_PREFETCH_STATUS round trip while a restore window
+# loads; bounds how long a server thread blocks per call.
+_RESTORE_WAIT_POLL_SECONDS = 0.25
+
+
+@dataclass
+class _RestoreWindow:
+    """One window of a windowed retrieve: a chunk-aligned token range of the
+    request's external prefix that is loaded, scattered and committed as a
+    unit.
+
+    Attributes:
+        start: First token of the window (chunk-aligned).
+        end: Exclusive last token (chunk-aligned).
+        known: False when the server no longer tracks the request's lookup;
+            the restore stops at this window.
+        pinned_end_chunk: Chunks below this index were loaded and read-locked
+            by the request's lookup and need no wait.
+        submitted_chunks: Chunks the server submitted for loading from L2.
+        job_id: Prefetch job to wait on when ``submitted_chunks`` is positive.
+        loaded_chunks: Chunks of the submitted part that loaded, once known.
+    """
+
+    start: int
+    end: int
+    known: bool = True
+    pinned_end_chunk: int = 0
+    submitted_chunks: int = 0
+    job_id: str = ""
+    loaded_chunks: int = -1
+
 class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
     """Fully async engine-driven data transfer context (store-only async).
 
@@ -68,6 +107,12 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
     This class is only instantiated by the factory when the device is
     async-capable, so the constructor creates async resources unconditionally;
     there is no ``self._async_capable`` flag.
+
+    ``submit_windowed_retrieve`` is the one asynchronous retrieve: it restores
+    an external prefix in chunk windows off the forward thread (server-side
+    window loads from L2 overlap the scatter of the previous window), so a
+    prefix larger than the L1 pin limit is restored in full instead of being
+    truncated to what L1 holds, and the forward thread never waits for it.
     """
 
     def __init__(
@@ -109,6 +154,15 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             tuple[tuple[int, ...], torch.dtype], list[torch.Tensor]
         ] = {}
         self._is_closing = False
+        # Windowed retrieves: one restore at a time per worker on its own
+        # stream, so window scatters never queue behind store gathers.
+        self._restore_stream: Any = torch_dev.Stream()
+        self._restore_executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="lmcache_windowed_restore"
+        )
+        self._restore_lock = threading.Lock()
+        self._cancelled_retrieves: set[str] = set()
+        self._retrieve_progress: dict[str, int] = {}
 
     def _alloc_pinned_staging(
         self, shape: torch.Size, dtype: torch.dtype, count: int
@@ -512,6 +566,429 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             return completion
         return completion
 
+    # ------------------------------------------------------------------
+    # Windowed retrieve
+    # ------------------------------------------------------------------
+
+    def cancel_retrieve(self, request_id: str) -> None:
+        """Stop a windowed retrieve at its next window boundary.
+
+        Called when the engine finished the request while its load was still
+        in flight. The restore releases the locks of windows it will not
+        retrieve and resolves its future as failed; the engine keeps the
+        request's blocks until that future is reported.
+        """
+        with self._restore_lock:
+            self._cancelled_retrieves.add(request_id)
+
+    def pop_retrieve_progress(self, request_id: str) -> int | None:
+        """Return and forget the exclusive token end a windowed retrieve
+        wrote into the paged cache, or None when the request had no windowed
+        retrieve. Blocks at or past this token were not written."""
+        with self._restore_lock:
+            return self._retrieve_progress.pop(request_id, None)
+
+    def submit_windowed_retrieve(
+        self,
+        request_id: str,
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        event: IPCEvent,
+        blocks_in_chunk: int,
+        skip_first_n_tokens: int = 0,
+        *,
+        window_chunks: int,
+        tp_size: int,
+        readers_per_object: int,
+    ) -> MessagingFuture:
+        """Retrieve ``[key.start, key.end)`` in chunk windows off the forward
+        thread.
+
+        Each window is loaded by the server (RESTORE_WINDOW + WAIT), scattered
+        on the restore stream and committed; the next window's load is
+        submitted before the current one is scattered so disk reads overlap
+        the copies. The returned future resolves True when every chunk was
+        written; otherwise False, with ``pop_retrieve_progress`` reporting the
+        exclusive token end that was written so the adapter invalidates only
+        the remainder. Falls back to the synchronous retrieve when the
+        transport is not SHM or the chunk geometry is unknown.
+
+        Args:
+            request_id: External request identifier.
+            key: Worker key of the full retrieve range.
+            instance_id: Worker process instance identifier.
+            kv_caches: Worker KV cache tensors keyed by layer name.
+            block_ids: Block IDs per LMCache group covering the range.
+            event: Forward-step event (unused: the range's blocks are not
+                read by any forward until the load is reported).
+            blocks_in_chunk: Paged blocks per LMCache chunk (single-group).
+            skip_first_n_tokens: Leading tokens of the range not to write.
+            window_chunks: Chunks per window (positive).
+            tp_size: Tensor-parallel size forwarded to RESTORE_WINDOW.
+            readers_per_object: Workers retrieving each object; carried in
+                the window keys so the server takes one lock per reader.
+        """
+        del event
+        ctx = self._engine_driven_context
+        chunk = self._external_chunk_size
+        if (
+            not isinstance(ctx, EngineDrivenContextShm)
+            or window_chunks <= 0
+            or chunk <= 0
+            or key.start % chunk
+            or key.end % chunk
+            or key.end <= key.start
+        ):
+            return self.submit_retrieve(
+                request_id,
+                key,
+                instance_id,
+                kv_caches,
+                block_ids,
+                None,  # type: ignore[arg-type]
+                blocks_in_chunk,
+                skip_first_n_tokens,
+            )
+        if self._group_states and len(block_ids) != len(self._group_states):
+            raise RuntimeError(
+                f"got {len(block_ids)} block-id lists for "
+                f"{len(self._group_states)} registered groups"
+            )
+        windows = [
+            _RestoreWindow(start=ws, end=min(ws + window_chunks * chunk, key.end))
+            for ws in range(key.start, key.end, window_chunks * chunk)
+        ]
+        completion: MessagingFuture[bool] = MessagingFuture()
+        with self._restore_lock:
+            if self._is_closing:
+                completion.set_result(False)
+                return completion
+            self._retrieve_progress[request_id] = key.start
+            self._cancelled_retrieves.discard(request_id)
+        self._restore_executor.submit(
+            self._run_windowed_retrieve,
+            request_id,
+            key,
+            instance_id,
+            kv_caches,
+            block_ids,
+            blocks_in_chunk,
+            skip_first_n_tokens,
+            windows,
+            tp_size,
+            readers_per_object,
+            completion,
+        )
+        return completion
+
+    def _is_retrieve_cancelled(self, request_id: str) -> bool:
+        with self._restore_lock:
+            return self._is_closing or request_id in self._cancelled_retrieves
+
+    def _mq_call(self, request_type: RequestType, payload: list[Any]) -> Any:
+        """One request to the server, serialized with the store commits."""
+        ctx = self._engine_driven_context
+        assert isinstance(ctx, EngineDrivenContextShm)
+        with self._commit_lock:
+            future = ctx.mq_client.submit_request(
+                request_type, payload, get_response_class(request_type)
+            )
+        return future.result(timeout=ctx.mq_timeout)
+
+    def _submit_restore_window(
+        self, key: Any, window: _RestoreWindow, tp_size: int, readers: int
+    ) -> None:
+        wkey = replace(
+            key, start=window.start, end=window.end, readers_per_object=readers
+        )
+        response = self._mq_call(RequestType.RESTORE_WINDOW, [wkey, tp_size])
+        window.known = bool(response.known)
+        window.pinned_end_chunk = int(response.pinned_chunk_end)
+        window.submitted_chunks = int(response.submitted_chunks)
+        window.job_id = str(response.job_id)
+        if window.submitted_chunks == 0:
+            window.loaded_chunks = 0
+
+    def _wait_restore_window(self, request_id: str, window: _RestoreWindow) -> int:
+        """Block until the window's submitted chunks loaded (or the wait is
+        cancelled); returns the loaded chunk count of the submitted part."""
+        if window.loaded_chunks >= 0:
+            return window.loaded_chunks
+        ctx = self._engine_driven_context
+        assert isinstance(ctx, EngineDrivenContextShm)
+        deadline = time.monotonic() + max(ctx.mq_timeout, 1.0) * 4
+        while True:
+            result = self._mq_call(
+                RequestType.WAIT_PREFETCH_STATUS,
+                [window.job_id, _RESTORE_WAIT_POLL_SECONDS],
+            )
+            if result is not None:
+                window.loaded_chunks = max(0, int(result))
+                return window.loaded_chunks
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"restore window {window.job_id} did not load within "
+                    f"{deadline} s"
+                )
+            # A cancelled restore still consumes the job so the server drops
+            # it, but it stops as soon as the job resolves.
+            if self._is_retrieve_cancelled(request_id):
+                continue
+
+    def _free_range_locks(self, key: Any, start: int, end: int, tp_size: int) -> None:
+        """Release this rank's read locks on ``[start, end)`` (chunk-aligned)."""
+        if end <= start:
+            return
+        try:
+            self._mq_call(
+                RequestType.FREE_LOOKUP_LOCKS,
+                [replace(key, start=start, end=end), tp_size],
+            )
+        except Exception:
+            logger.exception(
+                "Failed to release restore locks [%d, %d) for request_id=%s",
+                start,
+                end,
+                key.request_id,
+            )
+
+    def _scatter_window(
+        self,
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        blocks_in_chunk: int,
+        start: int,
+        end: int,
+        skip_first_n_tokens: int,
+    ) -> bool:
+        """Retrieve ``[start, end)`` from L1 slots into the paged cache.
+
+        Returns True when the server served every chunk of every group and
+        the scatter completed; the read locks are released either way.
+        """
+        ctx = self._engine_driven_context
+        assert isinstance(ctx, EngineDrivenContextShm)
+        chunk = self._external_chunk_size
+        first_chunk = (start - key.start) // chunk
+        last_chunk = (end - key.start) // chunk
+        rkey = replace(key, start=start, end=end)
+        ok = False
+        try:
+            with torch.inference_mode(), torch_dev.stream(self._restore_stream):
+                if self._group_states:
+                    with self._commit_lock:
+                        result = ctx.prepare_retrieve_grouped(rkey, instance_id)
+                    if result is not None:
+                        tensors, group_ids = result
+                        for gid, state in enumerate(self._group_states):
+                            bic = state.blocks_in_chunk
+                            group_block_ids = block_ids[gid][
+                                first_chunk * bic : last_chunk * bic
+                            ]
+                            src_g, _ = self._group_slots(tensors, group_ids, gid)
+                            src_g, kept_ids, dropped = _drop_skipped_chunks(
+                                src_g, group_block_ids, bic
+                            )
+                            if not src_g:
+                                continue
+                            group_start = rkey.start + dropped * chunk
+                            group_skip = max(0, skip_first_n_tokens - dropped * chunk)
+                            transfer_kv_caches, transfer_ids = (
+                                self._group_transfer_inputs(
+                                    state,
+                                    rkey,
+                                    kv_caches,
+                                    kept_ids,
+                                    start_token_idx=group_start,
+                                )
+                            )
+                            physical_skip = self._physical_skip_tokens(
+                                state, group_skip
+                            )
+                            if physical_skip == 0:
+                                src_g, transfer_ids = (
+                                    _collapse_chunks_for_single_destination(
+                                        src_g,
+                                        transfer_ids,
+                                        state.blocks_in_chunk,
+                                        state.blocks_per_window,
+                                    )
+                                )
+                            scatter_cpu_to_paged_kv(
+                                transfer_kv_caches,
+                                transfer_ids,
+                                src_g,
+                                state.blocks_in_chunk,
+                                skip_first_n_tokens=physical_skip,
+                                layout_hints=self._layout_hints,
+                                engine_kv_format=state.engine_kv_format,
+                                blocks_per_window=state.blocks_per_window,
+                            )
+                        ok = True
+                else:
+                    with self._commit_lock:
+                        src_buffers = ctx.prepare_retrieve(rkey, instance_id)
+                    if src_buffers is not None:
+                        single_ids = _single_group_block_ids(block_ids)[
+                            first_chunk * blocks_in_chunk : last_chunk * blocks_in_chunk
+                        ]
+                        src_buffers, single_ids, dropped = _drop_skipped_chunks(
+                            src_buffers, single_ids, blocks_in_chunk
+                        )
+                        single_skip = 0 if dropped else skip_first_n_tokens
+                        if src_buffers:
+                            scatter_cpu_to_paged_kv(
+                                kv_caches,
+                                single_ids,
+                                src_buffers,
+                                blocks_in_chunk,
+                                skip_first_n_tokens=single_skip,
+                                layout_hints=self._layout_hints,
+                                engine_kv_format=self._engine_kv_format,
+                            )
+                        ok = True
+                done = torch_dev.Event()
+                done.record(self._restore_stream)
+            # The server may reuse the slots right after commit: finish the
+            # device writes first (this thread only; no device-wide sync).
+            done.synchronize()
+        except (RuntimeError, ValueError, TypeError, IndexError):
+            logger.exception(
+                "Failed to scatter restore window [%d, %d) for request_id=%s",
+                start,
+                end,
+                key.request_id,
+            )
+            ok = False
+        finally:
+            with self._commit_lock:
+                ctx.commit_retrieve(rkey, instance_id)
+        return ok
+
+    def _run_windowed_retrieve(
+        self,
+        request_id: str,
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        blocks_in_chunk: int,
+        skip_first_n_tokens: int,
+        windows: list[_RestoreWindow],
+        tp_size: int,
+        readers: int,
+        completion: MessagingFuture,
+    ) -> None:
+        chunk = self._external_chunk_size
+        loaded_end = key.start
+        submitted = 0
+        complete = False
+        pinned_end_chunk = 0
+        try:
+            torch_dev.set_device(self._restore_stream.device)
+            # One window of lookahead keeps the disk busy while a window is
+            # scattered; L1 holds at most two windows of this restore.
+            lookahead = 1
+            for index, window in enumerate(windows):
+                while submitted < len(windows) and submitted <= index + lookahead:
+                    self._submit_restore_window(
+                        key, windows[submitted], tp_size, readers
+                    )
+                    submitted += 1
+                    if not windows[submitted - 1].known:
+                        break
+                if not window.known or self._is_retrieve_cancelled(request_id):
+                    break
+                pinned_end_chunk = window.pinned_end_chunk
+                total_chunks = (window.end - window.start) // chunk
+                pinned_chunks = min(
+                    total_chunks,
+                    max(0, window.pinned_end_chunk - window.start // chunk),
+                )
+                loaded = self._wait_restore_window(request_id, window)
+                usable = min(total_chunks, pinned_chunks + loaded)
+                if self._is_retrieve_cancelled(request_id):
+                    # Locks of the loaded part are released with the tail.
+                    self._free_range_locks(
+                        key, window.start, window.start + usable * chunk, tp_size
+                    )
+                    break
+                if usable > 0:
+                    usable_end = window.start + usable * chunk
+                    scattered = self._scatter_window(
+                        key,
+                        instance_id,
+                        kv_caches,
+                        block_ids,
+                        blocks_in_chunk,
+                        window.start,
+                        usable_end,
+                        skip_first_n_tokens if index == 0 else 0,
+                    )
+                    if not scattered:
+                        break
+                    loaded_end = usable_end
+                    with self._restore_lock:
+                        self._retrieve_progress[request_id] = loaded_end
+                if usable < total_chunks:
+                    break
+            else:
+                complete = loaded_end == key.end
+        except Exception:
+            logger.exception(
+                "Windowed retrieve failed for request_id=%s at token %d",
+                request_id,
+                loaded_end,
+            )
+        finally:
+            if not complete:
+                # Release what will not be retrieved: the lookup's pinned
+                # prefix past the written range and every window load that
+                # was submitted (its loaded prefix holds this rank's locks).
+                # Loads still in flight are awaited first so no lock is taken
+                # after its release.
+                self._free_range_locks(
+                    key,
+                    loaded_end,
+                    min(key.end, pinned_end_chunk * chunk),
+                    tp_size,
+                )
+                for window in windows[:submitted]:
+                    if not window.known or window.submitted_chunks == 0:
+                        continue
+                    try:
+                        loaded = self._wait_restore_window(request_id, window)
+                    except Exception:
+                        logger.exception(
+                            "Could not settle restore window %s", window.job_id
+                        )
+                        continue
+                    load_start = max(window.start, window.pinned_end_chunk * chunk)
+                    load_end = min(window.end, load_start + loaded * chunk)
+                    if load_end > loaded_end:
+                        self._free_range_locks(
+                            key, max(load_start, loaded_end), load_end, tp_size
+                        )
+            with self._restore_lock:
+                self._cancelled_retrieves.discard(request_id)
+                self._retrieve_progress[request_id] = loaded_end
+            logger.info(
+                "Windowed retrieve %s for request_id=%s: wrote tokens [%d, %d) "
+                "of [%d, %d) in %d window(s)",
+                "completed" if complete else "stopped",
+                request_id,
+                key.start,
+                loaded_end,
+                key.start,
+                key.end,
+                len(windows),
+            )
+            completion.set_result(complete)
+
     def flush_inflight_stores(self) -> None:
         """Synchronize all in-flight gather (GPU->CPU) events.
 
@@ -558,6 +1035,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             ev.wait()
         self._sync_gather_events(suppress_errors=True)
         self._commit_executor.shutdown(wait=True, cancel_futures=False)
+        with self._restore_lock:
+            self._cancelled_retrieves.update(self._retrieve_progress.keys())
+        self._restore_executor.shutdown(wait=True, cancel_futures=True)
         super().close()
 
     def _sync_gather_events(self, suppress_errors: bool = False) -> None:

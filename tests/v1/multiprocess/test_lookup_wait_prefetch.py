@@ -34,6 +34,8 @@ def _make_module(ctx):
     module._ctx = ctx
     module._prefetch_jobs = {}
     module._prefetch_job_lock = threading.Lock()
+    module._pinned_chunk_end = {}
+    module._window_job_readers = {}
     return module
 
 

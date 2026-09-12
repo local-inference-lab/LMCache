@@ -48,6 +48,7 @@ class RequestType(enum.Enum):
     WAIT_PREFETCH_STATUS = enum.auto()
     QUERY_PREFETCH_LOOKUP_HITS = enum.auto()
     FREE_LOOKUP_LOCKS = enum.auto()
+    RESTORE_WINDOW = enum.auto()
     END_SESSION = enum.auto()
     REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT = enum.auto()
     UNREGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT = enum.auto()

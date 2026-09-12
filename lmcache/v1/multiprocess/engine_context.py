@@ -197,6 +197,8 @@ class MPCacheServerContext:
         hash_algorithm: Hash algorithm for token hashing.
         separate_object_groups: Whether to split kernel groups into one object
             group per sliding-window size at KV-cache registration. Default True.
+        restore_pin_limit_chunks: Chunks a lookup loads and read-locks before
+            reporting the rest of the prefix from the L2 index; 0 pins all.
     """
 
     def __init__(
@@ -206,10 +208,12 @@ class MPCacheServerContext:
         hash_algorithm: str = "blake3",
         separate_object_groups: bool = True,
         full_sw_kv: bool = False,
+        restore_pin_limit_chunks: int = 0,
     ) -> None:
         self._chunk_size = chunk_size
         self._separate_object_groups = separate_object_groups
         self._full_sw_kv = full_sw_kv
+        self._restore_pin_limit_chunks = max(0, int(restore_pin_limit_chunks))
 
         # Initialize the process-global GDS context.
         # No-op when GDS L1 is disabled (config is None).
@@ -235,6 +239,13 @@ class MPCacheServerContext:
         self._storage_manager.close()
         # Tear down the GDS cuFile context (the shared slab + its handle).
         get_gds_context().close()
+
+    @property
+    def restore_pin_limit_chunks(self) -> int:
+        """Chunks a lookup loads into L1 and read-locks before it reports the
+        remaining prefix from the L2 index for windowed restores; 0 loads and
+        pins every found chunk."""
+        return self._restore_pin_limit_chunks
 
     @property
     def chunk_size(self) -> int:

@@ -107,6 +107,11 @@ class StorageManager:
         # reference. No explicit cleanup on close — the registry is
         # just a dict protected by a lock and has no OS resources.
         self._quota_manager = QuotaManager()
+        # Loaded-head results of pin-limited lookups, parked until their
+        # presence-only tail completes (the controller hands out each result
+        # exactly once). Keyed by the head prefetch request id.
+        self._split_head_results: dict[int, Bitmap] = {}
+        self._split_results_lock = threading.Lock()
 
         # Unified L2 eviction controller for all adapters with eviction
         # config. Aggregate-usage policies (``LRU``, ``noop``) need
@@ -432,6 +437,7 @@ class StorageManager:
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         skip_l2: bool = False,
         mode: PrefetchMode = PrefetchMode.LOOKUP,
+        pin_limit_keys: int = 0,
     ) -> PrefetchHandle:
         """Prefetch objects into L1 asynchronously.
 
@@ -454,6 +460,13 @@ class StorageManager:
             mode: The prefetch intent (see :class:`PrefetchMode`).  ``WARM``
                 retains loaded keys and pins none; ``LOOKUP`` (default) pins
                 them for an imminent reader and follows the policy.
+            pin_limit_keys: ``LOOKUP`` with the ``PREFIX`` policy only. When
+                positive, at most this many leading keys are loaded into L1
+                and read-locked (the L1 prefix hits count towards it); the
+                remaining keys are answered from the L2 index as a
+                presence-only continuation, so the reported prefix can exceed
+                what L1 holds. The reader then restores the continuation in
+                windows (``RESTORE_WINDOW``). 0 loads and pins every found key.
 
         Returns:
             PrefetchHandle to track the task.
@@ -606,10 +619,21 @@ class StorageManager:
                 l2_orig_indices=(),
             )
 
-        # Submit remaining keys to L2 prefetch controller
+        # Submit remaining keys to L2 prefetch controller. With a pin limit
+        # only the head of the remainder is loaded and read-locked; the tail
+        # is a presence-only continuation answered from the L2 index.
         remaining_keys = keys[hit_count:]
+        pinned_key_count = -1
+        tail_keys: list[ObjectKey] = []
+        if pin_limit_keys > 0:
+            head_count = max(0, pin_limit_keys - hit_count)
+            tail_keys = remaining_keys[head_count:]
+            remaining_keys = remaining_keys[:head_count]
+            pinned_key_count = hit_count + len(remaining_keys)
         prefetch_request_id = -1
         l2_orig_indices: tuple[int, ...] = ()
+        tail_prefetch_request_id = -1
+        tail_orig_indices: tuple[int, ...] = ()
         if remaining_keys and self._has_l2_adapters():
             prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
                 remaining_keys,
@@ -621,20 +645,32 @@ class StorageManager:
             )
             # The controller indexes its result bitmap over remaining_keys
             # (0-based); map those local indices back to original positions.
-            l2_orig_indices = tuple(range(hit_count, len(keys)))
+            l2_orig_indices = tuple(range(hit_count, hit_count + len(remaining_keys)))
+        if tail_keys and self._has_l2_adapters():
+            tail_prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
+                tail_keys,
+                layout_desc,
+                extra_count=0,
+                attn_desc=attn_desc,
+                policy=policy,
+                mode=PrefetchMode.LOOKUP_ONLY,
+            )
+            tail_orig_indices = tuple(range(hit_count + len(remaining_keys), len(keys)))
 
         submit_time = time.monotonic()
         logger.debug(
             "Prefetch request submitted: "
             "%d total keys, %d L1 prefix hits, "
-            "%d remaining for L2 "
+            "%d remaining for L2, %d presence-only "
             "(external_request_id=%s, "
-            "prefetch_request_id=%d)",
+            "prefetch_request_id=%d, tail_prefetch_request_id=%d)",
             len(keys),
             hit_count,
             len(remaining_keys),
+            len(tail_keys),
             external_request_id,
             prefetch_request_id,
+            tail_prefetch_request_id,
         )
 
         return PrefetchHandle(
@@ -644,17 +680,24 @@ class StorageManager:
             total_requested_keys=len(keys),
             submit_time=submit_time,
             l2_orig_indices=l2_orig_indices,
+            tail_prefetch_request_id=tail_prefetch_request_id,
+            tail_orig_indices=tail_orig_indices,
+            pinned_key_count=pinned_key_count,
         )
 
     def _combine_found(
-        self, handle: PrefetchHandle, l2_local: "Bitmap | None"
+        self,
+        handle: PrefetchHandle,
+        l2_local: "Bitmap | None",
+        tail_local: "Bitmap | None" = None,
     ) -> Bitmap:
-        """Merge the L1 found indices with an L2 result bitmap into one bitmap
-        over the original key positions.
+        """Merge the L1 found indices with the L2 result bitmaps into one
+        bitmap over the original key positions.
 
         ``l2_local`` is indexed over the keys submitted to L2 (0-based); its
         set bits are mapped back to original positions via
-        ``handle.l2_orig_indices``.
+        ``handle.l2_orig_indices``. ``tail_local`` is the presence-only
+        continuation, mapped through ``handle.tail_orig_indices``.
         """
         found = Bitmap(handle.total_requested_keys)
         found.batched_set(handle.l1_found_indices)
@@ -662,7 +705,46 @@ class StorageManager:
             # gather maps each L2 set bit i to its original position
             # ``l2_orig_indices[i]``; batched_set drops any position >= size.
             found.batched_set(l2_local.gather(handle.l2_orig_indices))
+        if tail_local is not None:
+            found.batched_set(tail_local.gather(handle.tail_orig_indices))
         return found
+
+    def _query_l2_results(
+        self, handle: PrefetchHandle
+    ) -> "tuple[Bitmap | None, Bitmap | None] | None":
+        """Collect the loaded-head and presence-tail results of a handle.
+
+        The controller hands out each result exactly once, so a head result
+        that arrives before its tail is parked until the tail completes.
+
+        Returns:
+            ``(head, tail)`` once every submitted L2 request has completed,
+            ``None`` while any is still in progress.
+        """
+        head: Bitmap | None = None
+        if handle.prefetch_request_id != -1:
+            with self._split_results_lock:
+                head = self._split_head_results.get(handle.prefetch_request_id)
+            if head is None:
+                head = self._prefetch_controller.query_prefetch_result(
+                    handle.prefetch_request_id
+                )
+                if head is None:
+                    return None
+                if handle.tail_prefetch_request_id != -1:
+                    with self._split_results_lock:
+                        self._split_head_results[handle.prefetch_request_id] = head
+        tail: Bitmap | None = None
+        if handle.tail_prefetch_request_id != -1:
+            tail = self._prefetch_controller.query_prefetch_result(
+                handle.tail_prefetch_request_id
+            )
+            if tail is None:
+                return None
+            if handle.prefetch_request_id != -1:
+                with self._split_results_lock:
+                    self._split_head_results.pop(handle.prefetch_request_id, None)
+        return head, tail
 
     def query_prefetch_lookup_hits(
         self,
@@ -700,7 +782,17 @@ class StorageManager:
             # Still in progress, or already consumed by query_prefetch_status.
             return None
         # L2 lookup done: total prefix hits are L1 plus the L2 continuation.
-        return l1_hits + l2_r
+        hits = l1_hits + l2_r
+        if handle.tail_prefetch_request_id != -1 and l2_r == len(
+            handle.l2_orig_indices
+        ):
+            tail_r = self._prefetch_controller.query_lookup_result(
+                handle.tail_prefetch_request_id
+            )
+            if tail_r is None:
+                return None
+            hits += tail_r
+        return hits
 
     def wait_prefetch_status(
         self,
@@ -723,11 +815,16 @@ class StorageManager:
             True if a result is available within the timeout (always True for
             an L1-only prefetch), False if the wait timed out.
         """
-        if handle.prefetch_request_id == -1:
+        if handle.prefetch_request_id == -1 and handle.tail_prefetch_request_id == -1:
             return True
-        return self._prefetch_controller.wait_prefetch_result(
-            handle.prefetch_request_id, timeout
-        )
+        deadline = time.monotonic() + max(timeout, 0.0)
+        for request_id in (handle.prefetch_request_id, handle.tail_prefetch_request_id):
+            if request_id == -1:
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._prefetch_controller.wait_prefetch_result(request_id, remaining):
+                return False
+        return True
 
     def query_prefetch_status(
         self,
@@ -744,15 +841,12 @@ class StorageManager:
             done, None if it's still in progress. Derive the prefix hit count
             via ``count_leading_ones``.
         """
-        l2_r: Bitmap | None = None
-        if handle.prefetch_request_id != -1:
-            l2_r = self._prefetch_controller.query_prefetch_result(
-                handle.prefetch_request_id
-            )
-            if l2_r is None:
-                return None
+        l2_results = self._query_l2_results(handle)
+        if l2_results is None:
+            return None
+        l2_r, tail_r = l2_results
 
-        found = self._combine_found(handle, l2_r)
+        found = self._combine_found(handle, l2_r, tail_r)
         # popcount (not count_leading_ones) so the log is accurate for
         # non-contiguous policies (SEGMENTED_PREFIX / SPARSE) too.
         total_hits = found.popcount()
@@ -762,9 +856,10 @@ class StorageManager:
             # L1 and L2 sets are disjoint (only L1-misses go to L2).
             l1_hits = len(handle.l1_found_indices)
             l2_hits = l2_r.popcount() if l2_r is not None else 0
+            tail_hits = tail_r.popcount() if tail_r is not None else 0
             logger.info(
                 "%s completed (L1+L2): "
-                "%d/%d %s keys (%d L1, %d L2) in %.1f ms "
+                "%d/%d %s keys (%d L1, %d L2, %d L2 unloaded) in %.1f ms "
                 "(external_request_id=%s, prefetch_request_id=%d)",
                 "Lookup-only request" if handle.lookup_only else "Prefetch request",
                 total_hits,
@@ -772,6 +867,7 @@ class StorageManager:
                 "present" if handle.lookup_only else "retained",
                 l1_hits,
                 l2_hits,
+                tail_hits,
                 elapsed_ms,
                 handle.external_request_id,
                 handle.prefetch_request_id,

@@ -26,6 +26,7 @@ from lmcache.v1.multiprocess.engine_module import (
     ThreadPoolType,
 )
 from lmcache.v1.multiprocess.protocol import RequestType
+from lmcache.v1.multiprocess.protocols.engine import RestoreWindowResponse
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 if TYPE_CHECKING:
@@ -111,6 +112,12 @@ class _PrefetchJob:
     lookup_only: bool = False
     """True when no handle holds a lock: the job reported presence only, so
     completion must not release group-local surplus locks."""
+    is_window: bool = False
+    """True for a restore-window job: one rank's slice of a looked-up prefix,
+    loaded on demand; its completion records no pinned prefix."""
+    surplus_released: bool = False
+    """Set once group-local surplus locks were released, so a job polled by
+    several readers releases them exactly once."""
 
     def __post_init__(self) -> None:
         if not self.handles:
@@ -143,6 +150,15 @@ class LookupModule:
         self._ctx = ctx
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        # Chunk count of the read-locked prefix of each looked-up request: the
+        # L1 prefix hits plus the L2 head loaded under the pin limit. Chunks
+        # past it were reported from the L2 index only and hold no lock; the
+        # windowed restore loads them on demand. Recorded when the lookup
+        # completes, dropped when the session ends.
+        self._pinned_chunk_end: dict[str, int] = {}
+        # Remaining readers of each restore-window job shared by workers that
+        # read the same objects; the last reader consumes the job.
+        self._window_job_readers: dict[str, int] = {}
         self._setup_metrics()
 
     @property
@@ -176,6 +192,11 @@ class LookupModule:
             HandlerSpec(
                 RequestType.FREE_LOOKUP_LOCKS,
                 self.free_lookup_locks,
+                ThreadPoolType.NORMAL,
+            ),
+            HandlerSpec(
+                RequestType.RESTORE_WINDOW,
+                self.restore_window,
                 ThreadPoolType.NORMAL,
             ),
             HandlerSpec(
@@ -328,6 +349,11 @@ class LookupModule:
         # A lookup-only key reports the present prefix without loading or
         # locking: the client will not retrieve and will not free locks.
         mode = PrefetchMode.LOOKUP_ONLY if key.lookup_only else PrefetchMode.LOOKUP
+        # Per group, keys are chunk-major over every rank, so a chunk pin limit
+        # is ``chunks * ranks`` keys. Chunks past the limit are reported from
+        # the L2 index and restored in windows by the workers.
+        pin_limit_chunks = self._restore_pin_limit_chunks()
+        pin_limit_keys = 0 if key.lookup_only else pin_limit_chunks * key.world_size
         handles = tuple(
             self._ctx.storage_manager.submit_prefetch_task(
                 list(group_keys),
@@ -338,6 +364,7 @@ class LookupModule:
                     num_chunks_in_sw=[attn_desc.num_chunks_in_sw[object_group_id]]
                 ),
                 mode=mode,
+                pin_limit_keys=pin_limit_keys,
             )
             for object_group_id, (group_keys, layout_desc) in enumerate(
                 zip(object_keys_by_group, layout_descs, strict=True)
@@ -425,8 +452,11 @@ class LookupModule:
         found_count = min(
             found.count_leading_ones() // job.world_size for found in found_by_group
         )
-        if not job.lookup_only:
+        if not job.lookup_only and not job.surplus_released:
+            job.surplus_released = True
             self._release_nonservable_group_results(job, found_by_group, found_count)
+        if not job.lookup_only and not job.is_window:
+            self._record_pinned_prefix(job, found_count)
 
         self._ctx.event_bus.publish(
             Event(
@@ -442,8 +472,7 @@ class LookupModule:
             )
         )
 
-        with self._prefetch_job_lock:
-            self._prefetch_jobs.pop(request_id, None)
+        self._consume_prefetch_job(request_id)
 
         return found_count
 
@@ -514,8 +543,17 @@ class LookupModule:
             tp_size: Tensor-parallel size for MLA
                 multi-reader locking.
         """
+        # Chunks past the pinned prefix were reported from the L2 index and
+        # hold no lock; releasing them would only log spurious lock errors.
+        end = key.end
+        with self._prefetch_job_lock:
+            pinned_chunk_end = self._pinned_chunk_end.get(key.request_id)
+        if pinned_chunk_end is not None:
+            end = min(end, pinned_chunk_end * self._ctx.chunk_size)
+        if end <= key.start:
+            return
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
-            list(key.token_ids), start=key.start, end=key.end
+            list(key.token_ids), start=key.start, end=end
         )
         if not chunk_hashes:
             return
@@ -551,6 +589,8 @@ class LookupModule:
             )
         )
         session = self._ctx.session_manager.remove(request_id)
+        with self._prefetch_job_lock:
+            self._pinned_chunk_end.pop(request_id, None)
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_REQUEST_END,
@@ -575,9 +615,166 @@ class LookupModule:
         #  these keys has been deleted and will not be touched.
         self._ctx.storage_manager.touch_l1_keys(obj_keys)
 
+    def restore_window(
+        self,
+        key: IPCCacheServerKey,
+        tp_size: int,
+    ) -> RestoreWindowResponse:
+        """Load one window of a looked-up prefix from L2 into L1 for a worker.
+
+        The lookup that preceded this call loaded and read-locked at most the
+        server's pin limit of chunks and reported the rest from the L2 index.
+        A worker restores that remainder window by window: this handler
+        submits the window's objects of the worker's rank for loading and
+        registers a prefetch job the worker waits on with
+        WAIT_PREFETCH_STATUS before it retrieves the window. Chunks below the
+        pinned prefix are skipped: they are already loaded and locked.
+
+        Args:
+            key: Worker key whose ``[start, end)`` token range is the window
+                (chunk-aligned) and whose ``request_id`` is the looked-up
+                request. ``worker_id`` must be set.
+            tp_size: Tensor-parallel size, used with the key's reader count to
+                take one read lock per retrieving worker.
+
+        Returns:
+            The window's loading plan; ``known=False`` when the request has no
+            recorded lookup (its session ended), which tells the worker to stop.
+
+        Raises:
+            ValueError: If the key has no worker id or the range is not
+                chunk-aligned.
+        """
+        if key.worker_id is None:
+            raise ValueError("restore_window requires a worker key")
+        chunk_size = self._ctx.chunk_size
+        if key.start % chunk_size or key.end % chunk_size or key.end < key.start:
+            raise ValueError(
+                f"restore window [{key.start}, {key.end}) must align to "
+                f"chunk size {chunk_size}"
+            )
+        with self._prefetch_job_lock:
+            pinned_chunk_end = self._pinned_chunk_end.get(key.request_id)
+        if pinned_chunk_end is None:
+            return RestoreWindowResponse(known=False)
+
+        load_start_chunk = max(key.start // chunk_size, pinned_chunk_end)
+        end_chunk = key.end // chunk_size
+        if load_start_chunk >= end_chunk:
+            return RestoreWindowResponse(
+                known=True, pinned_chunk_end=pinned_chunk_end, submitted_chunks=0
+            )
+
+        model_name, world_size = key.model_name, key.world_size
+        layout_descs = self._ctx.layout_desc_registry.find_object_group_layouts(
+            model_name, world_size
+        )
+        if layout_descs is None:
+            raise ValueError(
+                f"No GPU context found for model {model_name} with world size "
+                f"{world_size} during restore_window"
+            )
+        attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
+            model_name, world_size
+        )
+        chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
+            list(key.token_ids), start=load_start_chunk * chunk_size, end=key.end
+        )
+        num_chunks = end_chunk - load_start_chunk
+        if len(chunk_hashes) != num_chunks:
+            raise ValueError(
+                f"restore window [{key.start}, {key.end}) hashed "
+                f"{len(chunk_hashes)} chunks, expected {num_chunks}"
+            )
+        object_keys_by_group = tuple(
+            tuple(group_keys)
+            for group_keys in ipc_key_to_object_keys(
+                key, chunk_hashes, list(range(len(layout_descs)))
+            )
+        )
+        extra_count = compute_extra_count(tp_size, world_size, key.readers_per_object)
+        # Workers that read the same objects share one job (keyed by the
+        # object rank); the lookup-style locking already takes one read lock
+        # per reader, and the last reader consumes the job.
+        kv_rank = object_keys_by_group[0][0].kv_rank
+        job_id = f"{key.request_id}#w{load_start_chunk}#k{kv_rank}"
+        with self._prefetch_job_lock:
+            existing = self._prefetch_jobs.get(job_id)
+        if existing is not None:
+            return RestoreWindowResponse(
+                known=True,
+                pinned_chunk_end=pinned_chunk_end,
+                submitted_chunks=num_chunks,
+                job_id=job_id,
+            )
+        handles = tuple(
+            self._ctx.storage_manager.submit_prefetch_task(
+                list(group_keys),
+                layout_desc,
+                extra_count=extra_count,
+                external_request_id=job_id,
+                attn_desc=AttnWindowDesc(
+                    num_chunks_in_sw=[attn_desc.num_chunks_in_sw[object_group_id]]
+                ),
+                mode=PrefetchMode.LOOKUP,
+            )
+            for object_group_id, (group_keys, layout_desc) in enumerate(
+                zip(object_keys_by_group, layout_descs, strict=True)
+            )
+        )
+        job = _PrefetchJob(
+            handles=handles,
+            world_size=1,
+            request_id=job_id,
+            requested_tokens=num_chunks * chunk_size,
+            object_keys_by_group=object_keys_by_group,
+            extra_count=extra_count,
+            model_name=model_name,
+            cache_salt=key.cache_salt,
+            is_window=True,
+        )
+        with self._prefetch_job_lock:
+            if job_id in self._prefetch_jobs:
+                # Another reader registered the job first; theirs stands.
+                self._window_job_readers[job_id] = 1 + extra_count
+            else:
+                self._prefetch_jobs[job_id] = job
+                self._window_job_readers[job_id] = 1 + extra_count
+        return RestoreWindowResponse(
+            known=True,
+            pinned_chunk_end=pinned_chunk_end,
+            submitted_chunks=num_chunks,
+            job_id=job_id,
+        )
+
     # -----------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------
+
+    def _restore_pin_limit_chunks(self) -> int:
+        """Chunks a lookup may load and read-lock before reporting the rest
+        from the L2 index; 0 loads every found chunk."""
+        return max(0, int(getattr(self._ctx, "restore_pin_limit_chunks", 0)))
+
+    def _record_pinned_prefix(self, job: _PrefetchJob, found_count: int) -> None:
+        """Remember how many leading chunks of a lookup hold read locks."""
+        pinned = found_count
+        for handle in job.handles:
+            pinned_key_count = getattr(handle, "pinned_key_count", -1)
+            if pinned_key_count >= 0:
+                pinned = min(pinned, pinned_key_count // job.world_size)
+        with self._prefetch_job_lock:
+            self._pinned_chunk_end[job.request_id] = pinned
+
+    def _consume_prefetch_job(self, request_id: str) -> None:
+        """Drop a completed job; a shared window job waits for its last reader."""
+        with self._prefetch_job_lock:
+            readers = self._window_job_readers.get(request_id)
+            if readers is not None and readers > 1:
+                self._window_job_readers[request_id] = readers - 1
+                return
+            self._window_job_readers.pop(request_id, None)
+            self._prefetch_jobs.pop(request_id, None)
 
     def _query_prefetch_results(self, job: _PrefetchJob) -> list["Bitmap"] | None:
         """Collect each object group's result without polling it twice."""
@@ -606,13 +803,17 @@ class LookupModule:
 
         retained_keys_per_group = found_count * job.world_size
         surplus_keys: list[ObjectKey] = []
-        for group_keys, found in zip(
-            job.object_keys_by_group, found_by_group, strict=True
+        for handle, group_keys, found in zip(
+            job.handles, job.object_keys_by_group, found_by_group, strict=True
         ):
+            # Keys at or past the handle's pinned count were reported from the
+            # L2 index without a lock; only the locked surplus is released.
+            pinned_key_count = getattr(handle, "pinned_key_count", -1)
+            locked_end = pinned_key_count if pinned_key_count >= 0 else len(group_keys)
             surplus_keys.extend(
                 group_keys[index]
                 for index in found.get_indices_list()
-                if index >= retained_keys_per_group
+                if retained_keys_per_group <= index < locked_end
             )
         if surplus_keys:
             self._ctx.storage_manager.finish_read_prefetched(

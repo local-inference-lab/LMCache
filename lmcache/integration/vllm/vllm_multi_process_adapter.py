@@ -67,6 +67,15 @@ class ExtraConfigDefault(enum.Enum):
     # Mirrors the ``LMCACHE_MP_TRANSFER_MODE`` env var; this extra_config
     # key wins when both are set.
     mp_transfer_mode = "auto"
+    # Chunks per window of a windowed external-prefix restore (engine-driven
+    # SHM transport only). A positive value retrieves each request's external
+    # prefix window by window off the forward thread, so a prefix larger than
+    # the server's L1 pin limit (``--restore-pin-limit-chunks``) is restored
+    # in full. 0 keeps the single-shot retrieve. The
+    # ``LMCACHE_RESTORE_WINDOW_CHUNKS`` env var overrides this key. The
+    # default is a string: an integer 0 would equal ``heartbeat_timeout``'s
+    # 0.0 and make this member an enum alias of it.
+    restore_window_chunks = "0"
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
@@ -1165,8 +1174,17 @@ class LMCacheMPWorkerAdapter:
                 self._mp_transfer_mode = cfg[ExtraConfigDefault.mp_transfer_mode.name]
             else:
                 self._mp_transfer_mode = None
+            restore_window_chunks = cfg[ExtraConfigDefault.restore_window_chunks.name]
         else:
             self._mp_transfer_mode = None
+            restore_window_chunks = ExtraConfigDefault.restore_window_chunks.value
+        env_window = os.environ.get("LMCACHE_RESTORE_WINDOW_CHUNKS")
+        if env_window is not None:
+            restore_window_chunks = env_window
+        self._restore_window_chunks = max(0, int(restore_window_chunks))
+        # Retrieve ops keyed by request id while their futures are pending, so
+        # a partial windowed restore invalidates only the unwritten blocks.
+        self._retrieve_ops: dict[str, LoadStoreOp] = {}
         self.mq_client = MessageQueueClient(server_url, context)
         self._mq_timeout = mq_timeout
 
@@ -1610,18 +1628,37 @@ class LMCacheMPWorkerAdapter:
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting retrieve requests."
             )
-        future = self.transfer_ctx.submit_retrieve(
-            request_id,
-            key,
-            self.instance_id,
-            self.kv_caches,
-            self._block_ids_per_group(op),
-            event,
-            self._transfer_blocks_in_chunk,
-            skip_first_n_tokens=op.skip_first_n_tokens,
-        )
+        windowed = getattr(self.transfer_ctx, "submit_windowed_retrieve", None)
+        if self._restore_window_chunks > 0 and windowed is not None:
+            future = windowed(
+                request_id,
+                key,
+                self.instance_id,
+                self.kv_caches,
+                self._block_ids_per_group(op),
+                event,
+                self._transfer_blocks_in_chunk,
+                skip_first_n_tokens=op.skip_first_n_tokens,
+                window_chunks=self._restore_window_chunks,
+                tp_size=getattr(self.parallel_strategy, "kv_tp_size", 1),
+                readers_per_object=getattr(
+                    self.parallel_strategy, "kv_readers_per_object", 1
+                ),
+            )
+        else:
+            future = self.transfer_ctx.submit_retrieve(
+                request_id,
+                key,
+                self.instance_id,
+                self.kv_caches,
+                self._block_ids_per_group(op),
+                event,
+                self._transfer_blocks_in_chunk,
+                skip_first_n_tokens=op.skip_first_n_tokens,
+            )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
         self.retrieve_events[request_id] = event
+        self._retrieve_ops[request_id] = op
 
     @_lmcache_nvtx_annotate
     def batched_submit_store_requests(
@@ -1772,6 +1809,7 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.clear()
             self.store_events.clear()
             self.retrieve_events.clear()
+            self._retrieve_ops.clear()
 
             # Retrieves dropped at submit time still must be reported,
             # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
@@ -1795,6 +1833,14 @@ class LMCacheMPWorkerAdapter:
 
         finished_stores = self._poll_store_futures()
         finished_retrieves = set()
+        # A request the engine finished while its windowed load is in flight
+        # stops at the next window; its blocks stay allocated until the
+        # future is reported below.
+        cancel_retrieve = getattr(self.transfer_ctx, "cancel_retrieve", None)
+        if cancel_retrieve is not None:
+            for request_id in finished_req_ids_from_engine:
+                if request_id in self.retrieve_futures:
+                    cancel_retrieve(request_id)
         for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
             if not r_future.query():
                 continue
@@ -1824,8 +1870,13 @@ class LMCacheMPWorkerAdapter:
                 # kv_connector_output.invalid_block_ids -> scheduler
                 # recompute. The MP server collapses per-key results into
                 # one bool, so marking the op's whole span is
-                # conservative-correct for partial failures too.
-                self.error_block_ids.update(r_block_ids)
+                # conservative-correct for partial failures too. A windowed
+                # retrieve reports how far it wrote; only the unwritten
+                # remainder is invalidated then.
+                invalid_block_ids = self._unwritten_retrieve_blocks(
+                    request_id, r_block_ids
+                )
+                self.error_block_ids.update(invalid_block_ids)
                 self.retrieve_failure_count += 1
                 logger.error(
                     "LMCache retrieve failed for request_id=%s: %d block(s) "
@@ -1840,6 +1891,7 @@ class LMCacheMPWorkerAdapter:
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
+            self._retrieve_ops.pop(request_id, None)
 
         # Retrieves dropped while unhealthy still must be reported,
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
@@ -1875,6 +1927,43 @@ class LMCacheMPWorkerAdapter:
             The number of vllm blocks in a LMCache data chunk
         """
         return self.blocks_in_chunk
+
+    def _unwritten_retrieve_blocks(
+        self, request_id: str, flat_block_ids: list[int]
+    ) -> set[int]:
+        """Block ids of a failed retrieve that hold no written KV.
+
+        A windowed retrieve records the exclusive token end it wrote; in every
+        engine group the block containing that token and every later block
+        are invalid (a partially written block must be recomputed from its
+        start), earlier blocks hold valid KV. Without that record
+        (single-shot retrieve or an unknown group geometry) the whole span is
+        invalid.
+        """
+        progress_pop = getattr(self.transfer_ctx, "pop_retrieve_progress", None)
+        op = self._retrieve_ops.get(request_id)
+        written_end = progress_pop(request_id) if progress_pop is not None else None
+        if written_end is None or op is None or written_end <= op.start:
+            return set(flat_block_ids)
+        tokens_per_block: dict[int, int] = {}
+        for info in self.engine_group_infos:
+            if info.tokens_per_block <= 0:
+                return set(flat_block_ids)
+            tokens_per_block.setdefault(info.engine_group_id, info.tokens_per_block)
+        per_group: list[list[int]]
+        if op.block_ids and isinstance(op.block_ids[0], int):
+            per_group = [list(op.block_ids)]  # type: ignore[arg-type]
+        else:
+            per_group = [list(group) for group in op.block_ids]
+        invalid: set[int] = set()
+        written_tokens = written_end - op.start
+        for engine_group_id, group_block_ids in enumerate(per_group):
+            span = tokens_per_block.get(engine_group_id)
+            if span is None:
+                return set(flat_block_ids)
+            first_invalid = written_tokens // span
+            invalid.update(group_block_ids[first_invalid:])
+        return invalid
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """

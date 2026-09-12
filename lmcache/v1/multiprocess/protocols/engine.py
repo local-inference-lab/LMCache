@@ -9,6 +9,7 @@ This module defines the protocol for:
 - STORE: Store KV cache blocks to the server
 - RETRIEVE: Retrieve KV cache blocks from the server
 - LOOKUP: Submit a prefix lookup and return a prefetch job ID
+- RESTORE_WINDOW: Load one window of a looked-up prefix from L2 into L1
 - QUERY_PREFETCH_STATUS: Poll a prefetch job for its result
 - END_SESSION: End a session and clean up associated resources
 """
@@ -49,6 +50,31 @@ class PrepareRetrieveResponse:
 
 
 @dataclass
+class RestoreWindowResponse:
+    """Response for RESTORE_WINDOW.
+
+    Attributes:
+        known: False when the server holds no lookup state for the request
+            (its session ended or it never looked up); the worker must stop
+            restoring. The other fields are then meaningless.
+        pinned_chunk_end: Exclusive chunk index up to which the request's
+            lookup already loaded and read-locked objects; the worker retrieves
+            those chunks without waiting for a load.
+        submitted_chunks: Number of chunks of the window that the server
+            submitted for loading from L2; 0 when the window is entirely
+            covered by the lookup's pinned prefix.
+        job_id: Prefetch job to wait on with WAIT_PREFETCH_STATUS when
+            ``submitted_chunks`` is positive; the wait reports how many of the
+            submitted chunks form a loadable prefix.
+    """
+
+    known: bool
+    pinned_chunk_end: int = 0
+    submitted_chunks: int = 0
+    job_id: str = ""
+
+
+@dataclass
 class RegisterEngineDrivenContextResponse:
     """Response for REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT."""
 
@@ -67,6 +93,7 @@ REQUEST_NAMES = [
     "WAIT_PREFETCH_STATUS",
     "QUERY_PREFETCH_LOOKUP_HITS",
     "FREE_LOOKUP_LOCKS",
+    "RESTORE_WINDOW",
     "END_SESSION",
     "REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT",
     "UNREGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT",
@@ -199,6 +226,19 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "FREE_LOOKUP_LOCKS": ProtocolDefinition(
             payload_classes=[KeyType, int],
             response_class=None,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Load one window of a request's external prefix from L2 into L1 so
+        # a worker can retrieve it; part of the windowed restore of prefixes
+        # larger than the L1 pin limit.
+        # Payload:
+        #   - key: IPCCacheServerKey - worker key whose [start, end) is the
+        #     window (chunk-aligned); request_id is the looked-up request
+        #   - tp_size: int - Tensor-parallel size (reader count derivation)
+        # Returns: RestoreWindowResponse
+        "RESTORE_WINDOW": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=RestoreWindowResponse,
             handler_type=HandlerType.BLOCKING,
         ),
         # End session

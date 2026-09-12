@@ -352,6 +352,21 @@ class PrefetchHandle:
     key was loaded or locked, so the found bitmap describes presence only and
     nothing must be released afterwards."""
 
+    tail_prefetch_request_id: int = -1
+    """Presence-only continuation submitted past the pin limit of a
+    ``PrefetchMode.LOOKUP`` task (see ``pin_limit_keys``): the keys are
+    answered from the L2 index without being loaded or locked. -1 when every
+    found key was loaded and pinned."""
+
+    tail_orig_indices: tuple[int, ...] = ()
+    """Original-key index of each key in the presence-only continuation."""
+
+    pinned_key_count: int = -1
+    """Number of leading keys that may hold L1 read locks once the task
+    completes: the L1 prefix hits plus the loaded L2 head. -1 (no pin limit)
+    means every found key is loaded and locked, as before pin limits existed.
+    Lock releases must never touch keys at or past this count."""
+
 
 def ipc_key_to_object_keys(
     ipc_key: "IPCCacheServerKey",

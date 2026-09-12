@@ -355,6 +355,7 @@ def run_cache_server(
         hash_algorithm=mp_config.hash_algorithm,
         separate_object_groups=mp_config.separate_object_groups and not is_blend,
         full_sw_kv=is_blend,
+        restore_pin_limit_chunks=mp_config.restore_pin_limit_chunks,
     )
 
     modules = _build_modules(ctx, mp_config, coordinator_config)

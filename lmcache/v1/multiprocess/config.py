@@ -56,6 +56,13 @@ class MPServerConfig:
     L1-resident (served by the sparse leg as L1 hits, the hole recomputed)
     instead of truncating the prefix at the gap. No effect for other engines."""
 
+    restore_pin_limit_chunks: int = 0
+    """Chunks a loading lookup copies from L2 into L1 and read-locks before it
+    reports the remaining prefix from the L2 index only. Workers then restore
+    the remainder in windows (RESTORE_WINDOW) instead of the whole prefix at
+    once, so a prefix larger than L1 no longer collapses to the part that
+    fits. 0 (default) loads and pins every found chunk at lookup time."""
+
     supported_transfer_mode: str = "auto"
     """Transfer mode: 'lmcache_driven' for server-driven transfer
     (STORE/RETRIEVE, supports CUDA IPC and CPU SHM), 'engine_driven' for
@@ -374,6 +381,15 @@ def add_mp_server_args(
         "retrieve failure, retain the gapped prefix so post-gap chunks stay "
         "L1-resident instead of truncating at the gap. No effect otherwise.",
     )
+    mp_group.add_argument(
+        "--restore-pin-limit-chunks",
+        type=int,
+        default=0,
+        help="Chunks a loading lookup copies into L1 and read-locks before "
+        "it reports the rest of the prefix from the L2 index; workers "
+        "restore that rest in windows. 0 (default) loads every found chunk "
+        "at lookup time.",
+    )
     return parser
 
 
@@ -408,6 +424,7 @@ def parse_args_to_mp_server_config(
         engine_type=args.engine_type,
         separate_object_groups=args.separate_object_groups,
         enable_segmented_prefix=args.enable_segmented_prefix,
+        restore_pin_limit_chunks=getattr(args, "restore_pin_limit_chunks", 0),
         supported_transfer_mode=args.supported_transfer_mode,
         runtime_plugin_config=RuntimePluginConfig(
             locations=(args.runtime_plugin_locations or []),
