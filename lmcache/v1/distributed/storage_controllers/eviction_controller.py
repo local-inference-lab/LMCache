@@ -10,6 +10,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING
 import inspect
 import math
+import os
 import threading
 import time
 
@@ -120,7 +121,20 @@ class L1EvictionController(EvictionController):
     # Keys per periodic backup flush cycle.
     _BACKUP_FLUSH_BATCH_SIZE = 128
     # A prefetch request must not stall the controller indefinitely on L2.
-    _EMERGENCY_FLUSH_TIMEOUT_SECONDS = 1.0
+    # Time budget of one emergency eviction for a prefetch restore, including
+    # the synchronous write-back of victims that are not yet in L2. The default
+    # holds for victims that are already durable (delete only); when the LRU
+    # tail is dirty a restore of several GB cannot be written within it, the
+    # flush is abandoned before any batch is deleted and the restore fails
+    # (``LMCACHE_EMERGENCY_FLUSH_TIMEOUT``, seconds). ``LMCACHE_EMERGENCY_FLUSH_MIN_MBPS``
+    # (default 0 = off) instead sizes the budget from the deficit, as
+    # ``deficit / rate``, never below the fixed budget.
+    _EMERGENCY_FLUSH_TIMEOUT_SECONDS = float(
+        os.environ.get("LMCACHE_EMERGENCY_FLUSH_TIMEOUT", "1.0") or 1.0
+    )
+    _EMERGENCY_FLUSH_MIN_MBPS = float(
+        os.environ.get("LMCACHE_EMERGENCY_FLUSH_MIN_MBPS", "0") or 0.0
+    )
     # Periodic backup runs under the flush lock and must remain stoppable.
     _PERIODIC_FLUSH_TIMEOUT_SECONDS = 5.0
 
@@ -348,10 +362,15 @@ class L1EvictionController(EvictionController):
         Returns:
             The free byte count after eviction.
         """
-        deadline = time.monotonic() + self._EMERGENCY_FLUSH_TIMEOUT_SECONDS
-        if not self._emergency_evict_lock.acquire(
-            timeout=self._EMERGENCY_FLUSH_TIMEOUT_SECONDS
-        ):
+        used, total = self._l1_manager.get_memory_usage()
+        budget = self._EMERGENCY_FLUSH_TIMEOUT_SECONDS
+        if self._EMERGENCY_FLUSH_MIN_MBPS > 0:
+            deficit_now = max(0, target_free_bytes - max(0, total - used))
+            budget = max(
+                budget, deficit_now / (self._EMERGENCY_FLUSH_MIN_MBPS * 1e6)
+            )
+        deadline = time.monotonic() + budget
+        if not self._emergency_evict_lock.acquire(timeout=budget):
             used, total = self._l1_manager.get_memory_usage()
             return max(0, total - used)
         try:
