@@ -21,3 +21,21 @@ test "$(find /wheelhouse -maxdepth 1 -name 'lmcache-*.whl' | wc -l)" -eq 1
   --wheel /wheelhouse/lmcache-*.whl \
   --torch-version 2.14.0a0+4fdf77b940.nv26.8.63802676 \
   --source-date-epoch "${SOURCE_DATE_EPOCH:?}"
+
+/build-venv/bin/python - <<'PY'
+from pathlib import Path
+from zipfile import ZipFile
+
+wheel = next(Path("/wheelhouse").glob("lmcache-*.whl"))
+with ZipFile(wheel) as archive:
+    cuda_extensions = [
+        name
+        for name in archive.namelist()
+        if name.startswith("lmcache/cuda_ops.") and name.endswith(".so")
+    ]
+if len(cuda_extensions) != 1:
+    raise RuntimeError(
+        "LMCache wheel must contain exactly one lmcache.cuda_ops extension"
+    )
+print(f"lmcache_cuda_extension={cuda_extensions[0]}")
+PY

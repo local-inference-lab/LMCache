@@ -47,6 +47,7 @@ metadata=$(unzip -p "${wheel}" '*/METADATA')
 package_name=$(awk -F': ' '$1 == "Name" {print $2; exit}' <<<"${metadata}")
 package_version=$(awk -F': ' '$1 == "Version" {print $2; exit}' <<<"${metadata}")
 test "${package_name}" = lmcache
+unzip -l "${wheel}" | grep -Eq 'lmcache/cuda_ops\.[^/]*\.so$'
 digest=$(sha256sum "${wheel}" | awk '{print $1}')
 file=$(basename "${wheel}")
 url="https://github.com/${repository}/releases/download/${release_tag}/${file}"
