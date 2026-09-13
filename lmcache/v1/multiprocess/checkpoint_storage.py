@@ -250,7 +250,7 @@ class CheckpointPayloadStore:
 
     def prepare_store(
         self, manifest: CheckpointManifest, rank: int
-    ) -> CheckpointSlots | None:
+    ) -> CheckpointSlots | AdmissionFailure | None:
         """Reserve all pages for one rank or release the partial reservation.
 
         Args:
@@ -258,8 +258,10 @@ class CheckpointPayloadStore:
             rank: Producer rank.
 
         Returns:
-            A pinned writable lease, or None if any page cannot be reserved.
-            Admission failure cancels publication of the whole generation.
+            A pinned writable lease, ``AdmissionFailure.BUSY`` when an
+            immutable page has another writer, or None for a terminal miss.
+            Busy admission retains the pending generation so the producer can
+            retry; a terminal miss cancels its publication.
 
         Raises:
             ValueError: For invalid layouts or a duplicate producer rank.
@@ -316,15 +318,24 @@ class CheckpointPayloadStore:
                         for key in keys
                         if key not in objects and key not in readable
                     ]
-                    capacity_only = all(
-                        detailed.get(key, (L1Error.KEY_NOT_WRITABLE, None))[0]
-                        is L1Error.OUT_OF_MEMORY
+                    errors = [
+                        detailed.get(key, (L1Error.KEY_NOT_EXIST, None))[0]
                         for key in missing
+                    ]
+                    capacity_only = all(
+                        error is L1Error.OUT_OF_MEMORY for error in errors
+                    )
+                    busy_only = all(
+                        error is L1Error.KEY_NOT_WRITABLE for error in errors
                     )
                     return AdmissionAttempt.failure(
                         AdmissionFailure.CAPACITY
                         if capacity_only
-                        else AdmissionFailure.CONFLICT
+                        else (
+                            AdmissionFailure.BUSY
+                            if busy_only
+                            else AdmissionFailure.CONFLICT
+                        )
                     )
                 slots.append(
                     tuple(
@@ -337,6 +348,7 @@ class CheckpointPayloadStore:
             return AdmissionAttempt.success(tuple(slots))
 
         admitted = False
+        retryable = False
         try:
             outcome = reserve_with_eviction_backpressure(
                 attempt=attempt,
@@ -352,7 +364,8 @@ class CheckpointPayloadStore:
                 on_timeout=self._storage.record_admission_timeout,
             )
             if outcome.value is None:
-                return None
+                retryable = outcome.failure is AdmissionFailure.BUSY
+                return AdmissionFailure.BUSY if retryable else None
             lease_id = uuid.uuid4().hex
             with self._lock:
                 self._stores[lease_id] = _StoreLease(manifest, rank, reserved)
@@ -364,7 +377,8 @@ class CheckpointPayloadStore:
                     self._storage.abort_write(reserved)
                 finally:
                     try:
-                        self._index.abort(manifest.generation)
+                        if not retryable:
+                            self._index.abort(manifest.generation)
                     finally:
                         with self._lock:
                             self._store_ranks.discard(identity)
