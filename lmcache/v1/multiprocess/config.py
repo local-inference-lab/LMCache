@@ -91,6 +91,11 @@ class MPServerConfig:
     """SHM segment name for engine-driven KV transfer.
     "" (default): force pickle. None: auto-allocate. Other: use that name."""
 
+    checkpoint_index_path: str | None = None
+    """SQLite manifest directory for engine-driven recurrent checkpoints.
+    None keeps manifests in RAM. The parent directory must exist and be trusted.
+    Tensor payload durability is independently configured through L2 storage."""
+
     script_allowed_imports: list[str] = field(default_factory=list)
     """Modules that /run_script endpoint is allowed to import."""
 
@@ -424,6 +429,13 @@ def add_mp_server_args(
         "behind different prefixes is indexed once. No effect otherwise.",
     )
     mp_group.add_argument(
+        "--checkpoint-index-path",
+        default=None,
+        help="SQLite file for engine-driven recurrent checkpoint manifests; "
+        "requires SHM. Omit for a RAM-only manifest directory. The parent "
+        "directory must exist. Configure filesystem L2 separately for payloads.",
+    )
+    mp_group.add_argument(
         "--enable",
         type=str,
         nargs="*",
@@ -475,6 +487,7 @@ def parse_args_to_mp_server_config(
         ),
         p2p_config=parse_args_to_p2p_config(args),
         shm_name=args.shm_name,
+        checkpoint_index_path=args.checkpoint_index_path,
         script_allowed_imports=args.script_allowed_imports or [],
         worker_reap_timeout_seconds=args.worker_reap_timeout_seconds,
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,

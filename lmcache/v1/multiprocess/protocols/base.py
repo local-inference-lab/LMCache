@@ -92,6 +92,18 @@ class RequestType(enum.Enum):
     # Experimental transfer intermediate tensor
     GET_EXPERIMENTAL = enum.auto()
 
+    # Append wire IDs: existing clients depend on all preceding enum values.
+    CHECKPOINT_CAPABILITIES = enum.auto()
+    CHECKPOINT_FIND = enum.auto()
+    CHECKPOINT_BEGIN = enum.auto()
+    CHECKPOINT_ABORT = enum.auto()
+    CHECKPOINT_PREPARE_STORE = enum.auto()
+    CHECKPOINT_FINISH_STORE = enum.auto()
+    CHECKPOINT_BEGIN_RETRIEVE = enum.auto()
+    CHECKPOINT_POLL_RETRIEVE = enum.auto()
+    CHECKPOINT_FINISH_RETRIEVE = enum.auto()
+    CHECKPOINT_CANCEL_RETRIEVE = enum.auto()
+
 
 @dataclass
 class ProtocolDefinition:

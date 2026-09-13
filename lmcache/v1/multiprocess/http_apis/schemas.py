@@ -53,8 +53,8 @@ class PrefetchRequest:
 class ClearRequest:
     """Wire body for ``POST /cache/clear``.
 
-    ``tier`` is request data (today only ``l1``). ``force=true`` means active
-    locks may be ignored if the implementation supports forced cleanup.
+    Only the ``l1`` tier is supported. ``force=false`` retains read/write-locked
+    objects. ``force=true`` also frees locked objects and requires an idle engine.
     """
 
     tier: Tier = Tier.L1
