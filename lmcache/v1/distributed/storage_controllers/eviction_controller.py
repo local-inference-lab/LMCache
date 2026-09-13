@@ -422,11 +422,12 @@ class L1EvictionController(EvictionController):
         requester: str = "",
         cache_salt: str | None = None,
     ) -> int:
-        """Synchronously make room in L1 through bounded durable eviction.
+        """Synchronously make room in L1 through bounded, ownership-safe eviction.
 
         The normal LRU policy chooses victims. A hard deadline bounds lock
         acquisition and L2 persistence, and deadline exhaustion does not count
         as a backend failure for the normal writeback circuit breaker.
+        Write-through uses ordinary discard eviction without issuing L2 writes.
         """
         deadline = time.monotonic() + self._EMERGENCY_FLUSH_TIMEOUT_SECONDS
         if not self._emergency_evict_lock.acquire(
@@ -440,9 +441,8 @@ class L1EvictionController(EvictionController):
             free = max(0, total - used)
             if free >= target_free_bytes:
                 return free
-            if (
-                not self._write_back_enabled
-                or not self.has_bounded_l2_flush_adapter()
+            if self._write_back_enabled and (
+                not self.has_bounded_l2_flush_adapter()
                 or time.monotonic() < self._sync_flush_backoff_until
             ):
                 return free
@@ -483,7 +483,11 @@ class L1EvictionController(EvictionController):
                     )
                 actions = self._eviction_policy.get_eviction_actions(
                     min(1.0, need_keys / max(1, tracked)),
-                    key_eligible_filter=self._is_writeback_evictable,
+                    key_eligible_filter=(
+                        self._is_writeback_evictable
+                        if self._write_back_enabled
+                        else self._l1_manager.is_key_evictable
+                    ),
                     cache_salt=cache_salt,
                 )
                 if not actions:
@@ -491,7 +495,10 @@ class L1EvictionController(EvictionController):
 
                 free_before_pass = free
                 for action in actions:
-                    if action.destination == EvictionDestination.L2_CACHE:
+                    if (
+                        self._write_back_enabled
+                        and action.destination == EvictionDestination.L2_CACHE
+                    ):
                         outcome = self._flush_to_l2_then_delete(
                             action.keys,
                             deadline=deadline,
