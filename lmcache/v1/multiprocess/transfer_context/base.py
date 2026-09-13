@@ -45,6 +45,88 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass
+class PagedKVTransferWorkspace:
+    """Persistent CUDA arguments for engine-driven paged-KV transfers.
+
+    The paged-cache pointer table is immutable for the lifetime of a registered
+    engine. Block IDs change for every cache object, so each in-flight store
+    receives a distinct pinned-host and device staging pair. One staging tensor
+    holds the four objects supported by a native transfer launch. Larger stores
+    use a call-owned pinned-host snapshot so batches never overwrite metadata
+    still being consumed by an asynchronous H2D copy. The caller must not reuse
+    a workspace slot before its transfer completion event has finished.
+    """
+
+    paged_buffer_ptrs: torch.Tensor
+    block_ids_host: tuple[torch.Tensor, ...]
+    block_ids_device: tuple[torch.Tensor, ...]
+
+    @property
+    def num_slots(self) -> int:
+        """Return the number of independent in-flight staging pairs."""
+        return len(self.block_ids_host)
+
+
+def create_paged_kv_transfer_workspace(
+    kv_caches: dict[str, torch.Tensor],
+    max_block_ids: int,
+    num_slots: int,
+    layout_hints: LayoutHints | None = None,
+    engine_kv_format: "lmcache_native.EngineKVFormat" | None = None,
+) -> PagedKVTransferWorkspace:
+    """Create immutable pointer metadata and reusable block-ID staging.
+
+    Args:
+        kv_caches: Per-layer tensors belonging to one transfer group.
+        max_block_ids: Maximum block-ID count passed to one native launch.
+        num_slots: Number of stores that may be in flight concurrently.
+        layout_hints: Optional engine layout hints.
+        engine_kv_format: Optional pre-detected KV format.
+
+    Returns:
+        Workspace whose tensors stay alive until the transfer context closes.
+    """
+    if max_block_ids < 1:
+        raise ValueError("max_block_ids must be positive")
+    if num_slots < 1:
+        raise ValueError("num_slots must be positive")
+
+    # First Party
+    from lmcache.v1.gpu_connector.utils import (
+        get_device,
+        get_group_data_ptrs,
+        get_num_layers,
+        normalize_kv_and_discover_format,
+    )
+
+    tensors = list(kv_caches.values())
+    discovered_format, normalized = normalize_kv_and_discover_format(
+        tensors, EngineType.VLLM, layout_hints=layout_hints
+    )
+    transfer_format = engine_kv_format or discovered_format
+    num_layers = get_num_layers(normalized, transfer_format)
+    pointer_values = np.array(
+        get_group_data_ptrs(normalized, transfer_format, list(range(num_layers))),
+        dtype=np.uint64,
+    ).view(np.int64)
+    device = get_device(normalized)
+    paged_buffer_ptrs = torch.from_numpy(pointer_values).to(device=device)
+    block_ids_host = tuple(
+        torch.empty(max_block_ids, dtype=torch.int64, device="cpu", pin_memory=True)
+        for _ in range(num_slots)
+    )
+    block_ids_device = tuple(
+        torch.empty(max_block_ids, dtype=torch.int64, device=device)
+        for _ in range(num_slots)
+    )
+    return PagedKVTransferWorkspace(
+        paged_buffer_ptrs=paged_buffer_ptrs,
+        block_ids_host=block_ids_host,
+        block_ids_device=block_ids_device,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Global capability flag: does device_ops.multi_layer_block_kv_transfer accept
 # list[torch.Tensor] directly for lmcache_objects_ptrs, or only list[int]?
@@ -447,6 +529,8 @@ def gather_paged_kv_to_cpu(
     chunk_indices: list[int] | None = None,
     blocks_per_window: int | None = None,
     group_idx: int = 0,
+    transfer_workspace: PagedKVTransferWorkspace | None = None,
+    transfer_workspace_slot: int = 0,
 ) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
 
@@ -468,6 +552,11 @@ def gather_paged_kv_to_cpu(
         blocks_per_window: Number of trailing physical blocks retained from
             each logical chunk. ``None`` stores the whole chunk.
         group_idx: Protocol-visible group index used in layout diagnostics.
+        transfer_workspace: Optional registered CUDA pointer table and reusable
+            block-ID staging. When omitted, CUDA tensors are allocated for
+            backward compatibility.
+        transfer_workspace_slot: Staging pair reserved for this in-flight
+            transfer.
 
     Returns:
         List of CPU tensors, one per chunk. For split-K/V formats each chunk
@@ -634,21 +723,58 @@ def gather_paged_kv_to_cpu(
 
         else:
             # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
-            _ptrs_np = np.array(
-                get_group_data_ptrs(
-                    normalized, engine_kv_format, list(range(num_layers))
-                ),
-                dtype=np.uint64,
-            ).view(np.int64)
-            paged_arg = torch.from_numpy(_ptrs_np).to(device=get_device(normalized))
+            if transfer_workspace is None:
+                _ptrs_np = np.array(
+                    get_group_data_ptrs(
+                        normalized, engine_kv_format, list(range(num_layers))
+                    ),
+                    dtype=np.uint64,
+                ).view(np.int64)
+                paged_arg = torch.from_numpy(_ptrs_np).to(device=get_device(normalized))
+                block_ids_arg = torch.tensor(
+                    selected_block_ids,
+                    dtype=torch.int64,
+                    device=get_device(normalized),
+                )
+                block_ids_host = None
+                block_ids_device = None
+            else:
+                if not 0 <= transfer_workspace_slot < transfer_workspace.num_slots:
+                    raise ValueError(
+                        f"transfer_workspace_slot {transfer_workspace_slot} is "
+                        f"outside [0, {transfer_workspace.num_slots})"
+                    )
+                paged_arg = transfer_workspace.paged_buffer_ptrs
+                block_ids_arg = None
+                block_ids_host = transfer_workspace.block_ids_host[
+                    transfer_workspace_slot
+                ]
+                block_ids_device = transfer_workspace.block_ids_device[
+                    transfer_workspace_slot
+                ]
+                required_device_ids = min(4 * bpw, len(selected_block_ids))
+                if required_device_ids > block_ids_device.numel():
+                    raise ValueError(
+                        f"transfer workspace holds {block_ids_device.numel()} "
+                        f"block IDs, but the launch requires {required_device_ids}"
+                    )
+                if len(selected_block_ids) > block_ids_host.numel():
+                    block_ids_host = torch.empty(
+                        len(selected_block_ids),
+                        dtype=torch.int64,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                # Host writes are not ordered by the CUDA stream. Keep every
+                # batch's source immutable until its H2D copy completes; copy_
+                # records pinned-allocation lifetime on that stream.
+                block_ids_host[: len(selected_block_ids)].numpy()[:] = (
+                    selected_block_ids
+                )
 
             # This safely points to either the pre-pinned chunks
             # OR the temporary staged_chunks
             objs_arg = _tensors_to_ptrs(chunks)
-
-            block_ids_arg = torch.tensor(
-                selected_block_ids, dtype=torch.int64, device=get_device(normalized)
-            )
 
             # Split transfer to respect CUDA kernel's object count limitation
             MAX_OBJECTS = 4
@@ -663,7 +789,17 @@ def gather_paged_kv_to_cpu(
                 end_block = min(
                     (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
                 )
-                batch_blocks = block_ids_arg[start_block:end_block]
+                if transfer_workspace is None:
+                    assert block_ids_arg is not None
+                    batch_blocks = block_ids_arg[start_block:end_block]
+                else:
+                    assert block_ids_host is not None
+                    assert block_ids_device is not None
+                    batch_count = end_block - start_block
+                    block_ids_device[:batch_count].copy_(
+                        block_ids_host[start_block:end_block], non_blocking=True
+                    )
+                    batch_blocks = block_ids_device[:batch_count]
 
                 # Execute batched transfer
                 device_ops.multi_layer_block_kv_transfer(
