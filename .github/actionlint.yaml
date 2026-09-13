@@ -1,0 +1,4 @@
+# The CUDA wheel publisher runs on the organization-managed build pool.
+self-hosted-runner:
+  labels:
+    - lil-wheel-builder
