@@ -160,6 +160,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             }
 
         return {
+            "engine_driven_shm_pool": dict(self._shm_pool_info),
             "registered_non_cuda_instance_ids": registered_non_cuda_ids,
             "non_cuda_context_meta": non_cuda_context_meta,
         }
