@@ -1,6 +1,6 @@
 {
   "schema": "local-inference-lmcache-community-source/v1",
-  "branch": "dev/local-inference-lab",
+  "branch": "integration/local-inference-lab",
   "reference_commit": "29bc5a2efde737c436b04499eb62cd1776cebeec",
   "required_reviews": {
     "49": "b4b79a0ffeeec0e7ede02744cb50a8271bb1c89e",

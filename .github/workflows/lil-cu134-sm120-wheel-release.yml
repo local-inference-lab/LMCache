@@ -3,7 +3,7 @@ name: LIL LMCache CUDA 13.4 SM120 wheels
 on:
   push:
     branches:
-      - dev/local-inference-lab
+      - integration/local-inference-lab
     tags:
       - lmcache-cu134-sm120-stable-*
     paths:
