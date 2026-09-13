@@ -3,7 +3,7 @@ ninja==1.13.0 \
 packaging==26.2 \
     --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
 setuptools==80.10.2 \
-    --hash=sha256:95b30ddfb717250ed492926c92b5221f7ef3fbcc2b07579bcd4a27da21d0173
+    --hash=sha256:95b30ddfb717250edb492926c92b5221f7ef3fbcc2b07579bcd4a27da21d0173
 setuptools-scm==10.2.1 \
     --hash=sha256:b7c82f4102d389ee57dc66ccdb4f9b4bca3c40ba83b43f1f63d68ccd72db2580
 vcs-versioning==2.3.1 \
