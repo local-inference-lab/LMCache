@@ -3,8 +3,9 @@
 File-system based L2 adapter using aiofiles for async I/O.
 
 Stores KV cache objects as raw tensor bytes on disk (no metadata
-header).  Each ObjectKey maps to a separate ``.data`` file whose
-name encodes all key fields so it can be reversed on startup.
+header). Each ObjectKey maps to a separate ``.data`` file. Names that fit the
+filesystem component limit use the flat layout. Oversized names use bounded,
+reversible path components so restart inventory retains the complete key.
 """
 
 # Future
@@ -56,6 +57,10 @@ _KEY_SEP = "@"
 # csrc/storage_backends/fs/connector.cpp.
 _PATH_SLASH_REPLACEMENT = "-SEP-"
 _FILE_EXT = ".data"
+# Keep ObjectKey-to-filename mapping independent of local filesystem settings.
+_LEGACY_FILENAME_MAX_BYTES = 255
+_BOUNDED_PATH_VERSION = ".lmcache-objects-v1"
+_ENCODED_COMPONENT_MAX_CHARS = 200
 
 
 def _write_all(fd: int, buf: bytes | bytearray | memoryview) -> None:
@@ -157,7 +162,7 @@ def _object_key_to_filename(key: ObjectKey) -> str:
 def _filename_to_object_key(
     filename: str,
 ) -> Optional[ObjectKey]:
-    """Reverse ``_object_key_to_filename``.
+    """Reverse legacy filenames produced by ``_object_key_to_filename``.
 
     Accepts both the 4-field unsalted shape and the 5-field salted
     shape (trailing ``cache_salt``). Returns ``None`` for anything
@@ -194,6 +199,138 @@ def _filename_to_object_key(
             cache_salt=cache_salt,
         )
     except ValueError:
+        return None
+
+
+def _hex_path_components(value: str) -> list[str]:
+    """Encode a key field into bounded, path-safe components."""
+    encoded = value.encode("utf-8", errors="surrogatepass").hex()
+    return [
+        encoded[offset : offset + _ENCODED_COMPONENT_MAX_CHARS]
+        for offset in range(0, len(encoded), _ENCODED_COMPONENT_MAX_CHARS)
+    ]
+
+
+def _ascii_path_components(value: str) -> list[str]:
+    """Split a path-safe ASCII key field into bounded components."""
+    return [
+        value[offset : offset + _ENCODED_COMPONENT_MAX_CHARS]
+        for offset in range(0, len(value), _ENCODED_COMPONENT_MAX_CHARS)
+    ]
+
+
+def _object_key_to_bounded_relative_path(key: ObjectKey) -> Path:
+    """Map an oversized ObjectKey to a reversible bounded relative path.
+
+    Model identity and tenant salt are preserved exactly so restart inventory
+    can reconstruct capacity and per-tenant accounting without a sidecar.
+    """
+    model_parts = _hex_path_components(key.model_name)
+    salt_parts = _hex_path_components(key.cache_salt)
+    leaf = (
+        f"{key.kv_rank:#010x}{_KEY_SEP}{key.object_group_id:x}"
+        f"{_KEY_SEP}{key.chunk_hash.hex()}{_FILE_EXT}"
+    )
+    prefix = Path(
+        _BOUNDED_PATH_VERSION,
+        f"m{len(model_parts)}",
+        *model_parts,
+        f"s{len(salt_parts)}",
+        *salt_parts,
+    )
+    if len(os.fsencode(leaf)) <= _LEGACY_FILENAME_MAX_BYTES:
+        return prefix / leaf
+
+    rank_parts = _ascii_path_components(f"{key.kv_rank:#010x}")
+    group_parts = _ascii_path_components(f"{key.object_group_id:x}")
+    hash_parts = _ascii_path_components(key.chunk_hash.hex())
+    return Path(
+        prefix,
+        f"r{len(rank_parts)}",
+        *rank_parts,
+        f"g{len(group_parts)}",
+        *group_parts,
+        f"h{len(hash_parts)}",
+        *hash_parts,
+        f"object{_FILE_EXT}",
+    )
+
+
+def _object_key_to_relative_path(key: ObjectKey) -> Path:
+    """Return a stable flat or bounded storage path for an ObjectKey."""
+    legacy_filename = _object_key_to_filename(key)
+    canonical_bytes = legacy_filename.encode("utf-8", errors="surrogatepass")
+    if len(canonical_bytes) <= _LEGACY_FILENAME_MAX_BYTES:
+        return Path(legacy_filename)
+    return _object_key_to_bounded_relative_path(key)
+
+
+def _bounded_relative_path_to_object_key(
+    relative_path: Path,
+) -> Optional[ObjectKey]:
+    """Decode the reversible bounded path shape into its ObjectKey."""
+    parts = relative_path.parts
+    if len(parts) < 4 or parts[0] != _BOUNDED_PATH_VERSION:
+        return None
+    try:
+        model_count = int(parts[1][1:]) if parts[1].startswith("m") else -1
+        model_start = 2
+        salt_marker = model_start + model_count
+        if model_count < 0 or salt_marker >= len(parts):
+            return None
+        salt_header = parts[salt_marker]
+        salt_count = int(salt_header[1:]) if salt_header.startswith("s") else -1
+        salt_start = salt_marker + 1
+        suffix_start = salt_start + salt_count
+        if salt_count < 0 or suffix_start >= len(parts):
+            return None
+
+        model_name = bytes.fromhex("".join(parts[model_start:salt_marker])).decode(
+            "utf-8", errors="surrogatepass"
+        )
+        cache_salt = bytes.fromhex("".join(parts[salt_start:suffix_start])).decode(
+            "utf-8", errors="surrogatepass"
+        )
+        leaf = parts[-1]
+        if not leaf.endswith(_FILE_EXT):
+            return None
+        key_parts = leaf[: -len(_FILE_EXT)].split(_KEY_SEP)
+        if suffix_start == len(parts) - 1 and len(key_parts) == 3:
+            kv_rank_str, object_group_str, chunk_hash_hex = key_parts
+        else:
+            rank_header = parts[suffix_start]
+            rank_count = int(rank_header[1:]) if rank_header.startswith("r") else -1
+            rank_start = suffix_start + 1
+            group_marker = rank_start + rank_count
+            if rank_count <= 0 or group_marker >= len(parts):
+                return None
+            group_header = parts[group_marker]
+            group_count = int(group_header[1:]) if group_header.startswith("g") else -1
+            group_start = group_marker + 1
+            hash_marker = group_start + group_count
+            if group_count <= 0 or hash_marker >= len(parts):
+                return None
+            hash_header = parts[hash_marker]
+            hash_count = int(hash_header[1:]) if hash_header.startswith("h") else -1
+            hash_start = hash_marker + 1
+            leaf_index = hash_start + hash_count
+            if (
+                hash_count < 0
+                or leaf_index != len(parts) - 1
+                or leaf != f"object{_FILE_EXT}"
+            ):
+                return None
+            kv_rank_str = "".join(parts[rank_start:group_marker])
+            object_group_str = "".join(parts[group_start:hash_marker])
+            chunk_hash_hex = "".join(parts[hash_start:leaf_index])
+        return ObjectKey(
+            chunk_hash=bytes.fromhex(chunk_hash_hex),
+            model_name=model_name,
+            kv_rank=int(kv_rank_str, 16),
+            object_group_id=int(object_group_str, 16),
+            cache_salt=cache_salt,
+        )
+    except (UnicodeDecodeError, ValueError):
         return None
 
 
@@ -277,9 +414,9 @@ class FSL2Adapter(L2AdapterInterface):
     """
     File-system backed L2 adapter with async I/O via *aiofiles*.
 
-    Each file stores **only** the raw tensor bytes (no metadata
-    header), which gives maximum I/O throughput.  The file name
-    itself encodes the full ``ObjectKey`` so it is reversible.
+    Each file stores **only** the raw tensor bytes (no metadata header), which
+    gives maximum I/O throughput. Representable file names encode the complete
+    ``ObjectKey``; oversized names use a reversible bounded path.
 
     Thread safety is ensured via a lock for shared bookkeeping
     and an asyncio event loop running on a dedicated daemon
@@ -309,6 +446,27 @@ class FSL2Adapter(L2AdapterInterface):
             (self._base_path / self._relative_tmp_dir).mkdir(
                 parents=False, exist_ok=True
             )
+
+        try:
+            name_limits = [os.pathconf(self._base_path, "PC_NAME_MAX")]
+            path_limits = [os.pathconf(self._base_path, "PC_PATH_MAX")]
+            if self._relative_tmp_dir is not None:
+                tmp_path = self._base_path / self._relative_tmp_dir
+                name_limits.append(os.pathconf(tmp_path, "PC_NAME_MAX"))
+                path_limits.append(os.pathconf(tmp_path, "PC_PATH_MAX"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"Failed to determine filesystem path limits for FS L2 adapter: {exc}"
+            ) from exc
+        finite_name_limits = [limit for limit in name_limits if limit >= 0]
+        self._name_max = min(finite_name_limits, default=None)
+        if self._name_max is not None and self._name_max < _LEGACY_FILENAME_MAX_BYTES:
+            raise ValueError(
+                "FS L2 adapter requires PC_NAME_MAX >= "
+                f"{_LEGACY_FILENAME_MAX_BYTES}, got {self._name_max}"
+            )
+        finite_path_limits = [limit for limit in path_limits if limit >= 0]
+        self._path_max = min(finite_path_limits, default=None)
 
         # I/O tuning options aligned with FSConnector
         self._read_ahead_size = config.read_ahead_size
@@ -533,7 +691,42 @@ class FSL2Adapter(L2AdapterInterface):
         return tid
 
     def _key_to_path(self, key: ObjectKey) -> Path:
-        return self._base_path / _object_key_to_filename(key)
+        path = self._base_path / _object_key_to_relative_path(key)
+        self._require_representable_path(path)
+        return path
+
+    def _key_candidate_paths(self, key: ObjectKey) -> tuple[Path, ...]:
+        """Return canonical-first paths accepted for one cache object.
+
+        Oversized keys used flat filenames before bounded paths were
+        introduced. Filesystems with a larger component limit can therefore
+        contain a valid legacy object that must remain readable and must block
+        a duplicate canonical store.
+        """
+        canonical = self._base_path / _object_key_to_relative_path(key)
+        legacy = self._base_path / _object_key_to_filename(key)
+        candidates: list[Path] = []
+        if self._path_is_representable(canonical):
+            candidates.append(canonical)
+        if (
+            canonical != legacy
+            and (
+                self._name_max is None
+                or len(os.fsencode(legacy.name)) <= self._name_max
+            )
+            and self._path_is_representable(legacy)
+        ):
+            candidates.append(legacy)
+        if not candidates:
+            self._require_representable_path(canonical)
+        return tuple(candidates)
+
+    async def _existing_key_path(self, key: ObjectKey) -> Optional[Path]:
+        """Resolve the first existing canonical or compatible legacy path."""
+        for path in self._key_candidate_paths(key):
+            if await aiofiles.os.path.exists(path):
+                return path
+        return None
 
     async def _key_exists_on_disk(
         self,
@@ -545,8 +738,7 @@ class FSL2Adapter(L2AdapterInterface):
         non-blocking and always reflects the real FS state,
         which is critical for multi-node shared-FS setups.
         """
-        path = self._key_to_path(key)
-        return await aiofiles.os.path.exists(path)
+        return await self._existing_key_path(key) is not None
 
     def _key_to_file_and_tmp_path(self, key: ObjectKey) -> tuple[Path, Path]:
         """Return ``(final_path, tmp_path)``.
@@ -556,14 +748,31 @@ class FSL2Adapter(L2AdapterInterface):
         ``FSConnector._get_file_and_tmp_path``).  Otherwise a
         ``.tmp`` suffix is used.
         """
-        fname = _object_key_to_filename(key)
-        final = self._base_path / fname
+        relative_path = _object_key_to_relative_path(key)
+        final = self._base_path / relative_path
+        self._require_representable_path(final)
         if self._relative_tmp_dir is not None:
             tmp_dir = self._base_path / self._relative_tmp_dir
         else:
-            tmp_dir = self._base_path
-        tmp = tmp_dir / f"{fname}.tmp"
+            tmp_dir = final.parent
+        # The caller appends a PID and UUID. Keep the temporary basename
+        # independent of the final key so a valid 255-byte legacy name cannot
+        # overflow the same filesystem's component limit during publication.
+        tmp = tmp_dir / ".lmcache-write.tmp"
         return final, tmp
+
+    def _path_is_representable(self, path: Path) -> bool:
+        """Return whether the encoded path fits the filesystem path limit."""
+        return self._path_max is None or len(os.fsencode(path)) < self._path_max
+
+    def _require_representable_path(self, path: Path) -> None:
+        """Reject a path that cannot be passed to the target filesystem."""
+        if not self._path_is_representable(path):
+            path_bytes = len(os.fsencode(path))
+            raise ValueError(
+                f"FS L2 object path uses {path_bytes} bytes, but PC_PATH_MAX "
+                f"is {self._path_max}"
+            )
 
     # ---- O_DIRECT helpers -----------------------------------------------
 
@@ -647,16 +856,17 @@ class FSL2Adapter(L2AdapterInterface):
         stored_sizes: list[int] = []
         try:
             for key, obj in zip(keys, objects, strict=True):
-                file_path, tmp_template = self._key_to_file_and_tmp_path(key)
-
                 # Skip if already stored on disk
-                if await aiofiles.os.path.exists(file_path):
+                if await self._existing_key_path(key) is not None:
                     continue
+                file_path, tmp_template = self._key_to_file_and_tmp_path(key)
                 buf = obj.byte_array
                 size = len(buf)
                 tmp_path = tmp_template.with_name(
                     f"{tmp_template.name}.{os.getpid()}.{uuid.uuid4().hex}"
                 )
+                self._require_representable_path(tmp_path)
+                file_path.parent.mkdir(parents=True, exist_ok=True)
 
                 try:
                     # Decide whether O_DIRECT is usable
@@ -733,7 +943,12 @@ class FSL2Adapter(L2AdapterInterface):
     ) -> None:
         bitmap = Bitmap(len(keys))
         for i, key in enumerate(keys):
-            if not await self._key_exists_on_disk(key):
+            try:
+                key_exists = await self._key_exists_on_disk(key)
+            except ValueError:
+                logger.exception("FSL2Adapter rejected unrepresentable key %s", key)
+                continue
+            if not key_exists:
                 continue
             bitmap.set(i)
 
@@ -751,8 +966,8 @@ class FSL2Adapter(L2AdapterInterface):
     ) -> None:
         bitmap = Bitmap(len(keys))
         for i, key in enumerate(keys):
-            file_path = self._key_to_path(key)
             try:
+                file_path = await self._existing_key_path(key) or self._key_to_path(key)
                 dst_buf = objects[i].byte_array
                 expected = len(dst_buf)
                 num_read: Optional[int] = None
@@ -819,8 +1034,8 @@ class FSL2Adapter(L2AdapterInterface):
                 continue
             except Exception:
                 logger.exception(
-                    "FSL2Adapter failed to load %s",
-                    file_path,
+                    "FSL2Adapter failed to load key %s",
+                    key,
                 )
                 continue
 
@@ -841,7 +1056,13 @@ class FSL2Adapter(L2AdapterInterface):
         sem = asyncio.Semaphore(self._DELETE_CONCURRENCY)
 
         async def _delete_one(key: ObjectKey) -> tuple[ObjectKey, int] | None:
-            file_path = self._key_to_path(key)
+            try:
+                file_path = await self._existing_key_path(key)
+            except ValueError:
+                logger.exception("FSL2Adapter rejected unrepresentable key %s", key)
+                return None
+            if file_path is None:
+                return None
             async with sem:
                 try:
                     size = (await aiofiles.os.stat(file_path)).st_size

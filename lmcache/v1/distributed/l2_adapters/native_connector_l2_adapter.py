@@ -450,8 +450,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         tracking stays in sync.
 
         No-op if the connector does not expose ``submit_batch_delete``
-        or if the key list is empty. Keys with a pending or completed lookup
-        lock are skipped so an in-flight prefetch cannot race the unlink.
+        or if the key list is empty. Keys with a pending store or a pending or
+        completed lookup lock are skipped so active I/O cannot race the unlink.
         """
         if not keys or not self._has_delete:
             return
@@ -468,12 +468,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             for op_type, _task_id, _num_keys, op_keys in self._pending_ops.values():
                 if op_type == self._OP_LOOKUP and op_keys is not None:
                     protected_keys.update(op_keys)
+            for store in self._pending_store_sizes.values():
+                protected_keys.update(store.keys)
 
             delete_keys = [key for key in keys if key not in protected_keys]
             skipped_count = len(keys) - len(delete_keys)
             if skipped_count:
                 logger.info(
-                    "delete(): skipping %d lookup-pending or locked keys; %d remain",
+                    "delete(): skipping %d I/O-pending or locked keys; %d remain",
                     skipped_count,
                     len(delete_keys),
                 )

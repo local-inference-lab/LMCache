@@ -128,6 +128,8 @@ class ObjectKey:
             raise ValueError(
                 f"model_name must not contain '@' (got {self.model_name!r})"
             )
+        if self.kv_rank < 0:
+            raise ValueError(f"kv_rank must be >= 0 (got {self.kv_rank})")
         if self.object_group_id < 0:
             raise ValueError(
                 f"object_group_id must be >= 0 (got {self.object_group_id})"
