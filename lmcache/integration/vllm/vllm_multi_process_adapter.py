@@ -1456,7 +1456,10 @@ class LMCacheMPWorkerAdapter:
         self._layout_hints = (
             layout_hints if layout_hints is not None else vllm_layout_hints()
         )
-        self._send_register_kv_caches_request(kv_caches)
+        if self._send_register_kv_caches_request(kv_caches):
+            # Registration owns a server-side lease even while serving is
+            # idle or warming up. Start renewal before the first transfer.
+            self._ensure_heartbeat_started()
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
@@ -1565,7 +1568,7 @@ class LMCacheMPWorkerAdapter:
         return True
 
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat thread on first store/retrieve.
+        """Start one heartbeat after registration or on first store/retrieve.
 
         The heartbeat starts healthy (the event was set at construction). A
         live worker pings every interval, refreshing its server-side
