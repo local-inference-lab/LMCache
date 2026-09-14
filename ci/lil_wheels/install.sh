@@ -12,4 +12,4 @@ uv_binary=${UV_BIN:-uv}
   --no-deps \
   --require-hashes \
   -r "${bundle_dir}/requirements-github.txt"
-"${venv_path}/bin/python" -c 'import lmcache; import lmcache.cuda_ops; print("lmcache_install=PASS")'
+"${venv_path}/bin/python" -I -c 'import lmcache; import lmcache.cuda_ops; print("lmcache_install=PASS")'
