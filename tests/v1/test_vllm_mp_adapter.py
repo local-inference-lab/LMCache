@@ -281,6 +281,23 @@ def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
     assert args[1] == RequestType.REGISTER_KV_CACHE
 
 
+def test_registered_worker_heartbeats_before_first_cache_request(fake_adapter):
+    """An idle registered worker must not outlive its server-side lease."""
+    adapter, _send_mock, _ = fake_adapter
+    tensor = MagicMock()
+    tensor.device.type = "cuda"
+    adapter.register_kv_caches({"layer.0": tensor})
+    assert len(FakeHeartbeatThread.instances) == 1
+    heartbeat = FakeHeartbeatThread.instances[0]
+    assert heartbeat.instance_id == adapter.instance_id
+    assert heartbeat.calls == ["register_recover_callback", "start"]
+    assert adapter.is_healthy
+    # Registration refresh and the first store reuse the same heartbeat.
+    adapter.register_kv_caches({"layer.0": tensor})
+    adapter.submit_store_request("req-1", _op([[0]]), MagicMock())
+    assert len(FakeHeartbeatThread.instances) == 1
+
+
 def test_register_kv_caches_forwards_explicit_chunk_tokens(
     fake_adapter, monkeypatch
 ) -> None:
