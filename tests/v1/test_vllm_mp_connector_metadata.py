@@ -105,3 +105,40 @@ def test_retrieve_preserves_skip_inside_first_chunk() -> None:
     assert metadata.op.start == 0
     assert metadata.op.end == CHUNK_TOKENS
     assert metadata.op.skip_first_n_tokens == 16
+
+
+def test_private_group_does_not_suppress_store_or_enter_transfer() -> None:
+    tracker = _tracker(allocated_block_ids={0: [0, 1, 2, 3], 1: [99]})
+    tracker.num_scheduled_tokens = CHUNK_TOKENS
+
+    assert (
+        LMCacheMPRequestMetadata.GetStoreMetadata(tracker, CHUNK_TOKENS, [16, 8])
+        is None
+    )
+    metadata = LMCacheMPRequestMetadata.GetStoreMetadata(
+        tracker,
+        CHUNK_TOKENS,
+        [16, 8],
+        excluded_group_ids={1},
+    )
+
+    assert metadata is not None
+    assert metadata.op.block_ids == [[0, 1, 2, 3], []]
+
+
+def test_private_group_does_not_suppress_retrieve_or_enter_transfer() -> None:
+    tracker = _tracker(allocated_block_ids={0: [0, 1, 2, 3], 1: [99]})
+
+    assert (
+        LMCacheMPRequestMetadata.GetRetrieveMetadata(tracker, CHUNK_TOKENS, [16, 8])
+        is None
+    )
+    metadata = LMCacheMPRequestMetadata.GetRetrieveMetadata(
+        tracker,
+        CHUNK_TOKENS,
+        [16, 8],
+        excluded_group_ids={1},
+    )
+
+    assert metadata is not None
+    assert metadata.op.block_ids == [[0, 1, 2, 3], []]

@@ -251,6 +251,7 @@ class LMCacheMPRequestMetadata:
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
         mamba_group_ids: set[int] | None = None,
+        excluded_group_ids: set[int] | None = None,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the store metadata for the current request tracker.
@@ -266,6 +267,8 @@ class LMCacheMPRequestMetadata:
                 be replaced by exact recurrent-boundary handoffs. When a later
                 boundary has not arrived, the metadata covers only the longest
                 contiguous handoff-complete prefix.
+            excluded_group_ids: Request-private engine groups that must not
+                constrain transfer coverage or contribute block IDs.
 
         Returns:
             Store metadata for the next complete chunk range, or ``None`` when
@@ -301,13 +304,18 @@ class LMCacheMPRequestMetadata:
         # gemma-4 sliding: one 32-token ID covers 2x the tokens of a
         # 16-token full-attention ID).
         allocated_lengths = tracker.num_allocated_blocks()
+        transfer_group_ids = [
+            group_id
+            for group_id in range(num_engine_groups)
+            if not excluded_group_ids or group_id not in excluded_group_ids
+        ]
         allocated_tokens = (
             min(
                 allocated_lengths.get(engine_group_idx, 0)
                 * group_tokens_per_block[engine_group_idx]
-                for engine_group_idx in range(num_engine_groups)
+                for engine_group_idx in transfer_group_ids
             )
-            if num_engine_groups > 0
+            if transfer_group_ids
             else 0
         )
         min_available_tokens = min(
@@ -379,6 +387,8 @@ class LMCacheMPRequestMetadata:
                 start_token_idx,
                 end_token_idx,
             )
+            for group_id in excluded_group_ids or ():
+                block_ids[group_id] = []
             if mamba_group_ids and not apply_exact_mamba_store_blocks(
                 tracker,
                 block_ids,
@@ -428,6 +438,7 @@ class LMCacheMPRequestMetadata:
         tracker: LMCacheMPRequestTracker,
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
+        excluded_group_ids: set[int] | None = None,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the retrieve metadata for the current request tracker.
@@ -439,6 +450,8 @@ class LMCacheMPRequestMetadata:
                 paged chunk (one block ID) of that group, i.e. the group's
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+            excluded_group_ids: Request-private engine groups that must not
+                constrain transfer coverage or contribute block IDs.
         """
         if not tracker.is_ready_for_retrieving():
             return None
@@ -466,7 +479,8 @@ class LMCacheMPRequestMetadata:
             short_groups = [
                 group_idx
                 for group_idx, tokens_per_block in enumerate(group_tokens_per_block)
-                if len(tracker.allocated_block_ids.get(group_idx, []))
+                if (not excluded_group_ids or group_idx not in excluded_group_ids)
+                and len(tracker.allocated_block_ids.get(group_idx, []))
                 * tokens_per_block
                 < end_token_idx
             ]
@@ -488,6 +502,8 @@ class LMCacheMPRequestMetadata:
                 start_token_idx,
                 end_token_idx,
             )
+            for group_id in excluded_group_ids or ():
+                block_ids[group_id] = []
             token_ids = tracker.get_token_ids()
 
             # Compute how many tokens at the start of the retrieve range
