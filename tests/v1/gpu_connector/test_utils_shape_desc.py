@@ -32,6 +32,35 @@ from lmcache.v1.gpu_connector.utils import (  # noqa: E402
 import lmcache.lmcache_native as lmcache_native  # noqa: E402
 
 
+@pytest.mark.parametrize("group_idx", [3, None])
+def test_stride_resolution_keeps_validation_when_audit_is_disabled(
+    group_idx: int | None,
+) -> None:
+    """Suppressing the audit must retain stride resolution and layout rejection."""
+    backing = torch.empty((2, 384), dtype=torch.uint8)
+    mla = backing.as_strided((2, 4, 64), (384, 64, 1))
+    assert (
+        resolve_block_stride_and_log_layout(
+            [mla],
+            lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
+            layer_idx=0,
+            group_idx=group_idx,
+        )
+        == 384
+    )
+
+    kv_first = torch.empty_strided(
+        (2, 3, 4, 1, 64), (832, 256, 64, 64, 1), dtype=torch.uint8
+    )
+    with pytest.raises(ValueError, match="not a supported dim-0-padded format"):
+        resolve_block_stride_and_log_layout(
+            [kv_first],
+            lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            layer_idx=0,
+            group_idx=group_idx,
+        )
+
+
 def test_make_shape_desc_vllm_flash_attn_nhd():
     kv_caches = [torch.empty(2, 32, 16, 8, 64, dtype=torch.bfloat16) for _ in range(4)]
     sd = make_page_buffer_shape_desc(

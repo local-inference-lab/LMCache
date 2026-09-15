@@ -425,7 +425,7 @@ def _resolve_uniform_block_stride(
             normalized,
             engine_kv_format,
             layer_idx=layer_idx,
-            group_idx=group_idx,
+            group_idx=None,
         )
         for layer_idx in range(num_layers)
     ]
