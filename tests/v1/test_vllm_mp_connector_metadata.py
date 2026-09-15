@@ -126,6 +126,23 @@ def test_private_group_does_not_suppress_store_or_enter_transfer() -> None:
     assert metadata.op.block_ids == [[0, 1, 2, 3], []]
 
 
+def test_private_recurrent_group_does_not_reenter_store_transfer() -> None:
+    tracker = _tracker(allocated_block_ids={0: [0, 1, 2, 3], 1: [99]})
+    tracker.num_scheduled_tokens = CHUNK_TOKENS
+    tracker.exact_mamba_boundary_blocks = {1: {CHUNK_TOKENS: 777}}
+
+    metadata = LMCacheMPRequestMetadata.GetStoreMetadata(
+        tracker,
+        CHUNK_TOKENS,
+        [16, 8],
+        mamba_group_ids={1},
+        excluded_group_ids={1},
+    )
+
+    assert metadata is not None
+    assert metadata.op.block_ids == [[0, 1, 2, 3], []]
+
+
 def test_private_group_does_not_suppress_retrieve_or_enter_transfer() -> None:
     tracker = _tracker(allocated_block_ids={0: [0, 1, 2, 3], 1: [99]})
 

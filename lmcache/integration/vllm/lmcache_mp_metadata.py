@@ -275,6 +275,9 @@ class LMCacheMPRequestMetadata:
             no complete chunk is available.
         """
         num_engine_groups = len(group_tokens_per_block)
+        transfer_mamba_group_ids = set(mamba_group_ids or ()) - set(
+            excluded_group_ids or ()
+        )
         # NOTE: the invariant here is that `num_stored_tokens` should
         # always be a multiple of `lmcache_tokens_per_chunk`
         # TODO: This should be checked every time we update the num_stored_tokens
@@ -332,12 +335,12 @@ class LMCacheMPRequestMetadata:
                 start_token_idx + num_chunks * lmcache_tokens_per_chunk
             )
             end_token_idx = candidate_end_token_idx
-            if mamba_group_ids:
+            if transfer_mamba_group_ids:
                 received_handoff_boundaries = {
                     group_id: sorted(
                         tracker.exact_mamba_boundary_blocks.get(group_id, {})
                     )
-                    for group_id in sorted(mamba_group_ids)
+                    for group_id in sorted(transfer_mamba_group_ids)
                 }
                 required_boundaries = list(
                     range(
@@ -351,7 +354,7 @@ class LMCacheMPRequestMetadata:
                     if not all(
                         boundary_tokens
                         in tracker.exact_mamba_boundary_blocks.get(group_id, {})
-                        for group_id in mamba_group_ids
+                        for group_id in transfer_mamba_group_ids
                     ):
                         break
                     end_token_idx = boundary_tokens
@@ -362,7 +365,7 @@ class LMCacheMPRequestMetadata:
                         "required_store_boundaries=%s, reason=no contiguous "
                         "exact recurrent boundary",
                         tracker.request_id,
-                        sorted(mamba_group_ids),
+                        sorted(transfer_mamba_group_ids),
                         received_handoff_boundaries,
                         required_boundaries,
                     )
@@ -375,7 +378,7 @@ class LMCacheMPRequestMetadata:
                         "required_store_boundaries=%s, store_range=[%d, %d), "
                         "reason=later exact recurrent boundary unavailable",
                         tracker.request_id,
-                        sorted(mamba_group_ids),
+                        sorted(transfer_mamba_group_ids),
                         received_handoff_boundaries,
                         required_boundaries,
                         start_token_idx,
@@ -389,11 +392,11 @@ class LMCacheMPRequestMetadata:
             )
             for group_id in excluded_group_ids or ():
                 block_ids[group_id] = []
-            if mamba_group_ids and not apply_exact_mamba_store_blocks(
+            if transfer_mamba_group_ids and not apply_exact_mamba_store_blocks(
                 tracker,
                 block_ids,
                 group_tokens_per_block,
-                mamba_group_ids,
+                transfer_mamba_group_ids,
                 lmcache_tokens_per_chunk,
                 start_token_idx,
                 end_token_idx,
