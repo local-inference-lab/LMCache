@@ -25,6 +25,7 @@ import lmcache.lmcache_native as lmcache_native
 @dataclass
 class MockKVCacheSpec:
     block_size: int
+    prefix_cacheable: bool = True
 
 
 @dataclass
@@ -119,6 +120,30 @@ def test_conversion_preserves_engine_group_layers():
     assert num_engine_groups(spec) == 2
     assert get_engine_group_indices(spec, 4) == [0, 1, 0, 1]
     assert [group.tokens_per_block for group in spec] == [16, 16]
+
+
+def test_conversion_excludes_private_group_without_renumbering():
+    """Request-private state keeps its engine ID but has no transfer view."""
+    caches = _same_shape_caches(["layer.0", "layer.1", "layer.2"])
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["layer.0"], MockKVCacheSpec(block_size=16)),
+                MockKVCacheGroup(
+                    ["layer.1"],
+                    MockKVCacheSpec(block_size=8, prefix_cacheable=False),
+                ),
+                MockKVCacheGroup(["layer.2"], MockKVCacheSpec(block_size=32)),
+            ]
+        ),
+        caches,
+    )
+
+    from lmcache.v1.kv_layer_groups import EXCLUDED_ENGINE_GROUP
+
+    assert [group.engine_group_id for group in spec] == [0, 2]
+    assert get_engine_group_indices(spec, 3) == [0, EXCLUDED_ENGINE_GROUP, 2]
+    assert num_engine_groups(spec) == 3
 
 
 def test_conversion_splits_by_lmcache_layer_identity():

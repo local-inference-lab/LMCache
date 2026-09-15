@@ -508,6 +508,24 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         validate_mamba_step_alignment(vllm_config, kv_cache_config)
         validate_kv_cache_groups(kv_cache_config)
         self._has_recurrent_cache = _has_recurrent_cache(kv_cache_config)
+        groups = getattr(kv_cache_config, "kv_cache_groups", ()) or ()
+        self._excluded_group_ids = {
+            group_id
+            for group_id, group in enumerate(groups)
+            if not getattr(group.kv_cache_spec, "prefix_cacheable", True)
+        }
+        if groups and len(self._excluded_group_ids) == len(groups):
+            raise ValueError("LMCache requires at least one prefix-cacheable group")
+        self._prefill_replay_tokens = max(
+            0,
+            max(
+                (
+                    getattr(spec, "prefill_replay_tokens", 0)
+                    for spec in _iter_kv_cache_specs(kv_cache_config)
+                ),
+                default=0,
+            ),
+        )
 
         group_tokens_per_block = get_group_tokens_per_block(
             vllm_config, kv_cache_config
@@ -1100,6 +1118,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
 
         lookup_token_ids = tracker.get_token_ids()
+        prefill_replay_tokens = getattr(self, "_prefill_replay_tokens", 0)
+        if prefill_replay_tokens:
+            lookup_token_ids = lookup_token_ids[
+                : max(0, len(lookup_token_ids) - prefill_replay_tokens)
+            ]
         if self._has_recurrent_cache:
             lookup_token_ids = lookup_token_ids[
                 : _recurrent_safe_lookup_end(
@@ -1182,6 +1205,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         tracker = self._get_or_create_request_tracker(request)
         lookup_token_ids = list(request.all_token_ids)
+        prefill_replay_tokens = getattr(self, "_prefill_replay_tokens", 0)
+        if prefill_replay_tokens:
+            lookup_token_ids = lookup_token_ids[
+                : max(0, len(lookup_token_ids) - prefill_replay_tokens)
+            ]
         if self._has_recurrent_cache:
             lookup_token_ids = lookup_token_ids[
                 : _recurrent_safe_lookup_end(
@@ -1572,6 +1600,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 group_tokens_per_block=self._group_tokens_per_block,
+                excluded_group_ids=getattr(self, "_excluded_group_ids", None),
             )
             if r_metadata is not None:
                 metadata.add_request_metadata(r_metadata)
@@ -1605,6 +1634,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
                 self._mamba_group_ids,
+                getattr(self, "_excluded_group_ids", None),
             )
             if r_meta is not None:
                 # In lazy_offload mode, add to pending queue instead of immediate store
@@ -1659,6 +1689,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
                 self._mamba_group_ids,
+                getattr(self, "_excluded_group_ids", None),
             )
 
             if r_meta is not None:
