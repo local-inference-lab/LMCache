@@ -21,6 +21,7 @@ from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
     LMCacheMPConnector,
     LMCacheMPRequestState,
     _has_recurrent_cache,
+    _iter_kv_cache_specs,
     _recurrent_safe_lookup_end,
 )
 
@@ -197,6 +198,23 @@ def test_lookup_leaves_model_required_private_replay_tail(eager: bool) -> None:
     adapter = connector.scheduler_adapter
     assert isinstance(adapter, _SchedulerAdapter)
     assert adapter.submitted_token_counts == [8192 - 128]
+
+
+def test_private_group_does_not_increase_replay_tail() -> None:
+    cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(prefill_replay_tokens=0)),
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(prefill_replay_tokens=128)),
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(prefill_replay_tokens=64)),
+        ]
+    )
+
+    replay_tokens = max(
+        getattr(spec, "prefill_replay_tokens", 0)
+        for spec in _iter_kv_cache_specs(cache_config, {1})
+    )
+
+    assert replay_tokens == 64
 
 
 def test_recurrent_mixed_local_and_external_prefix_recomputes_tail() -> None:

@@ -148,11 +148,16 @@ def _has_preemption_reqs(scheduler_output: SchedulerOutput) -> bool:
     return False
 
 
-def _iter_kv_cache_specs(kv_cache_config: "KVCacheConfig | None") -> Iterable[Any]:
+def _iter_kv_cache_specs(
+    kv_cache_config: "KVCacheConfig | None",
+    excluded_group_ids: set[int] | None = None,
+) -> Iterable[Any]:
     """Yield leaf KV cache specs without depending on a vLLM helper API."""
     if kv_cache_config is None:
         return
-    for group in kv_cache_config.kv_cache_groups:
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        if excluded_group_ids and group_id in excluded_group_ids:
+            continue
         group_spec = group.kv_cache_spec
         per_layer_specs = getattr(group_spec, "kv_cache_specs", None)
         if isinstance(per_layer_specs, dict):
@@ -521,7 +526,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             max(
                 (
                     getattr(spec, "prefill_replay_tokens", 0)
-                    for spec in _iter_kv_cache_specs(kv_cache_config)
+                    for spec in _iter_kv_cache_specs(
+                        kv_cache_config, self._excluded_group_ids
+                    )
                 ),
                 default=0,
             ),
