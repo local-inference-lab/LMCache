@@ -309,7 +309,9 @@ def create_engine_group_infos_from_vllm(
     )
 
     layer_index_groups = [
-        [layer_to_idx[name] for name in group.layer_names] for group in vllm_groups
+        [layer_to_idx[name] for name in group.layer_names]
+        for group in vllm_groups
+        if getattr(group.kv_cache_spec, "prefix_cacheable", True)
     ]
 
     # CacheBlend fused-aux (presence-gated): the pool joins detection as
@@ -335,6 +337,8 @@ def create_engine_group_infos_from_vllm(
     if vllm_groups:
         per_layer_group_idx = [EXCLUDED_ENGINE_GROUP] * num_layers
         for engine_group_id, group in enumerate(vllm_groups):
+            if not getattr(group.kv_cache_spec, "prefix_cacheable", True):
+                continue
             # The spec's block_size is the logical tokens covered by one of
             # this group's paged chunks (block IDs); the physical slot count
             # per chunk is discovered later from the registered tensors.
