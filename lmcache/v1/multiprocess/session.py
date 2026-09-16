@@ -40,6 +40,8 @@ class Session:
     last_prefix_hash: Any = None
     num_chunks_processed: int = 0
     created_at: float = field(default_factory=time.time)
+    last_access: float = field(default_factory=time.time)
+    ended_at: Optional[float] = None
     lookup_ipc_key: Optional[IPCCacheServerKey] = None
     lookup_chunk_hashes: tuple[bytes, ...] | None = None
     prefetch_hit_chunks: int = -1
@@ -326,6 +328,7 @@ class SessionManager:
     """Thread-safe manager for per-request sessions."""
 
     DEFAULT_SESSION_TTL = 600  # 10 minutes
+    ENDED_SESSION_GRACE_SECONDS = 45.0
     DEFAULT_CLEANUP_INTERVAL = 60.0
 
     def __init__(
@@ -359,12 +362,17 @@ class SessionManager:
                     request_id=request_id, hasher=self._hasher
                 )
                 logger.debug("Created session for request_id=%s", request_id)
-            return self._sessions[request_id]
+            session = self._sessions[request_id]
+            session.last_access = time.time()
+            return session
 
     def get(self, request_id: str) -> Optional[Session]:
         """Return an existing session without creating ownership state."""
         with self._lock:
-            return self._sessions.get(request_id)
+            session = self._sessions.get(request_id)
+            if session is not None:
+                session.last_access = time.time()
+            return session
 
     def remove(self, request_id: str) -> Optional[Session]:
         """Remove a session by request_id.
@@ -393,7 +401,11 @@ class SessionManager:
         expired = []
         with self._lock:
             for rid, session in self._sessions.items():
-                if now - session.created_at > self._ttl:
+                if session.ended_at is not None:
+                    if now - session.ended_at > self.ENDED_SESSION_GRACE_SECONDS:
+                        expired.append(rid)
+                    continue
+                if now - session.last_access > self._ttl:
                     expired.append(rid)
             for rid in expired:
                 del self._sessions[rid]

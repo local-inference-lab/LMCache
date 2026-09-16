@@ -81,9 +81,12 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         super().__init__()
         self._commit_workers = max(1, int(commit_workers))
         self._copy_stream: Any = torch_dev.Stream()
+        # new threads default to device 0
         self._commit_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=self._commit_workers,
             thread_name_prefix="lmcache_engine_driven_commit",
+            initializer=torch_dev.set_device,
+            initargs=(self._copy_stream.device,),
         )
         self._inflight_lock = threading.Lock()
         self._inflight_gather_events: set[Any] = set()

@@ -547,7 +547,10 @@ class LookupModule:
                 metadata={"request_id": request_id},
             )
         )
-        session = self._ctx.session_manager.remove(request_id)
+        # a worker retrieve may still be in flight; reaped after a grace period
+        session = self._ctx.session_manager.get(request_id)
+        if session is not None:
+            session.ended_at = time.time()
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_REQUEST_END,

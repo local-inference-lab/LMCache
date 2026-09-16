@@ -271,6 +271,30 @@ class TestSessionManager:
         removed = session_manager.cleanup_expired()
         assert removed == 0
 
+    def test_cleanup_expires_on_idle_not_age(
+        self, session_manager: SessionManager
+    ) -> None:
+        """A session older than TTL survives while it is still being used."""
+        session_manager.get_or_create("req-1")
+        time.sleep(0.15)  # past ttl=0.1s since creation
+        assert session_manager.get("req-1") is not None  # touch
+        assert session_manager.cleanup_expired() == 0
+        time.sleep(0.15)  # now idle past ttl
+        assert session_manager.cleanup_expired() == 1
+
+    def test_ended_session_lingers_for_grace_period(
+        self, session_manager: SessionManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An ended session stays resolvable briefly, then is reaped."""
+        monkeypatch.setattr(SessionManager, "ENDED_SESSION_GRACE_SECONDS", 0.1)
+        s = session_manager.get_or_create("req-1")
+        s.ended_at = time.time()  # what LookupModule.end_session does
+        assert session_manager.get("req-1") is not None
+        assert session_manager.cleanup_expired() == 0
+        time.sleep(0.15)
+        assert session_manager.cleanup_expired() == 1
+        assert session_manager.get("req-1") is None
+
     def test_periodic_cleanup_removes_expired_sessions(
         self, hasher: TokenHasher
     ) -> None:
