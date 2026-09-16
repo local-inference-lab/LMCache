@@ -138,8 +138,10 @@ class CheckpointSchedulerBridge:
             request: Waiting request whose prefix has not been admitted yet.
 
         Returns:
-            False while layout negotiation, lookup or H2D is pending. True after
-            a miss or a fully published import, which normal GPU lookup may use.
+            False while layout negotiation, lookup or H2D is pending. True when
+            ordinary GPU admission may proceed, including when an external
+            import cannot reserve capacity. An unadmitted request may poll
+            again to retry that reservation without another directory lookup.
             Reusing a finished request's ID waits for its admitted copies to
             drain, so their completion cannot cancel or erase another lookup.
         """
@@ -190,7 +192,9 @@ class CheckpointSchedulerBridge:
             state.done = True
             return True
         if checkpoint is None:
-            state.done = True
+            # Insufficient GPU capacity is not an external-cache miss. Permit
+            # ordinary admission, but retain the manifest so an unadmitted
+            # request can retry its import after other owners release pages.
             return True
         task = self._make_task(manifest, checkpoint, "RETRIEVE")
         self._tasks[task.task_id] = _PendingTask(task, checkpoint, request.request_id)

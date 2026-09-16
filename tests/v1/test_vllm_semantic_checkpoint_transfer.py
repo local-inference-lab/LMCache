@@ -316,6 +316,7 @@ def test_worker_metadata_requires_bound_rank() -> None:
         "cancelled",
         "rejected-store-reused-request-id",
         "inflight-store-reused-request-id",
+        "capacity-retry",
     ],
 )
 def test_semantic_roundtrip_collective_visibility_and_cancellation(
@@ -403,6 +404,24 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
                 assert manager.reset_prefix_cache() == (rank == 3)
             assert not bridge.has_pending
             consumer = make_request("consumer")
+            if outcome == "capacity-retry":
+                # Ordinary admission may also fail while another request owns
+                # the pool. An available manifest must remain retryable until
+                # this consumer is admitted or cancelled.
+                pressure = manager.block_pool.get_new_blocks(
+                    manager.block_pool.get_num_free_blocks()
+                )
+                try:
+                    deadline = time.monotonic() + 5
+                    while not bridge.poll_prefix(consumer):
+                        assert time.monotonic() < deadline
+                        time.sleep(0.001)
+                    assert bridge.take_tasks() == []
+                    # Persistent pressure still permits ordinary admission;
+                    # retaining the manifest must not introduce a wait loop.
+                    assert bridge.poll_prefix(consumer)
+                finally:
+                    manager.block_pool.free_blocks(pressure)
             inflight_store = None
             if outcome == "inflight-store-reused-request-id":
                 # This cancelled producer has different tokens but the same
