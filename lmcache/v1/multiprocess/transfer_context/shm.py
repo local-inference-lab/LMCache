@@ -100,25 +100,23 @@ class ShmSlotDescriptor:
         )
 
 
-class EngineDrivenContextShm(EngineDrivenContext):
-    """Shared-memory implementation of :class:`EngineDrivenContext`."""
+class ShmPoolMapping:
+    """Map and pin a server-owned byte pool independently of token geometry.
+
+    Args:
+        shm_name: Existing POSIX shared-memory object owned by the server.
+        pool_size: Negotiated byte capacity of that object.
+
+    Callers must drain all DMA and release borrowed views before closing.
+    Checkpoint leases authenticate each page's width, offset and pool identity;
+    no aligned token-chunk registration is involved.
+    """
 
     def __init__(
         self,
-        metadata: EngineDrivenContextMetadata,
-        mq_client: MessageQueueClient,
-        mq_timeout: float,
         shm_name: str,
         pool_size: int,
-        *,
-        use_retrieve_session_reference: bool = False,
     ) -> None:
-        super().__init__(
-            metadata,
-            mq_client,
-            mq_timeout,
-            use_retrieve_session_reference=use_retrieve_session_reference,
-        )
         if not shm_name or pool_size <= 0:
             raise ValueError("shm_name must be non-empty and pool_size must be > 0")
 
@@ -137,6 +135,8 @@ class EngineDrivenContextShm(EngineDrivenContext):
             # from this worker's resource tracker so that Python does not
             # unlink the segment when this worker exits.
             unregister(f"/{self._shm.name}", "shared_memory")
+            if self._shm.size != pool_size:
+                raise ValueError("Negotiated SHM capacity differs from the mapped pool")
             self._shm_buffer = self._shm.buf
             # pin memory is per process
             # the shm might be pinned on lmcache server side already
@@ -144,8 +144,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
             self._pin_shm_buffer()
             logger.info("SHM pinned=%s for shm_name=%s", self._pinned, self._shm_name)
         except Exception:
-            self._shm = None
-            self._shm_buffer = None
+            self.close()
             raise
 
     def checkpoint_slot_views(
@@ -238,6 +237,76 @@ class EngineDrivenContextShm(EngineDrivenContext):
             self._shm_buffer, dtype=dtype, count=count, offset=offset
         )
         return tensor_1d.view(torch.Size(shape))
+
+    def close(self) -> None:
+        """Unpin and detach this mapping without unlinking the server's pool."""
+        if self._shm is None:
+            return
+        self._unpin_shm_buffer()
+        try:
+            self._shm.close()
+        finally:
+            self._shm = None
+            self._shm_buffer = None
+
+    def _pin_shm_buffer(self) -> None:
+        """Register the host mapping for asynchronous worker-owned DMA."""
+        if self._shm_buffer is None or not torch_dev.is_available():
+            return
+        try:
+            ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._shm_buffer))
+        except Exception as exc:
+            logger.warning(
+                "Failed to get pointer for shm_name=%s: %r; "
+                "D2H copies will be synchronous",
+                self._shm_name,
+                exc,
+            )
+            return
+        if current_device_spec.pin_memory(ptr, self._pool_size):
+            self._pinned = True
+            self._pinned_ptr = ptr
+            self._pinned_size = self._pool_size
+        else:
+            logger.warning(
+                "pin_memory failed for shm_name=%s ptr=%#x size=%d; "
+                "D2H copies will be synchronous",
+                self._shm_name,
+                ptr,
+                self._pool_size,
+            )
+
+    def _unpin_shm_buffer(self) -> None:
+        """Unregister only memory pinned by this mapping."""
+        if not self._pinned or self._pinned_ptr == 0:
+            return
+        current_device_spec.unpin_memory(self._pinned_ptr)
+        self._pinned = False
+        self._pinned_ptr = 0
+        self._pinned_size = 0
+
+
+class EngineDrivenContextShm(ShmPoolMapping, EngineDrivenContext):
+    """Aligned KV-chunk transfers using a shared, worker-pinned byte pool."""
+
+    def __init__(
+        self,
+        metadata: EngineDrivenContextMetadata,
+        mq_client: MessageQueueClient,
+        mq_timeout: float,
+        shm_name: str,
+        pool_size: int,
+        *,
+        use_retrieve_session_reference: bool = False,
+    ) -> None:
+        EngineDrivenContext.__init__(
+            self,
+            metadata,
+            mq_client,
+            mq_timeout,
+            use_retrieve_session_reference=use_retrieve_session_reference,
+        )
+        ShmPoolMapping.__init__(self, shm_name, pool_size)
 
     def _build_slot_tensors(self, slots: list[dict[str, Any]]) -> list[torch.Tensor]:
         descriptors = [ShmSlotDescriptor.from_dict(slot) for slot in slots]
@@ -413,53 +482,3 @@ class EngineDrivenContextShm(EngineDrivenContext):
             return bool(future.result(timeout=self.mq_timeout))
         except TimeoutError:
             return False
-
-    def close(self) -> None:
-        if self._shm is None:
-            return
-        self._unpin_shm_buffer()
-        try:
-            self._shm.close()
-        finally:
-            self._shm = None
-            self._shm_buffer = None
-
-    def _pin_shm_buffer(self) -> None:
-        """Pin the SHM buffer as page-locked host memory via cudaHostRegister.
-
-        Enables faster async D2H CUDA copies to the SHM region. If pinning is
-        not available or fails, logs a warning and continues without pinning.
-        """
-        if self._shm_buffer is None or not torch_dev.is_available():
-            return
-        try:
-            ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._shm_buffer))
-        except Exception as exc:
-            logger.warning(
-                "Failed to get pointer for shm_name=%s: %r; "
-                "D2H copies will be synchronous",
-                self._shm_name,
-                exc,
-            )
-            return
-        if current_device_spec.pin_memory(ptr, self._pool_size):
-            self._pinned = True
-            self._pinned_ptr = ptr
-            self._pinned_size = self._pool_size
-        else:
-            logger.warning(
-                "pin_memory failed for shm_name=%s ptr=%#x size=%d; "
-                "D2H copies will be synchronous",
-                self._shm_name,
-                ptr,
-                self._pool_size,
-            )
-
-    def _unpin_shm_buffer(self) -> None:
-        """Unpin the SHM buffer if it was previously pinned via cudaHostRegister."""
-        if not self._pinned or self._pinned_ptr == 0:
-            return
-        current_device_spec.unpin_memory(self._pinned_ptr)
-        self._pinned = False
-        self._pinned_ptr = 0
-        self._pinned_size = 0

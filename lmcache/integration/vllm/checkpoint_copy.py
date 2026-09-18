@@ -20,9 +20,7 @@ from lmcache.v1.multiprocess.protocols.checkpoint import (
     CheckpointCapabilities,
     CheckpointLeaseResponse,
 )
-from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
-    EngineDrivenTransferContext,
-)
+from lmcache.v1.multiprocess.transfer_context.shm import ShmPoolMapping
 from lmcache.v1.platform import torch_dev
 
 
@@ -34,7 +32,7 @@ class CheckpointPageCopier:
         layout: Expected address-free target/draft cache and auxiliary layout.
         initialize_layout: Validates and binds the runner's hidden-state views
             before a checkpoint can be restored, including before first forward.
-        transfer: Existing engine-driven SHM transfer context; caller-owned.
+        transfer: Existing pinned SHM byte mapping; caller-owned.
         capabilities: Checkpoint server format and SHM mapping identity.
 
     A completed call guarantees that all submitted DMA drained. GPU block pins,
@@ -46,7 +44,7 @@ class CheckpointPageCopier:
         page_pool: torch.Tensor,
         layout: dict[str, Any],
         initialize_layout: Callable[[dict[str, Any]], None],
-        transfer: EngineDrivenTransferContext,
+        transfer: ShmPoolMapping,
         capabilities: CheckpointCapabilities,
     ) -> None:
         if (
