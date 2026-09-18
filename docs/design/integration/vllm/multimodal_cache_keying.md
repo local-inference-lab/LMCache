@@ -37,12 +37,13 @@ This is an engine-level restriction, including text-only requests to a VLM.
 - `mm_hash_to_token_values(identifier, length)` derives a deterministic
   sequence of `length` values, each in `[0, 2**31)`, from the full
   identifier (SHA-256 based, counter-mode expansion). Guarantees:
-  - **Full entropy**: every position gets an independent 31-bit value, so a
-    chunk overlapping `k` placeholder tokens carries `31*k` bits of item
-    identity (effectively bounded only by the 64-bit chunk-hash width for
-    `k >= 3`).
+  - **Content identity**: each position receives a 31-bit value derived from
+    the full identifier. Unlike repeating one truncated value, multiple
+    positions contribute to distinguishing images. Collision resistance is
+    bounded by the identifier entropy, SHA-256 derivation and selected chunk
+    hasher; this is not a mathematical guarantee of unique keys.
   - **Position dependence**: the value at offset `i` is a function of the
-    whole identifier *and* of `i`, so no two positions repeat. This is what
+    whole identifier *and* of `i`, without deliberately repeating a value. This is what
     makes the entropy accumulate: a span holding one repeated value carries
     that value's entropy however long the span is. It also separates two
     segments of the same item, which matters on the one path where the
@@ -63,14 +64,12 @@ This is an engine-level restriction, including text-only requests to a VLM.
 Values are capped at 31 bits so they stay positive in a signed int32, the
 narrowest integer representation token IDs may pass through downstream.
 
-## History
+## Compatibility
 
-The original implementation (`hex_hash_to_int16`) collapsed the identifier
-to 16 bits and filled the whole span with that single value. By the birthday
-bound, ~300 distinct same-shape images gave ~50% probability of two images
-sharing all their cache keys — a silent false hit serving the wrong image's
-KV (issue #3301). `mm_hash_to_token_values` replaces it; on upgrade,
-previously cached multimodal entries miss (safe) rather than collide.
+Cache entries produced by the 16-bit `hex_hash_to_int16` representation are
+not reusable with these content-aware keys. They miss and are recomputed.
+Text-only keys and the token-ID wire format are unchanged. All clients sharing
+an external cache must use the same representation for multimodal reuse.
 
 ## Alternative considered
 
@@ -85,7 +84,7 @@ channel for request-scoped metadata that must NOT be baked into tokens
 
 ## TODO: migrate to an explicit `extra_keys` channel
 
-Substitution is the right minimal change for image/video models, but it only
+Substitution applies to image/video models, but it only
 works when the identity has placeholder tokens to overwrite. The end-state
 design is vLLM's: `key = hash(tokens, extra_keys)`, with identity carried
 out-of-band through every token-carrying interface (lookup RPC, MP metadata,

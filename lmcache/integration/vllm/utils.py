@@ -241,12 +241,12 @@ def mm_hash_to_token_values(identifier: str, length: int) -> Tuple[int, ...]:
 
     The returned values replace the placeholder token IDs of one multimodal
     item before token-based chunk hashing, so that the chunk hashes carry the
-    item's full content identity. Every position gets a distinct value derived
+    item's content identity. Every position gets a value derived
     from ``(identifier, position)``, which means:
 
-    - Two different items produce entirely different sequences (collision
-      probability per overlapping token is 2^-31, and any chunk overlapping
-      k placeholder tokens carries 31*k bits of item identity).
+    - Multiple placeholder positions contribute to distinguishing images,
+      instead of repeating one truncated identifier. Collision resistance is
+      bounded by identifier entropy, SHA-256 and the selected chunk hasher.
     - The value at a given offset within the item is stable regardless of how
       the surrounding tokens are chunked, preserving prefix-hash stability.
     - Prefixes are consistent: ``mm_hash_to_token_values(x, m)`` is a prefix
