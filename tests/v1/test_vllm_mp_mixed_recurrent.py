@@ -11,6 +11,9 @@ import pytest
 pytest.importorskip("vllm", reason="MP connector imports vLLM at module load")
 
 # Third Party
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
+    KVConnectorRole,
+)
 from vllm.v1.utils import ConstantList  # noqa: E402
 
 # First Party
@@ -18,6 +21,7 @@ from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
     LMCacheMPConnector,
     LMCacheMPRequestState,
     _has_recurrent_cache,
+    _iter_kv_cache_specs,
     _recurrent_safe_lookup_end,
 )
 
@@ -33,6 +37,7 @@ class _Request:
         self.mm_features: list[object] = []
         self.status = object()
         self.kv_transfer_params = None
+        self.resumable = False
 
 
 class _SchedulerAdapter:
@@ -170,10 +175,46 @@ def _scheduler_connector(
     connector: Any = object.__new__(LMCacheMPConnector)
     connector.request_trackers = {}
     connector._has_recurrent_cache = has_recurrent_cache
+    connector._prefill_replay_tokens = 0
     connector._hit_alignment_tokens = 3072
     connector.scheduler_adapter = _SchedulerAdapter(lookup_tokens)
     connector.lazy_offload = False
     return connector
+
+
+@pytest.mark.parametrize("eager", [False, True])
+def test_lookup_leaves_model_required_private_replay_tail(eager: bool) -> None:
+    connector = _scheduler_connector(has_recurrent_cache=False, lookup_tokens=0)
+    connector._prefill_replay_tokens = 128
+    connector._role = KVConnectorRole.SCHEDULER
+    connector._eager_prefetch = True
+    request = _Request("private-replay", 8192)
+
+    if eager:
+        connector.on_new_request(request)
+    else:
+        assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+
+    adapter = connector.scheduler_adapter
+    assert isinstance(adapter, _SchedulerAdapter)
+    assert adapter.submitted_token_counts == [8192 - 128]
+
+
+def test_private_group_does_not_increase_replay_tail() -> None:
+    cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(prefill_replay_tokens=0)),
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(prefill_replay_tokens=128)),
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(prefill_replay_tokens=64)),
+        ]
+    )
+
+    replay_tokens = max(
+        getattr(spec, "prefill_replay_tokens", 0)
+        for spec in _iter_kv_cache_specs(cache_config, {1})
+    )
+
+    assert replay_tokens == 64
 
 
 def test_recurrent_mixed_local_and_external_prefix_recomputes_tail() -> None:
