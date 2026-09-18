@@ -3,8 +3,8 @@
 
 Status: research-only until GLM serving, restart and performance qualification.
 Ordinary aligned LMCache transfers remain in LMCacheMPConnector. This connector
-uses its transport registration but never reconstructs recurrent checkpoints
-from independently cached aligned chunks.
+maps the negotiated SHM byte pool directly: complete checkpoint pages do not
+depend on the server's token-chunk size or aligned KV registration.
 """
 
 # Standard
@@ -31,6 +31,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 import torch
+import zmq
 
 # First Party
 from lmcache.integration.vllm.checkpoint_copy import CheckpointPageCopier
@@ -38,7 +39,9 @@ from lmcache.integration.vllm.checkpoint_scheduler import (
     CheckpointEngineTask,
     CheckpointSchedulerBridge,
 )
-from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+from lmcache.integration.vllm.lmcache_mp_connector import (
+    build_parallel_strategy_from_vllm_config,
+)
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.checkpoint_transfer import (
     CheckpointTransferJob,
@@ -46,11 +49,10 @@ from lmcache.v1.multiprocess.checkpoint_transfer import (
     UnsafeCheckpointCopyError,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
+from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.multiprocess.protocols.checkpoint import CheckpointCapabilities
-from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
-    EngineDrivenTransferContext,
-)
+from lmcache.v1.multiprocess.transfer_context.shm import ShmPoolMapping
 from lmcache.v1.platform import torch_dev
 
 logger = init_logger(__name__)
@@ -143,32 +145,54 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError(
                 "Semantic LMCache requires a supported request-boundary adapter"
             )
-        self._transport = LMCacheMPConnector(vllm_config, role, kv_cache_config)
         self._scheduler: CheckpointSchedulerBridge | None = None
         self._worker: CheckpointTransferWorker | None = None
+        self._mapping: ShmPoolMapping | None = None
         self._worker_layout: dict[str, Any] | None = None
         self._layout_sent = False
         self._pending: dict[str, Future[bool]] = {}
         self._rejected: set[str] = set()
         self._role = role
         self._rank: int | None = None
-        if role == KVConnectorRole.SCHEDULER:
-            clients = self._transport.scheduler_adapter.mq_clients
-            if len(clients) != 1:
-                raise ValueError(
-                    "Semantic checkpoints require one shared LMCache server"
-                )
-            self._client = next(iter(clients.values()))
-        else:
-            self._client = self._transport.worker_adapter.mq_client
-        capability_reply: MessagingFuture[CheckpointCapabilities] = (
-            self._client.submit_request(RequestType.CHECKPOINT_CAPABILITIES, [])
+        config = vllm_config.kv_transfer_config
+        mode = config.get_from_extra_config(
+            "lmcache.mp.mp_transfer_mode", os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto")
         )
-        self._capabilities = capability_reply.result(timeout=30)
-        if self._capabilities.format_version != 1:
+        if mode != "engine_driven":
+            raise ValueError("Semantic checkpoints require engine-driven SHM transport")
+        urls = config.get_from_extra_config("lmcache.mp.server_urls", None)
+        if urls:
+            urls = urls if isinstance(urls, list) else str(urls).split(",")
+            urls = [str(url).strip() for url in urls if str(url).strip()]
+        else:
+            host = config.get_from_extra_config("lmcache.mp.host", "tcp://localhost")
+            port = config.get_from_extra_config("lmcache.mp.port", 5555)
+            urls = [f"{host}:{port}"]
+        if len(urls) != 1:
+            raise ValueError("Semantic checkpoints require one shared LMCache server")
+        url = urls[0] if "://" in urls[0] else f"tcp://{urls[0]}"
+        timeout = float(config.get_from_extra_config("lmcache.mp.mq_timeout", 60.0))
+        if not 0 < timeout < float("inf"):
             raise ValueError(
-                "LMCache server does not support atomic checkpoint storage"
+                "LMCache message-queue timeout must be finite and positive"
             )
+        self._client = MessageQueueClient(url, zmq.Context.instance())
+        try:
+            capability_reply: MessagingFuture[CheckpointCapabilities] = (
+                self._client.submit_request(RequestType.CHECKPOINT_CAPABILITIES, [])
+            )
+            self._capabilities = capability_reply.result(timeout=timeout)
+            if (
+                self._capabilities.format_version != 1
+                or not self._capabilities.shm_name
+                or self._capabilities.pool_size <= 0
+            ):
+                raise ValueError(
+                    "LMCache server does not support atomic checkpoint SHM storage"
+                )
+        except BaseException:
+            self._client.close()
+            raise
 
     def bind_boundary_checkpoint_cache(self, manager: KVCacheManager) -> None:
         """Bind the scheduler's allocator and immutable content namespace."""
@@ -195,24 +219,32 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Reuse the registered worker SHM mapping without a sidecar CUDA context."""
-        self._transport.register_kv_caches(kv_caches)
+        """The boundary-state hook binds raw pages, not per-layer aligned chunks."""
+        return
 
     def bind_boundary_checkpoint_state(self, state: BoundaryCheckpointState) -> None:
         """Validate the worker byte layout and bind raw-page DMA before serving."""
-        transfer = self._transport.worker_adapter.transfer_ctx
-        if not isinstance(transfer, EngineDrivenTransferContext):
-            raise ValueError("Semantic checkpoints require engine-driven SHM transport")
+        if self._role != KVConnectorRole.WORKER or self._mapping is not None:
+            raise RuntimeError("Checkpoint byte mapping must bind once on a worker")
         self._worker_layout = state.get_external_checkpoint_layout()
-        copier = CheckpointPageCopier(
-            state.get_external_checkpoint_page_pool(),
-            self._worker_layout,
-            state.initialize_external_checkpoint_layout,
-            transfer,
-            self._capabilities,
+        strategy = build_parallel_strategy_from_vllm_config(self._vllm_config, 1)
+        mapping = ShmPoolMapping(
+            self._capabilities.shm_name, self._capabilities.pool_size
         )
-        self._worker = CheckpointTransferWorker(self._client, copier)
-        self._rank = self._transport.worker_adapter.parallel_strategy.vllm_worker_id
+        try:
+            copier = CheckpointPageCopier(
+                state.get_external_checkpoint_page_pool(),
+                self._worker_layout,
+                state.initialize_external_checkpoint_layout,
+                mapping,
+                self._capabilities,
+            )
+            self._worker = CheckpointTransferWorker(self._client, copier)
+        except BaseException:
+            mapping.close()
+            raise
+        self._mapping = mapping
+        self._rank = strategy.vllm_worker_id
 
     def poll_boundary_checkpoint(self, request: Request) -> bool:
         """Defer request admission until a collective import finishes or misses."""
@@ -361,9 +393,12 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
         """Drain all background copies before unregistering or unmapping worker SHM."""
         if self._worker is not None:
             self._worker.close()
-        self._transport.shutdown()
+        if self._mapping is not None:
+            self._mapping.close()
+            self._mapping = None
+        self._client.close()
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
-        """Use the same transport tensor views as aligned engine-driven LMCache."""
-        return LMCacheMPConnector.get_required_kvcache_layout(vllm_config)
+        """Opaque byte-page copies preserve the engine's native tensor layout."""
+        return None

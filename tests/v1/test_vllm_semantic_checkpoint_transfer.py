@@ -3,17 +3,23 @@
 
 # Standard
 from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
+import json
 import time
 
 # Third Party
 import pytest
 import torch
+import zmq
 
 pytest.importorskip("vllm")
 
 # Third Party
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
+    KVConnectorRole,
+)
 from vllm.lora.request import LoRARequest  # noqa: E402
 from vllm.sampling_params import SamplingParams  # noqa: E402
 from vllm.utils.hashing import sha256  # noqa: E402
@@ -31,6 +37,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 from vllm.v1.request import Request  # noqa: E402
 
 # First Party
+from lmcache.integration.vllm.checkpoint_copy import CheckpointPageCopier  # noqa: E402
 from lmcache.integration.vllm.checkpoint_scheduler import (  # noqa: E402
     CheckpointEngineTask,
     CheckpointSchedulerBridge,
@@ -44,7 +51,13 @@ from lmcache.v1.multiprocess.checkpoint_transfer import (  # noqa: E402
     CheckpointTransferJob,
     CheckpointTransferWorker,
 )
+from lmcache.v1.multiprocess.protocols.base import RequestType  # noqa: E402
+from lmcache.v1.multiprocess.protocols.checkpoint import (  # noqa: E402
+    CheckpointCapabilities,
+)
+from lmcache.v1.multiprocess.transfer_context.shm import ShmPoolMapping  # noqa: E402
 from tests.v1.multiprocess.test_checkpoint_storage import (  # noqa: E402
+    make_manifest,
     open_checkpoint_rpc,
 )
 
@@ -91,6 +104,101 @@ def test_worker_acknowledgements_preserve_rank_identity() -> None:
     assert set(merged.layouts) == {0, 1}
     with pytest.raises(ValueError, match="Duplicate"):
         merged.aggregate(left)
+
+
+@pytest.mark.parametrize("role", list(KVConnectorRole))
+def test_checkpoint_connector_does_not_require_aligned_chunk_rpc(
+    role: KVConnectorRole,
+) -> None:
+    """Qwen's 3008-token pages need no divisibility with a 4096-token service.
+
+    The real RPC fixture implements only checkpoint operations. Any request
+    for chunk geometry or aligned KV registration therefore fails this test.
+    """
+    init_none_hash(sha256)
+    with open_checkpoint_rpc() as (client, _module, _mapping, _name):
+        extras = {
+            "lmcache.mp.checkpoint_identity": {
+                "target_revision": "a" * 40,
+                "source_revision": "b" * 40,
+            },
+            "lmcache.mp.mp_transfer_mode": "engine_driven",
+            "lmcache.mp.mq_timeout": 2,
+            "lmcache.mp.server_urls": [
+                client.socket.getsockopt_string(zmq.LAST_ENDPOINT)
+            ],
+        }
+        config = SimpleNamespace(
+            use_request_boundary_checkpoints=True,
+            speculative_config=None,
+            cache_config=SimpleNamespace(block_size=3008),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=6019),
+            kv_transfer_config=SimpleNamespace(
+                get_from_extra_config=lambda key, default: extras.get(key, default)
+            ),
+        )
+        connector = LMCacheRecurrentCheckpointConnector(config, role, None)
+        try:
+            connector.register_kv_caches({"attention": torch.empty(2, 3008, 1)})
+            assert connector.get_num_new_matched_tokens(
+                make_request("no-chunks"), 0
+            ) == (
+                0,
+                False,
+            )
+        finally:
+            connector.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA DMA")
+def test_checkpoint_raw_pages_roundtrip_without_token_chunk_registration() -> None:
+    """Target, recurrent, draft and auxiliary bytes survive D2H and H2D exactly."""
+    with open_checkpoint_rpc() as (client, module, _memory, _name):
+        capability: CheckpointCapabilities = client.submit_request(
+            RequestType.CHECKPOINT_CAPABILITIES, []
+        ).result(timeout=5)
+        mapping = ShmPoolMapping(capability.shm_name, capability.pool_size)
+        pool = (
+            torch.arange(16 * 128, device="cuda", dtype=torch.int32)
+            .to(torch.uint8)
+            .reshape(16, 128)
+        )
+        # Distinguish equal-width pages as well as bytes within a page.
+        pool.add_(torch.arange(16, device="cuda", dtype=torch.uint8)[:, None])
+        expected = pool.clone()
+        layout = {"schema_version": 1, "page_bytes": 128}
+        validated: list[dict[str, Any]] = []
+        copier = CheckpointPageCopier(
+            pool, layout, validated.append, mapping, capability
+        )
+        entry = make_manifest()
+        payload = json.loads(entry.payload)
+        for group in payload["page_groups"]:
+            group["page_bytes"] = 128
+        payload["worker_layout"] = layout
+        entry = replace(entry, world_size=1, payload=json.dumps(payload).encode())
+        ids = ((1, 2, 3), (4,), (5, 6), (7,))
+        event = torch.cuda.Event()
+        event.record()
+        worker = CheckpointTransferWorker(client, copier)
+        try:
+            assert validated == [layout]
+            assert module.begin(entry)
+            stored = worker.submit(CheckpointTransferJob(entry, 0, "STORE", ids, event))
+            assert stored is not None and stored.result(timeout=5)
+            pool[1:8].zero_()
+            event = torch.cuda.Event()
+            event.record()
+            restored = worker.submit(
+                CheckpointTransferJob(entry, 0, "RETRIEVE", ids, event)
+            )
+            assert restored is not None and restored.result(timeout=5)
+            assert torch.equal(pool, expected)
+            status = module.report_status()["recurrent_checkpoints"]
+            assert status["store_leases"] == status["retrieve_leases"] == 0
+        finally:
+            worker.close()
+            mapping.close()
 
 
 def test_lora_requests_do_not_read_or_publish_the_base_weight_namespace() -> None:

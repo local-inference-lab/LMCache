@@ -38,7 +38,10 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     create_engine_driven_context,
 )
 from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
-from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
+from lmcache.v1.multiprocess.transfer_context.shm import (
+    EngineDrivenContextShm,
+    ShmPoolMapping,
+)
 import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
@@ -3051,21 +3054,28 @@ def _create_shm_segment(shm_name: str, size: int) -> int:
     return shm_create_readwrite(shm_name, size)
 
 
-def test_checkpoint_shm_views_validate_identity_bounds_and_nonoverlap() -> None:
+@pytest.mark.parametrize("checkpoint_only", [False, True])
+def test_checkpoint_shm_views_validate_identity_bounds_and_nonoverlap(
+    checkpoint_only: bool,
+) -> None:
     """Reject incompatible leases before creating any DMA-visible byte view."""
     name = f"lmcache_checkpoint_views_{os.getpid()}"
     addr = _create_shm_segment(name, 4096)
     try:
-        context = EngineDrivenContextShm(
-            metadata=EngineDrivenContextMetadata(
-                layout_desc=MemoryLayoutDesc([torch.Size([128])], [torch.uint8]),
-                block_size=1,
-                use_mla=False,
-            ),
-            mq_client=MagicMock(),
-            mq_timeout=1,
-            shm_name=name,
-            pool_size=4096,
+        context = (
+            ShmPoolMapping(name, 4096)
+            if checkpoint_only
+            else EngineDrivenContextShm(
+                metadata=EngineDrivenContextMetadata(
+                    layout_desc=MemoryLayoutDesc([torch.Size([128])], [torch.uint8]),
+                    block_size=1,
+                    use_mla=False,
+                ),
+                mq_client=MagicMock(),
+                mq_timeout=1,
+                shm_name=name,
+                pool_size=4096,
+            )
         )
         try:
             capability = CheckpointCapabilities(1, name, 4096, False)
@@ -3097,6 +3107,22 @@ def test_checkpoint_shm_views_validate_identity_bounds_and_nonoverlap() -> None:
                     context.checkpoint_slot_views(capability, invalid, sizes)
         finally:
             context.close()
+    finally:
+        shm_munmap(addr, 4096)
+        shm_unlink(name)
+
+
+def test_checkpoint_mapping_rejects_false_pool_capacity() -> None:
+    """Never pin bytes beyond the server-owned shared-memory allocation."""
+    name = f"lmcache_checkpoint_capacity_{os.getpid()}"
+    addr = _create_shm_segment(name, 4096)
+    try:
+        with pytest.raises(ValueError, match="capacity"):
+            ShmPoolMapping(name, 8192)
+        # A failed attachment must not unlink the server's allocation.
+        context = ShmPoolMapping(name, 4096)
+        context.close()
+        context.close()
     finally:
         shm_munmap(addr, 4096)
         shm_unlink(name)
