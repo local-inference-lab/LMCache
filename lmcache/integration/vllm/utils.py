@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import TYPE_CHECKING, Optional, Tuple
+import functools
 import hashlib
 import os
-import string
 import threading
 
 if TYPE_CHECKING:
@@ -36,6 +36,44 @@ _config_lock = threading.Lock()
 def is_false(value: str) -> bool:
     """Check if the given string value is equivalent to 'false'."""
     return value.lower() in ("false", "0", "no", "n", "off")
+
+
+def validate_vllm_multimodal_cache_config(vllm_config: "VllmConfig") -> None:
+    """Require reusable multimodal identifiers before initializing a connector.
+
+    When both vLLM's prefix cache and multimodal processor cache are disabled,
+    vLLM replaces content hashes (even user-provided UUIDs) with request-local
+    identifiers. These can repeat across frontend restarts or replicas, so
+    hashing them cannot safely identify KV stored in LMCache.
+
+    Args:
+        vllm_config: The active vLLM configuration.
+
+    Returns:
+        None when the configuration is safe for multimodal cache keying.
+
+    Raises:
+        ValueError: If a multimodal model disables both vLLM caches.
+
+    Notes:
+        Text-only models and older model configs without multimodal settings
+        are unaffected. Validation runs before any connector services start.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    mm_config = getattr(model_config, "multimodal_config", None)
+    if (
+        mm_config is not None
+        and getattr(mm_config, "mm_processor_cache_gb", None) == 0
+        and not vllm_config.cache_config.enable_prefix_caching
+    ):
+        raise ValueError(
+            "LMCache requires stable multimodal identifiers. Disabling both "
+            "vLLM prefix caching and the multimodal processor cache produces "
+            "request-local IDs that can repeat across restarts or replicas, "
+            "causing different media to reuse the same KV cache. Set "
+            "--mm-processor-cache-gb to a positive value, or enable "
+            "--enable-prefix-caching if the model supports it."
+        )
 
 
 def vllm_layout_hints(vllm_config: "VllmConfig | None" = None) -> "LayoutHints":
@@ -186,32 +224,59 @@ def create_lmcache_ec_config() -> LMCacheEngineConfig:
     return load_ec_engine_config(base_config=lmcache_get_or_create_config())
 
 
-def hex_hash_to_int16(s: str) -> int:
-    """
-    Convert a hash identifier into a 16-bit integer.
+# Number of bits kept per substituted placeholder token. 31 bits keeps the
+# values positive in a signed int32, the narrowest integer type token IDs may
+# pass through on any downstream serialization path.
+_MM_TOKEN_VALUE_BITS = 31
+_MM_TOKEN_VALUE_MASK = (1 << _MM_TOKEN_VALUE_BITS) - 1
+# SHA-256 digests are 32 bytes; each substituted value consumes 4 bytes.
+_MM_VALUES_PER_DIGEST = 8
 
-    Historically, LMCache expected multimodal identifiers to be hex strings.
-    In practice (e.g., OpenAI-style multimodal requests), identifiers may be
-    arbitrary strings like `chatcmpl-...-image-0`. This function therefore:
-      - Parses hex strings (optionally prefixed with `0x`) as before, or
-      - Falls back to a stable string hash (SHA-256) when the input is not hex.
+
+@functools.lru_cache(maxsize=256)
+def mm_hash_to_token_values(identifier: str, length: int) -> Tuple[int, ...]:
     """
+    Derive a deterministic sequence of pseudo-token values from a full
+    multimodal identifier.
+
+    The returned values replace the placeholder token IDs of one multimodal
+    item before token-based chunk hashing, so that the chunk hashes carry the
+    item's content identity. Every position gets a value derived
+    from ``(identifier, position)``, which means:
+
+    - Multiple placeholder positions contribute to distinguishing images,
+      instead of repeating one truncated identifier. Collision resistance is
+      bounded by identifier entropy, SHA-256 and the selected chunk hasher.
+    - The value at a given offset within the item is stable regardless of how
+      the surrounding tokens are chunked, preserving prefix-hash stability.
+    - Prefixes are consistent: ``mm_hash_to_token_values(x, m)`` is a prefix
+      of ``mm_hash_to_token_values(x, n)`` for ``m <= n``.
+
+    Args:
+        identifier: The multimodal identifier (vLLM ``mm_hash``). Treated as
+            an opaque string; both content hashes and request-scoped
+            identifiers (e.g. ``chatcmpl-...-image-0``) are accepted.
+        length: The number of values to derive (the placeholder span length).
+            Must be non-negative.
+
+    Returns:
+        A tuple of ``length`` integers, each in ``[0, 2**31)``.
+
+    Raises:
+        ValueError: If ``length`` is negative.
+    """
+    if length < 0:
+        raise ValueError(f"length must be non-negative, got {length}")
     # Be defensive: vLLM may pass non-string identifiers.
-    s = "" if s is None else str(s)
-    s_stripped = s.strip()
-
-    # Fast-path: pure hex (optionally 0x-prefixed).
-    hex_part = s_stripped[2:] if s_stripped.lower().startswith("0x") else s_stripped
-    if hex_part and all(c in string.hexdigits for c in hex_part):
-        try:
-            return int(hex_part, 16) & 0xFFFF
-        except ValueError:
-            # Extremely unlikely (e.g., oversized/odd formatting); fall back to hashing.
-            pass
-
-    # Fallback: stable 16-bit value derived from the full identifier string.
-    digest = hashlib.sha256(s_stripped.encode("utf-8")).digest()
-    return int.from_bytes(digest[:2], byteorder="big", signed=False)
+    seed = hashlib.sha256(str(identifier).encode("utf-8")).digest()
+    values: list[int] = []
+    for counter in range((length + _MM_VALUES_PER_DIGEST - 1) // _MM_VALUES_PER_DIGEST):
+        block = hashlib.sha256(seed + counter.to_bytes(8, byteorder="big")).digest()
+        for i in range(0, len(block), 4):
+            values.append(
+                int.from_bytes(block[i : i + 4], byteorder="big") & _MM_TOKEN_VALUE_MASK
+            )
+    return tuple(values[:length])
 
 
 def apply_mm_hashes_to_token_ids(
@@ -220,8 +285,29 @@ def apply_mm_hashes_to_token_ids(
     mm_positions: list["PlaceholderRange"],
 ) -> torch.Tensor:
     """
-    Overwrite token_ids in-place for multimodal placeholders using
-    efficient slice assignments.
+    Overwrite multimodal placeholder spans of ``token_ids`` in-place with
+    values derived from the corresponding full multimodal identifiers.
+
+    vLLM emits identical placeholder token IDs for every multimodal item, so
+    without this substitution two different images would produce identical
+    chunk hashes (and thus silently share KV cache entries). Each placeholder
+    span is filled with the per-position sequence from
+    :func:`mm_hash_to_token_values`, which carries the full identifier
+    entropy into every chunk that overlaps the span.
+
+    Args:
+        token_ids: 1-D tensor of token IDs to modify in-place. Must be the
+            full prompt or a prefix of it, because ``mm_positions`` offsets
+            are absolute: a suffix or a mid-slice would overwrite unrelated
+            positions and leave the placeholder spans untouched, silently
+            restoring the cross-image collision this substitution exists to
+            prevent. A prefix is fine; spans are truncated to its length.
+        mm_hashes: Multimodal identifiers, parallel to ``mm_positions``.
+        mm_positions: Placeholder ranges (``offset``/``length``) within the
+            full prompt, parallel to ``mm_hashes``.
+
+    Returns:
+        The same ``token_ids`` tensor, modified in-place.
     """
     n = token_ids.size(0)
     for hash_str, placeholder in zip(mm_hashes, mm_positions, strict=False):
@@ -229,7 +315,8 @@ def apply_mm_hashes_to_token_ids(
         if start >= n:
             continue
         end = min(start + length, n)
-        token_ids[start:end] = hex_hash_to_int16(hash_str)
+        values = mm_hash_to_token_values(hash_str, end - start)
+        token_ids[start:end] = torch.tensor(values, dtype=token_ids.dtype)
     return token_ids
 
 

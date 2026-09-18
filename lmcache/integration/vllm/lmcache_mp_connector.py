@@ -56,6 +56,7 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (
 )
 from lmcache.integration.vllm.utils import (
     mla_only,
+    validate_vllm_multimodal_cache_config,
     vllm_layout_hints,
 )
 from lmcache.utils import init_logger as lmcache_init_logger
@@ -499,6 +500,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         role: KVConnectorRole,
         kv_cache_config: "KVCacheConfig | None" = None,
     ):
+        validate_vllm_multimodal_cache_config(vllm_config)
+
         # Older supported vLLM releases allow connectors to omit this value,
         # while current vLLM's type declaration requires it.
         super().__init__(vllm_config, role, kv_cache_config)  # type: ignore[arg-type]
@@ -1181,7 +1184,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return
 
         tracker = self._get_or_create_request_tracker(request)
-        lookup_token_ids = list(request.all_token_ids)
+        lookup_token_ids = tracker.get_token_ids()
         if self._has_recurrent_cache:
             lookup_token_ids = lookup_token_ids[
                 : _recurrent_safe_lookup_end(
