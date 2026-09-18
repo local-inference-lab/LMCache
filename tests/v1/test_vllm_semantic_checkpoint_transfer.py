@@ -5,7 +5,7 @@
 from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 import json
 import time
 
@@ -17,10 +17,10 @@ import zmq
 pytest.importorskip("vllm")
 
 # Third Party
-from vllm.lora.request import LoRARequest  # noqa: E402
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
     KVConnectorRole,
 )
+from vllm.lora.request import LoRARequest  # noqa: E402
 from vllm.sampling_params import SamplingParams  # noqa: E402
 from vllm.utils.hashing import sha256  # noqa: E402
 from vllm.v1.core.kv_cache_manager import KVCacheManager  # noqa: E402
@@ -37,11 +37,11 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 from vllm.v1.request import Request  # noqa: E402
 
 # First Party
+from lmcache.integration.vllm.checkpoint_copy import CheckpointPageCopier  # noqa: E402
 from lmcache.integration.vllm.checkpoint_scheduler import (  # noqa: E402
     CheckpointEngineTask,
     CheckpointSchedulerBridge,
 )
-from lmcache.integration.vllm.checkpoint_copy import CheckpointPageCopier  # noqa: E402
 from lmcache.integration.vllm.recurrent_checkpoint_connector import (  # noqa: E402
     LMCacheRecurrentCheckpointConnector,
     RecurrentCheckpointMetadata,
@@ -52,6 +52,9 @@ from lmcache.v1.multiprocess.checkpoint_transfer import (  # noqa: E402
     CheckpointTransferWorker,
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType  # noqa: E402
+from lmcache.v1.multiprocess.protocols.checkpoint import (  # noqa: E402
+    CheckpointCapabilities,
+)
 from lmcache.v1.multiprocess.transfer_context.shm import ShmPoolMapping  # noqa: E402
 from tests.v1.multiprocess.test_checkpoint_storage import (  # noqa: E402
     make_manifest,
@@ -151,7 +154,7 @@ def test_checkpoint_connector_does_not_require_aligned_chunk_rpc(
 def test_checkpoint_raw_pages_roundtrip_without_token_chunk_registration() -> None:
     """Target, recurrent, draft and auxiliary bytes survive D2H and H2D exactly."""
     with open_checkpoint_rpc() as (client, module, _memory, _name):
-        capability = client.submit_request(
+        capability: CheckpointCapabilities = client.submit_request(
             RequestType.CHECKPOINT_CAPABILITIES, []
         ).result(timeout=5)
         mapping = ShmPoolMapping(capability.shm_name, capability.pool_size)
@@ -164,7 +167,7 @@ def test_checkpoint_raw_pages_roundtrip_without_token_chunk_registration() -> No
         pool.add_(torch.arange(16, device="cuda", dtype=torch.uint8)[:, None])
         expected = pool.clone()
         layout = {"schema_version": 1, "page_bytes": 128}
-        validated = []
+        validated: list[dict[str, Any]] = []
         copier = CheckpointPageCopier(
             pool, layout, validated.append, mapping, capability
         )
