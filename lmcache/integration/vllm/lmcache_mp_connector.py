@@ -1561,7 +1561,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
         if block_state is None:
             return False
-        block_ids = block_state.block_ids.get(request_id)
+        # vLLM can resolve only the requested table instead of materializing
+        # every scheduled request. Retain the mapping API for runtimes that
+        # publish eager snapshots; resolver errors must propagate unchanged.
+        resolve = getattr(block_state, "get_block_ids", None)
+        block_ids = (
+            resolve(request_id)
+            if resolve is not None
+            else block_state.block_ids.get(request_id)
+        )
         if block_ids is None:
             return False
         tracker.allocated_block_ids = {
