@@ -329,7 +329,8 @@ def test_connector_ingests_only_exact_handoffs_for_recurrent_groups(
     ]
 
 
-def test_store_uses_authoritative_scheduler_block_table() -> None:
+@pytest.mark.parametrize("state_api", ["mapping", "resolver"])
+def test_store_uses_authoritative_scheduler_block_table(state_api: str) -> None:
     """A store must not use an append-only block mirror after table mutation."""
     tracker = _store_tracker(num_chunks=1)
     tracker.state = LMCacheMPRequestState.READY
@@ -368,7 +369,29 @@ def test_store_uses_authoritative_scheduler_block_table() -> None:
         preempted_req_ids=[],
     )
 
+    resolved: list[str] = []
+    if state_api == "resolver":
+        # Third Party
+        from vllm.v1.core.sched.output import KVConnectorBlockState
+
+        if not hasattr(KVConnectorBlockState, "get_block_ids"):
+            pytest.skip("Installed vLLM exposes the mapping-only block-state API")
+
+        def resolve(request_id: str) -> tuple[list[int], ...]:
+            resolved.append(request_id)
+            assert request_id == "store"
+            return authoritative
+
+        scheduler_output.kv_connector_block_state = KVConnectorBlockState(
+            req_ids={"store"},
+            resolve_block_ids=resolve,
+            boundary_state_offloads=(
+                scheduler_output.kv_connector_block_state.boundary_state_offloads
+            ),
+        )
+
     metadata = connector.build_connector_meta(cast(SchedulerOutput, scheduler_output))
+    assert resolved == (["store"] if state_api == "resolver" else [])
 
     assert metadata.requests[0].op.block_ids[ATTENTION_GROUP_ID] == list(
         authoritative[ATTENTION_GROUP_ID]
