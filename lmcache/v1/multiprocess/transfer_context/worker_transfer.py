@@ -1026,7 +1026,15 @@ class EngineDrivenTransferContext(TransferContext):
         layer_names = tuple(kv_caches)
         if not layer_names:
             raise ValueError("kv_caches is empty")
-        grouped = len(engine_group_infos) > 1
+        # A single transferable group may still omit request-private layers or
+        # retain a nonzero engine group ID. Only the complete group-0 mapping
+        # can use the legacy wire format without losing that selection.
+        grouped = bool(engine_group_infos) and (
+            len(engine_group_infos) > 1
+            or engine_group_infos[0].engine_group_id != 0
+            or tuple(engine_group_infos[0].layer_indices)
+            != tuple(range(len(layer_names)))
+        )
         if grouped and any(info.extra_object_group_tag for info in engine_group_infos):
             raise ValueError(
                 "engine-driven hybrid transfer does not support connector-private "
