@@ -833,6 +833,69 @@ def test_engine_driven_shm_registration_requires_abort_capability(
         )
 
 
+@pytest.mark.parametrize("engine_group_id", [0, 2])
+def test_engine_driven_single_selected_group_excludes_private_layers(
+    monkeypatch: pytest.MonkeyPatch, engine_group_id: int
+) -> None:
+    """An explicit one-group selection must not register excluded layers."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    inspected_layers: list[tuple[str, ...]] = []
+
+    def layout(caches: dict[str, torch.Tensor], **_kwargs: Any) -> tuple:
+        inspected_layers.append(tuple(caches))
+        return (
+            4,
+            len(caches),
+            16,
+            "float32",
+            lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            2,
+        )
+
+    monkeypatch.setattr(worker_transfer, "compute_kv_layout", layout)
+    monkeypatch.setattr(worker_transfer, "create_engine_driven_context", MagicMock())
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse(
+        accepts_group_layouts=True
+    )
+    send = MagicMock(return_value=future)
+    context = EngineDrivenTransferContext()
+    try:
+        context.register(
+            instance_id=1,
+            kv_caches=_make_kv_caches(num_layers=2),
+            model_name="selected-prefix-state",
+            world_size=1,
+            blocks_in_chunk=2,
+            mq_client=MagicMock(),
+            mq_timeout=1.0,
+            send_request=send,
+            engine_group_infos=(
+                EngineGroupInfo(
+                    engine_group_id=engine_group_id,
+                    layer_indices=(1,),
+                    tokens_per_block=4,
+                ),
+            ),
+        )
+        payload = send.call_args.args[2][0]
+        assert inspected_layers and all(
+            names == ("layer_1",) for names in inspected_layers
+        )
+        assert [group.engine_group_idx for group in payload.group_layouts] == [
+            engine_group_id
+        ]
+        assert [group.layer_indices for group in payload.group_layouts] == [(1,)]
+    finally:
+        context.close()
+
+
 def test_engine_driven_hybrid_registration_preserves_group_order_and_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
