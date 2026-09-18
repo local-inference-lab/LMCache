@@ -66,7 +66,8 @@ def test_eager_lookup_uses_adjusted_identity_before_boundary_truncation(
         maybe_submit_lookup_request=MagicMock(),
     )
     # Isolate the public lifecycle hook from service/device initialization.
-    connector = SimpleNamespace(
+    connector = MagicMock(
+        spec=LMCacheMPConnector,
         role=KVConnectorRole.SCHEDULER,
         _eager_prefetch=True,
         _has_recurrent_cache=recurrent,
