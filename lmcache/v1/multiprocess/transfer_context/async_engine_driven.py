@@ -48,6 +48,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
 
     Store is three-phase, all executed entirely in a background thread:
 
+    The executor binds each thread to the copy stream's device before running
+    any phase, preserving the worker's accelerator affinity throughout the task.
+
     1. prepare: call prepare_store() to negotiate buffers with the server
        (the costliest step in pickle mode due to the synchronous RPC round-trip).
     2. gather: wait for the forward event on the copy stream, then enqueue
@@ -84,6 +87,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         self._commit_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=self._commit_workers,
             thread_name_prefix="lmcache_engine_driven_commit",
+            initializer=torch_dev.set_device,
+            initargs=(self._copy_stream.device,),
         )
         self._inflight_lock = threading.Lock()
         self._inflight_gather_events: set[Any] = set()

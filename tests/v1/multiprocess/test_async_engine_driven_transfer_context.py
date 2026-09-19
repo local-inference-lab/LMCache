@@ -107,11 +107,19 @@ class _FakeEvent:
 
 class _FakeTorchDev:
     def __init__(self, gather_gate: threading.Event):
-        self._stream = object()
+        self.stream_device = "cuda:3"
+        self._stream = SimpleNamespace(device=self.stream_device)
         self._gather_gate = gather_gate
+        self._thread_state = threading.local()
 
     def Stream(self) -> object:
-        return object()
+        return self._stream
+
+    def set_device(self, device: object) -> None:
+        self._thread_state.device = device
+
+    def current_device(self) -> object | None:
+        return getattr(self._thread_state, "device", None)
 
     def stream(self, stream: object) -> object:
         return nullcontext(stream)
@@ -370,6 +378,77 @@ def test_supports_async_primitives_false_without_stream(
     # A torch_dev without Stream/Event is not async-capable.
     monkeypatch.setattr(worker_transfer, "torch_dev", object())
     assert worker_transfer._supports_async_primitives() is False
+
+
+def test_supports_async_primitives_false_without_device_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async stores require a way to bind their executor threads."""
+
+    class _NoDeviceBinding:
+        Stream = MagicMock()
+        Event = MagicMock()
+
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+    monkeypatch.setattr(worker_transfer, "torch_dev", _NoDeviceBinding())
+    assert worker_transfer._supports_async_primitives() is False
+
+
+@pytest.mark.parametrize("multigroup", [False, True])
+def test_store_executor_is_bound_to_copy_stream_device(
+    monkeypatch: pytest.MonkeyPatch,
+    multigroup: bool,
+) -> None:
+    """Every async store phase runs on the worker copy stream's device."""
+    gather_gate = threading.Event()
+    gather_gate.set()
+    fake_torch_dev = _FakeTorchDev(gather_gate)
+    phase_devices: list[object | None] = []
+
+    def _record_device() -> None:
+        phase_devices.append(fake_torch_dev.current_device())
+
+    monkeypatch.setattr(async_engine_driven, "torch_dev", fake_torch_dev)
+    _install_fake_gather(monkeypatch)
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+
+    if multigroup:
+        ctx._engine_driven_context = _FakeGroupedStoreContext(  # type: ignore[assignment]
+            commit_impl=lambda _chunks: _record_device() or True,
+            prepare_result=(
+                [[torch.zeros(1)], [torch.zeros(1)]],
+                [[0], [0]],
+            ),
+            prepare_impl=_record_device,
+        )
+        _install_two_group_state(ctx)
+        kv_caches = {"layer_0": torch.zeros(1), "layer_1": torch.zeros(1)}
+        block_ids = [[10], [20, 21]]
+    else:
+        ctx._engine_driven_context = _FakeStoreContext(  # type: ignore[assignment]
+            commit_impl=lambda _chunks: _record_device() or True,
+            prepare_result=([torch.zeros(1)], [0]),
+            prepare_impl=_record_device,
+        )
+        kv_caches = {"layer_0": torch.zeros(1)}
+        block_ids = [[10]]
+
+    future = ctx.submit_store(
+        "device-affinity",
+        object(),
+        1,
+        kv_caches,
+        block_ids,
+        _FakeEvent(gather_gate),
+        1,
+    )
+
+    assert future.result(timeout=1) is True
+    assert phase_devices == [fake_torch_dev.stream_device] * 2
+    ctx.close()
 
 
 def test_flush_inflight_stores_waits_for_pending_gather(
