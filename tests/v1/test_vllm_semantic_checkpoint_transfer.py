@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 import json
 import time
 
@@ -37,6 +38,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 from vllm.v1.request import Request  # noqa: E402
 
 # First Party
+from lmcache.integration.vllm import checkpoint_scheduler  # noqa: E402
 from lmcache.integration.vllm.checkpoint_copy import CheckpointPageCopier  # noqa: E402
 from lmcache.integration.vllm.checkpoint_scheduler import (  # noqa: E402
     CheckpointEngineTask,
@@ -727,16 +729,22 @@ def test_failed_restore_falls_back_to_the_longest_remaining_checkpoint() -> None
             consumer = make_request("consumer")
             attempts: list[tuple[int, bool]] = []
             deadline = time.monotonic() + 10
-            while not bridge.poll_prefix(consumer):
-                assert time.monotonic() < deadline
-                for task in bridge.take_tasks():
-                    results = run(task)
-                    attempts.append(
-                        (task.manifest.prefix.num_tokens, all(results.values()))
-                    )
-                time.sleep(0.001)
+            with patch.object(checkpoint_scheduler.logger, "info") as info:
+                while not bridge.poll_prefix(consumer):
+                    assert time.monotonic() < deadline
+                    for task in bridge.take_tasks():
+                        results = run(task)
+                        attempts.append(
+                            (task.manifest.prefix.num_tokens, all(results.values()))
+                        )
+                    time.sleep(0.001)
 
             assert attempts == [(11, False), (8, True)]
+            failure = next(
+                call.args for call in info.call_args_list if "failed" in call.args[0]
+            )
+            assert failure[1:4] == (11, consumer.request_id, [0, 1, 2, 3])
+            assert 0 <= failure[4] < 10
             assert manager.get_computed_blocks(consumer)[1] == 8
             assert bridge.external_tokens(consumer) == 8
             assert not bridge.has_pending
