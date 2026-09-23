@@ -17,10 +17,10 @@ import zmq
 pytest.importorskip("vllm")
 
 # Third Party
-from vllm.lora.request import LoRARequest  # noqa: E402
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
     KVConnectorRole,
 )
+from vllm.lora.request import LoRARequest  # noqa: E402
 from vllm.sampling_params import SamplingParams  # noqa: E402
 from vllm.utils.hashing import sha256  # noqa: E402
 from vllm.v1.core.kv_cache_manager import KVCacheManager  # noqa: E402
@@ -37,11 +37,11 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 from vllm.v1.request import Request  # noqa: E402
 
 # First Party
+from lmcache.integration.vllm.checkpoint_copy import CheckpointPageCopier  # noqa: E402
 from lmcache.integration.vllm.checkpoint_scheduler import (  # noqa: E402
     CheckpointEngineTask,
     CheckpointSchedulerBridge,
 )
-from lmcache.integration.vllm.checkpoint_copy import CheckpointPageCopier  # noqa: E402
 from lmcache.integration.vllm.recurrent_checkpoint_connector import (  # noqa: E402
     LMCacheRecurrentCheckpointConnector,
     RecurrentCheckpointMetadata,
