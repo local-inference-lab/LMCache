@@ -1123,7 +1123,9 @@ def test_reuse_admission_persists_only_restored_checkpoints(
         publish_all(service, index, mapping, restored)
         publish_all(service, index, mapping, unused)
         for rank in range(restored.world_size):
-            lease = poll(service, service.begin_retrieve(restored, rank))
+            lease_id = service.begin_retrieve(restored, rank)
+            assert lease_id is not None
+            lease = poll(service, lease_id)
             assert isinstance(lease, CheckpointSlots)
             service.finish_retrieve(lease.lease_id)
         drain_l2_stores(storage)
@@ -1137,7 +1139,9 @@ def test_reuse_admission_persists_only_restored_checkpoints(
     ):
         assert index.find((restored.prefix,)) == restored
         for rank in range(restored.world_size):
-            lease = poll(service, service.begin_retrieve(restored, rank))
+            lease_id = service.begin_retrieve(restored, rank)
+            assert lease_id is not None
+            lease = poll(service, lease_id)
             assert isinstance(lease, CheckpointSlots)
             for group_id, group in enumerate(lease.groups):
                 for page_id, slot in enumerate(group):
@@ -1149,5 +1153,7 @@ def test_reuse_admission_persists_only_restored_checkpoints(
             service.finish_retrieve(lease.lease_id)
         # Never restored before the restart, so its pages never reached L2.
         assert index.find((unused.prefix,)) == unused
-        assert poll(service, service.begin_retrieve(unused, 0)) is False
+        lease_id = service.begin_retrieve(unused, 0)
+        assert lease_id is not None
+        assert poll(service, lease_id) is False
         assert index.find((unused.prefix,)) is None
