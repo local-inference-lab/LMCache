@@ -429,6 +429,56 @@ def test_flush_inflight_stores_waits_for_pending_gather(
     ctx.close()
 
 
+def test_flush_inflight_stores_warns_while_a_gather_has_not_launched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long preemption flush is reported, but it still waits for the gather."""
+    gather_gate = threading.Event()
+    gather_started = threading.Event()
+
+    class _BlockingFakeTorchDev(_FakeTorchDev):
+        def stream(self, stream: object) -> object:
+            gather_started.set()
+            gather_gate.wait(timeout=2)
+            return super().stream(stream)
+
+    monkeypatch.setattr(
+        async_engine_driven, "torch_dev", _BlockingFakeTorchDev(gather_gate)
+    )
+    monkeypatch.setattr(async_engine_driven, "_FLUSH_WARNING_INTERVAL_SECONDS", 0.02)
+    _install_fake_gather(monkeypatch)
+    warning = MagicMock()
+    monkeypatch.setattr(async_engine_driven.logger, "warning", warning)
+
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._engine_driven_context = (
+        _FakeStoreContext(commit_impl=lambda _c: True)  # type: ignore[assignment]
+    )
+    ctx.submit_store(
+        "r1", object(), 1, {"k": torch.zeros(1)}, [[0]], _FakeEvent(gather_gate), 1
+    )
+    assert gather_started.wait(timeout=1), "background thread never started"
+
+    flush_returned = threading.Event()
+
+    def _flush() -> None:
+        ctx.flush_inflight_stores()
+        flush_returned.set()
+
+    t = threading.Thread(target=_flush, daemon=True)
+    t.start()
+    assert not flush_returned.wait(timeout=0.2)
+    assert warning.call_count >= 2
+    message, _elapsed, pending = warning.call_args.args
+    assert "Preemption flush has waited" in message
+    assert pending == 1
+
+    gather_gate.set()
+    t.join(timeout=2)
+    assert flush_returned.is_set(), "flush_inflight_stores did not complete"
+    ctx.close()
+
+
 def test_commit_store_serialized_by_commit_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from typing import Any
 import threading
+import time
 
 # Third Party
 import torch
@@ -25,6 +26,11 @@ from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
 )
 
 logger = init_logger(__name__)
+
+# While a preemption flush waits for store gathers to launch, warn this often.
+# The wait itself stays unbounded: the forward pass must not overwrite blocks
+# that a gather has yet to read.
+_FLUSH_WARNING_INTERVAL_SECONDS = 10.0
 
 # Number of background threads used to run commit (CPU->server) work for the
 # async engine-driven store path. >1 so that a slow gather for one store does
@@ -386,8 +392,15 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         """
         with self._inflight_lock:
             pending = list(self._pending_stores)
+        started = time.monotonic()
         for ev in pending:
-            ev.wait()
+            while not ev.wait(timeout=_FLUSH_WARNING_INTERVAL_SECONDS):
+                logger.warning(
+                    "Preemption flush has waited %.0f s for %d LMCache store "
+                    "gathers to launch; the next forward pass waits until they do",
+                    time.monotonic() - started,
+                    len(pending),
+                )
         self._sync_gather_events(suppress_errors=False)
 
     def close(self) -> None:

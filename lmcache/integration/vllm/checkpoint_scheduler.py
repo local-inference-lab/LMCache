@@ -29,6 +29,10 @@ logger = init_logger(__name__)
 # longest candidate that is still listed rather than recomputing the prompt.
 _MAX_LOOKUP_ATTEMPTS = 4
 
+# Restores slower than this many seconds are logged even when they succeed;
+# the request waits in the scheduler, deferred, for the whole restore.
+_SLOW_RESTORE_SECONDS = 10.0
+
 if TYPE_CHECKING:
     # Third Party
     from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
@@ -489,6 +493,15 @@ class CheckpointSchedulerBridge:
                         )
                     if published and state is not None:
                         state.checkpoint_id = pending.checkpoint.checkpoint_id
+                    elapsed = time.monotonic() - pending.created
+                    if elapsed > _SLOW_RESTORE_SECONDS:
+                        logger.info(
+                            "Recurrent checkpoint restore of %d tokens for request "
+                            "%s took %.1f s",
+                            pending.task.manifest.prefix.num_tokens,
+                            pending.request_id,
+                            elapsed,
+                        )
                 else:
                     self._manager.discard_external_boundary_checkpoint(
                         pending.checkpoint.checkpoint_id
@@ -501,7 +514,7 @@ class CheckpointSchedulerBridge:
                     )
                     logger.info(
                         "Recurrent checkpoint restore of %d tokens failed for "
-                        "request %s on ranks %s%s",
+                        "request %s on ranks %s after %.1f s%s",
                         pending.task.manifest.prefix.num_tokens,
                         pending.request_id,
                         sorted(
@@ -509,6 +522,7 @@ class CheckpointSchedulerBridge:
                             for rank, success in pending.acknowledgements.items()
                             if not success
                         ),
+                        time.monotonic() - pending.created,
                         "" if retry else "; recomputing its prompt",
                     )
                 if state is not None and retry:

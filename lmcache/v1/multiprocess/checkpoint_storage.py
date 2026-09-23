@@ -7,17 +7,19 @@ Every lease remains pinned until its worker reports completion of the copy.
 """
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 import hashlib
 import json
 import threading
+import time
 import uuid
 
 # Third Party
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.distributed.admission import (
     AdmissionAttempt,
     AdmissionFailure,
@@ -39,6 +41,8 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.distributed.storage_manager import StorageManager
     from lmcache.v1.memory_management import MemoryObj
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -215,6 +219,7 @@ class _RetrieveLease:
     handle: PrefetchHandle
     slots: CheckpointSlots | None = None
     cancelled: bool = False
+    started: float = field(default_factory=time.monotonic)
 
 
 class CheckpointPayloadStore:
@@ -510,6 +515,18 @@ class CheckpointPayloadStore:
                 del self._retrieves[lease_id]
                 if not lease.cancelled:
                     self._index.invalidate(lease.manifest.generation)
+                logger.info(
+                    "Checkpoint retrieve of %d tokens for rank %d %s after %.1f s: "
+                    "%d of %d pages were readable",
+                    lease.manifest.prefix.num_tokens,
+                    lease.rank,
+                    "was cancelled by the engine"
+                    if lease.cancelled
+                    else "missed; its checkpoint is no longer listed",
+                    time.monotonic() - lease.started,
+                    len(readable_keys),
+                    len(lease.keys),
+                )
                 return False
             try:
                 keys, objects = self._storage.unsafe_read(lease.keys)

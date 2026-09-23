@@ -10,6 +10,7 @@ import threading
 import time
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.multiprocess.checkpoint_index import CheckpointManifest
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -18,6 +19,8 @@ from lmcache.v1.multiprocess.protocols.checkpoint import (
     CheckpointCapabilities,
     CheckpointLeaseResponse,
 )
+
+logger = init_logger(__name__)
 
 
 class UnsafeCheckpointCopyError(RuntimeError):
@@ -240,13 +243,23 @@ class CheckpointTransferWorker:
         if not store:
             # Poll in the background; the scheduler can continue serving other
             # requests. A pending lookup owns no worker-visible byte slots yet.
-            deadline = time.monotonic() + self._rpc_timeout
+            started = time.monotonic()
+            deadline = started + self._rpc_timeout
             cancelled = False
             try:
                 while lease.status == "pending":
                     if not cancelled and (
                         self._closing or time.monotonic() >= deadline
                     ):
+                        if not self._closing:
+                            logger.warning(
+                                "Checkpoint retrieve of %d tokens for rank %d is "
+                                "still waiting for storage after %.0f s; cancelling "
+                                "it, so the request recomputes its prompt",
+                                job.manifest.prefix.num_tokens,
+                                job.rank,
+                                time.monotonic() - started,
+                            )
                         self._call(
                             RequestType.CHECKPOINT_CANCEL_RETRIEVE, lease.lease_id
                         )

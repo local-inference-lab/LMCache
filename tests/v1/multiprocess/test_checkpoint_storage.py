@@ -9,6 +9,7 @@ from mmap import mmap
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
+from unittest.mock import ANY, patch
 import hashlib
 import json
 import threading
@@ -46,6 +47,7 @@ from lmcache.v1.multiprocess.checkpoint_index import (
     CheckpointManifest,
     CheckpointPrefix,
 )
+from lmcache.v1.multiprocess import checkpoint_storage, checkpoint_transfer
 from lmcache.v1.multiprocess.checkpoint_storage import (
     CheckpointPayloadStore,
     CheckpointSlots,
@@ -954,6 +956,79 @@ def test_missing_page_invalidates_bundle_and_releases_other_read_locks(
     assert poll(service, service.begin_retrieve(entry, 2)) is False
     assert index.find((entry.prefix,)) is None
     assert storage.delete_l1_keys(keys[1:])[0] == len(keys) - 1
+
+
+def test_retrieve_miss_log_tells_missing_pages_from_cancellation(
+    store: Any,
+) -> None:
+    """A failed retrieve says how many pages were readable, and whether the
+    engine cancelled it, so eviction and slow storage can be told apart."""
+    service, index, storage, mapping = store
+    entry = make_manifest()
+    publish_all(service, index, mapping, entry)
+    missing = [key for group in checkpoint_object_keys(entry, 2) for key in group]
+    intact = [key for group in checkpoint_object_keys(entry, 0) for key in group]
+    assert storage.delete_l1_keys(missing[:1])[0] == 1
+    with patch.object(checkpoint_storage.logger, "info") as info:
+        assert poll(service, service.begin_retrieve(entry, 2)) is False
+        lease_id = service.begin_retrieve(entry, 0)
+        service.cancel_retrieve(lease_id)
+        assert poll(service, lease_id) is False
+    tokens = entry.prefix.num_tokens
+    assert [call.args[1:] for call in info.call_args_list] == [
+        (
+            tokens,
+            2,
+            "missed; its checkpoint is no longer listed",
+            ANY,
+            len(missing) - 1,
+            len(missing),
+        ),
+        (tokens, 0, "was cancelled by the engine", ANY, len(intact), len(intact)),
+    ]
+
+
+def test_retrieve_pending_past_the_deadline_is_cancelled_with_a_warning() -> None:
+    """A restore stuck behind storage is logged before the engine recomputes."""
+
+    class Reply:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+        def result(self, timeout: float | None = None) -> Any:
+            return self.value
+
+    class SlowStorageClient:
+        def __init__(self) -> None:
+            self.requests: list[RequestType] = []
+
+        def submit_request(self, kind: RequestType, payload: list[Any]) -> Reply:
+            self.requests.append(kind)
+            if kind == RequestType.CHECKPOINT_CANCEL_RETRIEVE:
+                return Reply(None)
+            cancelled = RequestType.CHECKPOINT_CANCEL_RETRIEVE in self.requests
+            return Reply(
+                CheckpointLeaseResponse("miss" if cancelled else "pending", "lease")
+            )
+
+    client = SlowStorageClient()
+    worker = CheckpointTransferWorker(
+        cast(MessageQueueClient, client),
+        lambda job, lease: pytest.fail("a missed restore must not copy"),
+        rpc_timeout=0.1,
+    )
+    entry = replace(make_manifest(), world_size=1)
+    try:
+        with patch.object(checkpoint_transfer.logger, "warning") as warning:
+            completion = worker.submit(CheckpointTransferJob(entry, 0, "RETRIEVE", ()))
+            assert completion is not None
+            assert completion.result(timeout=5) is False
+    finally:
+        worker.close()
+    assert RequestType.CHECKPOINT_CANCEL_RETRIEVE in client.requests
+    message, tokens, rank, _elapsed = warning.call_args.args
+    assert "still waiting for storage" in message
+    assert (tokens, rank) == (entry.prefix.num_tokens, 0)
 
 
 def test_cancel_pending_lookup_drains_locks_without_invalidating_payload(
