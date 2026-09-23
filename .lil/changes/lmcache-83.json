@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-83",
+  "category": "feature",
+  "summary": "Log why checkpoint restores wait and why they fail",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The worker warns when a retrieve is still waiting for storage at its deadline and is cancelled.",
+    "The server logs each retrieve that ends without data, with readable pages and whether it was cancelled.",
+    "Failed restores report their duration; restores slower than 10 s and preemption flushes waiting over 10 s are logged."
+  ],
+  "pull_requests": [
+    83
+  ]
+}
