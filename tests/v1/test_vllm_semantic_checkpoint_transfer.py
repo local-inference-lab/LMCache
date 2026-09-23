@@ -739,3 +739,92 @@ def test_failed_restore_falls_back_to_the_longest_remaining_checkpoint() -> None
             assert not bridge.has_pending
         finally:
             worker.close()
+
+
+def make_bridge(client, manager, lookup_timeout: float) -> CheckpointSchedulerBridge:
+    """Bridge with negotiated layouts and a short directory reply deadline."""
+    bridge = CheckpointSchedulerBridge(
+        manager,
+        client,
+        {
+            "target_revision": "a" * 40,
+            "draft_revision": "",
+            "source_revision": "b" * 40,
+            "parallel": {"tp": 4, "dcp": 1},
+        },
+        4,
+        lookup_timeout=lookup_timeout,
+    )
+    bridge.accept_layouts(
+        {rank: {"schema_version": 1, "page_bytes": 128} for rank in range(4)}
+    )
+    return bridge
+
+
+@pytest.mark.parametrize("reply", ["never", "error"])
+def test_lookup_without_a_usable_reply_admits_the_request(
+    reply: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost or failed directory reply ends in recomputation, not a park."""
+    with open_checkpoint_rpc() as (client, _module, _mapping, _name):
+        manager = make_manager()
+        bridge = make_bridge(client, manager, lookup_timeout=0.2)
+        failed: Future[None] = Future()
+        failed.set_exception(RuntimeError("checkpoint find handler failure"))
+        future = (
+            SimpleNamespace(query=lambda: False, result=failed.result)
+            if reply == "never"
+            else SimpleNamespace(query=lambda: True, result=failed.result)
+        )
+        consumer = make_request("consumer")
+        with monkeypatch.context() as patch:
+            patch.setattr(client, "submit_request", lambda *_: future)
+            assert not bridge.poll_prefix(consumer)
+            if reply == "never":
+                assert not bridge.poll_prefix(consumer)
+                time.sleep(0.3)
+            assert bridge.poll_prefix(consumer)
+        assert bridge.take_tasks() == []
+        assert bridge.external_tokens(consumer) == 0
+        assert not bridge.has_pending
+
+
+def test_unanswered_store_begin_is_aborted_after_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A begin reply that never arrives cannot pin the source checkpoint."""
+    with open_checkpoint_rpc() as (client, _module, _mapping, _name):
+        manager = make_manager()
+        bridge = make_bridge(client, manager, lookup_timeout=0.2)
+        producer = make_request("producer")
+        checkpoint = manager.reserve_external_boundary_checkpoint(
+            producer,
+            11,
+            manager.boundary_checkpoint_page_positions(11),
+            draft_prefix_len=11,
+            kind="prompt",
+            num_ranks=4,
+        )
+        assert checkpoint is not None
+        for rank in range(4):
+            manager.acknowledge_external_boundary_checkpoint(
+                checkpoint.checkpoint_id, rank
+            )
+        submitted: list[RequestType] = []
+
+        def submit(kind: RequestType, *_args) -> SimpleNamespace:
+            submitted.append(kind)
+            return SimpleNamespace(query=lambda: False, result=lambda: None)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(client, "submit_request", submit)
+            bridge.store(producer, checkpoint)
+            bridge.finish_request(producer.request_id)
+            assert bridge.take_tasks() == []
+            assert bridge.has_pending
+            assert not manager.reset_prefix_cache()
+            time.sleep(0.3)
+            assert bridge.take_tasks() == []
+        assert submitted == [RequestType.CHECKPOINT_BEGIN, RequestType.CHECKPOINT_ABORT]
+        assert not bridge.has_pending
+        assert manager.reset_prefix_cache()

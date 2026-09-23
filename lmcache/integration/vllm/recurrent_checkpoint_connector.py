@@ -176,6 +176,7 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError(
                 "LMCache message-queue timeout must be finite and positive"
             )
+        self._mq_timeout = timeout
         self._client = MessageQueueClient(url, zmq.Context.instance())
         try:
             capability_reply: MessagingFuture[CheckpointCapabilities] = (
@@ -215,7 +216,11 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
             "cp_interleave": parallel.cp_kv_cache_interleave_size,
         }
         self._scheduler = CheckpointSchedulerBridge(
-            manager, self._client, identity, parallel.world_size
+            manager,
+            self._client,
+            identity,
+            parallel.world_size,
+            lookup_timeout=self._mq_timeout,
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
