@@ -3,6 +3,7 @@
 
 # Standard
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 
 # Third Party
@@ -73,7 +74,7 @@ def test_eager_lookup_uses_adjusted_identity_before_boundary_truncation(
         _get_or_create_request_tracker=lambda value: tracker,
         scheduler_adapter=adapter,
     )
-    LMCacheMPConnector.on_new_request(connector, request)
+    LMCacheMPConnector.on_new_request(cast(LMCacheMPConnector, connector), request)
     expected = tracker.get_token_ids()[:8] if recurrent else tracker.get_token_ids()
     adapter.maybe_submit_lookup_request.assert_called_once_with(
         request.request_id, token_ids=expected, cache_salt=tracker.cache_salt
