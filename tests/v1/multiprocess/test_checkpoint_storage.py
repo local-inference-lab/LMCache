@@ -78,6 +78,7 @@ def open_store(
     native: bool = False,
     *,
     shm_name: str | None = None,
+    store_policy: str = "default",
 ) -> Iterator[tuple[CheckpointPayloadStore, CheckpointIndex, StorageManager, mmap]]:
     name = shm_name or f"lmcache_l1_pool_checkpoint_test_{uuid.uuid4().hex}"
     size = 4 * 1024 * 1024
@@ -94,6 +95,7 @@ def open_store(
                 if path is not None
                 else []
             ),
+            store_policy=store_policy,
         )
     )
     with ExitStack() as cleanup:
@@ -1085,3 +1087,67 @@ def test_filesystem_restore_after_directory_and_storage_restart(
                         == bytes([rank * 16 + group_id * 4 + page_id]) * slot.length
                     )
             service.finish_retrieve(lease.lease_id)
+
+
+def drain_l2_stores(storage: StorageManager) -> None:
+    """Wait until written and reused keys have reached their L2 adapters."""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        status = storage.report_status()["store_controller"]
+        if (
+            status["pending_keys_count"]
+            == status["pending_reused_keys_count"]
+            == status["in_flight_task_count"]
+            == 0
+        ):
+            return
+        time.sleep(0.01)
+    raise AssertionError("filesystem checkpoint writes did not drain")
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_reuse_admission_persists_only_restored_checkpoints(
+    tmp_path: Path, native: bool
+) -> None:
+    """checkpoint_on_reuse writes a checkpoint to L2 only after a restore."""
+    restored = make_manifest()
+    unused = replace(
+        make_manifest(), prefix=replace(restored.prefix, tail_tokens=(1, 2, 4))
+    )
+    with open_store(tmp_path, native, store_policy="checkpoint_on_reuse") as (
+        service,
+        index,
+        storage,
+        mapping,
+    ):
+        publish_all(service, index, mapping, restored)
+        publish_all(service, index, mapping, unused)
+        for rank in range(restored.world_size):
+            lease = poll(service, service.begin_retrieve(restored, rank))
+            assert isinstance(lease, CheckpointSlots)
+            service.finish_retrieve(lease.lease_id)
+        drain_l2_stores(storage)
+        time.sleep(0.2)
+        drain_l2_stores(storage)
+    with open_store(tmp_path, native, store_policy="checkpoint_on_reuse") as (
+        service,
+        index,
+        storage,
+        mapping,
+    ):
+        assert index.find((restored.prefix,)) == restored
+        for rank in range(restored.world_size):
+            lease = poll(service, service.begin_retrieve(restored, rank))
+            assert isinstance(lease, CheckpointSlots)
+            for group_id, group in enumerate(lease.groups):
+                for page_id, slot in enumerate(group):
+                    assert slot is not None
+                    assert (
+                        mapping[slot.offset : slot.offset + slot.length]
+                        == bytes([rank * 16 + group_id * 4 + page_id]) * slot.length
+                    )
+            service.finish_retrieve(lease.lease_id)
+        # Never restored before the restart, so its pages never reached L2.
+        assert index.find((unused.prefix,)) == unused
+        assert poll(service, service.begin_retrieve(unused, 0)) is False
+        assert index.find((unused.prefix,)) is None

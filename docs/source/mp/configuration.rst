@@ -477,7 +477,10 @@ Source: ``lmcache/v1/distributed/config.py``
        The ``default`` policy stores all keys to all adapters and keeps L1.
        The ``skip_l1`` policy stores all keys to all adapters and then
        deletes them from L1 (buffer-only mode).
-       Choices: ``default``, ``skip_l1``.
+       The ``checkpoint_on_reuse`` policy stores ordinary keys like
+       ``default`` but stores a recurrent checkpoint page to L2 only after
+       a restore has read it.
+       Choices: ``default``, ``skip_l1``, ``checkpoint_on_reuse``.
    * - ``--l2-prefetch-policy``
      - ``default``
      - L2 prefetch policy.  Determines which adapter loads each key

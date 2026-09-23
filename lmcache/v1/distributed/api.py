@@ -219,6 +219,26 @@ class ObjectKey:
         )
 
 
+RECURRENT_CHECKPOINT_MODEL_PREFIX = "recurrent-checkpoint-"
+"""``ObjectKey.model_name`` prefix of recurrent checkpoint payload pages.
+
+Checkpoint pages carry a complete recurrent-state snapshot. Store policies
+use this prefix to treat them differently from ordinary KV chunks."""
+
+
+def is_recurrent_checkpoint_key(key: ObjectKey) -> bool:
+    """Return whether ``key`` names a recurrent checkpoint payload page.
+
+    Args:
+        key: Any storage object key.
+
+    Returns:
+        True for keys created for atomic recurrent checkpoint generations,
+        False for ordinary KV chunks and every other object.
+    """
+    return key.model_name.startswith(RECURRENT_CHECKPOINT_MODEL_PREFIX)
+
+
 @dataclass(frozen=True)
 class EncodedObjectKey:
     """JSON-safe wire form of :class:`ObjectKey` — ``chunk_hash`` is

@@ -47,6 +47,9 @@ from lmcache.integration.vllm.recurrent_checkpoint_connector import (  # noqa: E
     RecurrentCheckpointMetadata,
     RecurrentCheckpointWorkerMetadata,
 )
+from lmcache.v1.multiprocess.checkpoint_storage import (  # noqa: E402
+    checkpoint_object_keys,
+)
 from lmcache.v1.multiprocess.checkpoint_transfer import (  # noqa: E402
     CheckpointTransferJob,
     CheckpointTransferWorker,
@@ -625,5 +628,114 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
             assert (
                 module.report_status()["recurrent_checkpoints"]["retrieve_leases"] == 0
             )
+        finally:
+            worker.close()
+
+
+def test_failed_restore_falls_back_to_the_longest_remaining_checkpoint() -> None:
+    """A restore whose pages are gone retries the directory, not the prompt."""
+    with open_checkpoint_rpc() as (client, module, mapping, _name):
+        manager = make_manager()
+        bridge = CheckpointSchedulerBridge(
+            manager,
+            client,
+            {
+                "target_revision": "target-content",
+                "draft_revision": "",
+                "source_revision": "source-content",
+                "parallel": {"tp": 4, "dcp": 1},
+            },
+            4,
+        )
+        bridge.accept_layouts(
+            {rank: {"schema_version": 1, "page_bytes": 128} for rank in range(4)}
+        )
+
+        def copy_pages(job, lease) -> None:
+            for group_id, group in enumerate(lease.slots):
+                for page_id, (offset, size) in enumerate(group):
+                    pattern = bytes([job.rank * 16 + group_id * 4 + page_id]) * size
+                    if job.direction == "STORE":
+                        mapping[offset : offset + size] = pattern
+                    else:
+                        assert mapping[offset : offset + size] == pattern
+
+        def run(task: CheckpointEngineTask) -> dict[int, bool]:
+            results = {}
+            for rank in range(4):
+                future = worker.submit(
+                    CheckpointTransferJob(
+                        task.manifest, rank, task.direction, task.block_ids
+                    )
+                )
+                results[rank] = future is not None and future.result(timeout=5)
+            bridge.complete({task.task_id: results})
+            return results
+
+        worker = CheckpointTransferWorker(client, copy_pages)
+        try:
+            producer = make_request("producer")
+            manifests = {}
+            for length, kind in ((8, "instruction"), (11, "prompt")):
+                checkpoint = manager.reserve_external_boundary_checkpoint(
+                    producer,
+                    length,
+                    manager.boundary_checkpoint_page_positions(length),
+                    draft_prefix_len=length,
+                    kind=kind,
+                    num_ranks=4,
+                )
+                assert checkpoint is not None
+                for rank in range(4):
+                    manager.acknowledge_external_boundary_checkpoint(
+                        checkpoint.checkpoint_id, rank
+                    )
+                bridge.store(producer, checkpoint)
+                deadline = time.monotonic() + 5
+                tasks: list[CheckpointEngineTask] = []
+                while not tasks and time.monotonic() < deadline:
+                    tasks = bridge.take_tasks()
+                    time.sleep(0.001)
+                assert len(tasks) == 1
+                assert all(run(tasks[0]).values())
+                manifests[length] = tasks[0].manifest
+            bridge.finish_request(producer.request_id)
+            assert manager.reset_prefix_cache()
+
+            # Pages only the longest checkpoint owns leave L1 without an L2
+            # copy; content-addressed pages shared with the shorter one stay.
+            storage = module.context.storage_manager
+            shared = {
+                key
+                for rank in range(4)
+                for group in checkpoint_object_keys(manifests[8], rank)
+                for key in group
+            }
+            for rank in range(4):
+                keys = [
+                    key
+                    for group in checkpoint_object_keys(manifests[11], rank)
+                    for key in group
+                    if key not in shared
+                ]
+                assert keys
+                assert storage.delete_l1_keys(keys) == (len(keys), 0)
+
+            consumer = make_request("consumer")
+            attempts: list[tuple[int, bool]] = []
+            deadline = time.monotonic() + 10
+            while not bridge.poll_prefix(consumer):
+                assert time.monotonic() < deadline
+                for task in bridge.take_tasks():
+                    results = run(task)
+                    attempts.append(
+                        (task.manifest.prefix.num_tokens, all(results.values()))
+                    )
+                time.sleep(0.001)
+
+            assert attempts == [(11, False), (8, True)]
+            assert manager.get_computed_blocks(consumer)[1] == 8
+            assert bridge.external_tokens(consumer) == 8
+            assert not bridge.has_pending
         finally:
             worker.close()

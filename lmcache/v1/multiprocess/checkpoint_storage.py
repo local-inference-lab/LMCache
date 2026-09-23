@@ -24,6 +24,7 @@ from lmcache.v1.distributed.admission import (
     reserve_with_eviction_backpressure,
 )
 from lmcache.v1.distributed.api import (
+    RECURRENT_CHECKPOINT_MODEL_PREFIX,
     MemoryLayoutDesc,
     ObjectKey,
     PrefetchHandle,
@@ -165,8 +166,8 @@ def checkpoint_object_keys(
                         json.dumps([manifest.generation, group.name, position]).encode()
                     ).digest()
                 ),
-                f"recurrent-checkpoint-v{3 if group.content_keys else 2}-"
-                f"{namespaces[group_id]}",
+                f"{RECURRENT_CHECKPOINT_MODEL_PREFIX}"
+                f"v{3 if group.content_keys else 2}-{namespaces[group_id]}",
                 rank,
                 group_id,
             )
@@ -549,6 +550,9 @@ class CheckpointPayloadStore:
             if lease.slots is None:
                 raise ValueError("checkpoint retrieval has not produced a read lease")
             del self._retrieves[lease_id]
+        # A completed restore proves reuse; reuse-admission store policies
+        # store checkpoint pages to L2 only after such a report.
+        self._storage.notify_keys_reused(lease.keys)
         self._storage.finish_read_prefetched(lease.keys)
 
     def cancel_retrieve(self, lease_id: str) -> None:

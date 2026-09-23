@@ -537,6 +537,20 @@ class StorageManager:
             )
         )
 
+    def notify_keys_reused(self, keys: list[ObjectKey]) -> None:
+        """Report objects that a completed restore just read from L1.
+
+        With a store policy that stores keys only after reuse (such as
+        ``checkpoint_on_reuse``), the first report of a key not yet in L2
+        stores it there. Write-through policies ignore the report. The call
+        is non-blocking; the store controller's loop does the work.
+
+        Args:
+            keys: Keys read by a restore whose consumer copy has completed.
+                Call this before releasing the restore's read locks.
+        """
+        self._store_controller.submit_reused_keys(keys)
+
     @enable_tracing()
     def submit_prefetch_task(
         self,

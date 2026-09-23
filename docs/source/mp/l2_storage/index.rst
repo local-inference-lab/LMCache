@@ -107,6 +107,13 @@ Select policies via CLI:
      - Buffer-only mode.  Store all keys to all adapters, then
        **delete them from L1** immediately.  Pair with
        ``--eviction-policy noop`` to avoid useless LRU overhead.
+   * - ``--l2-store-policy``
+     - ``checkpoint_on_reuse``
+     - Store ordinary keys like ``default``.  Keep new recurrent checkpoint
+       pages in L1 and store each one to L2 the first time a restore reads
+       it, once per page.  Checkpoints that are never restored never reach
+       L2; after a restart or eviction, restores fall back to the longest
+       checkpoint that still exists.
    * - ``--l2-prefetch-policy``
      - ``default``
      - For each key, pick the first (lowest-indexed) adapter that has it.

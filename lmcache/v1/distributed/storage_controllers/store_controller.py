@@ -10,7 +10,7 @@ The controller runs a background thread with an event-driven loop that:
 """
 
 # Standard
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 import enum
 import select
@@ -20,7 +20,7 @@ import threading
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.distributed.internal_api import L1ManagerListener
+from lmcache.v1.distributed.internal_api import L1ManagerListener, L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
@@ -67,7 +67,14 @@ def _group_keys_by_shape(
 # Helper classes (module-level, before main class)
 
 
-class StoreListener(L1ManagerListener):
+class L2Residency(enum.Enum):
+    """Whether an event shows that keys are in L2 or no longer are."""
+
+    PRESENT = enum.auto()
+    ABSENT = enum.auto()
+
+
+class StoreListener(L1ManagerListener, L2AdapterListener):
     """
     Listener that receives L1 write-completion callbacks and enqueues
     keys for the StoreController's background loop.
@@ -75,10 +82,17 @@ class StoreListener(L1ManagerListener):
     The ``on_keys_write_finished`` callback is invoked inside L1Manager's
     lock, so it must be non-blocking. It appends keys to an internal list
     and signals an eventfd to wake up the controller's select.poll().
+
+    For reuse-admission policies it also queues reused keys and records
+    which keys enter or leave L2 (loads from L2, L2 stores and deletions),
+    so the controller stores a reused key once rather than on every reuse.
     """
 
     def __init__(self) -> None:
         self._pending_keys: list[ObjectKey] = []
+        self._reused_keys: list[ObjectKey] = []
+        self._residency_events: list[tuple[L2Residency, list[ObjectKey]]] = []
+        self._tracks_l2_residency = False
         self._lock = threading.Lock()
         self._event_fd = create_event_notifier()
 
@@ -116,6 +130,49 @@ class StoreListener(L1ManagerListener):
         with self._lock:
             return len(self._pending_keys)
 
+    def pending_reused_count(self) -> int:
+        """Return the number of reused keys waiting to be processed."""
+        with self._lock:
+            return len(self._reused_keys)
+
+    def enable_l2_residency_tracking(self) -> None:
+        """Start recording L2 residency events and accepting reused keys."""
+        with self._lock:
+            self._tracks_l2_residency = True
+
+    def enqueue_reused_keys(self, keys: list[ObjectKey]) -> None:
+        """
+        Enqueue keys read by a completed restore and signal the notifier.
+
+        Ignored until ``enable_l2_residency_tracking`` is called.
+
+        Args:
+            keys (list[ObjectKey]): Keys whose restore has completed.
+        """
+        with self._lock:
+            if not self._tracks_l2_residency:
+                return
+            self._reused_keys.extend(keys)
+        self._event_fd.notify()
+
+    def pop_reuse_events(
+        self,
+    ) -> tuple[list[tuple[L2Residency, list[ObjectKey]]], list[ObjectKey]]:
+        """
+        Pop residency events and reused keys in one atomic step.
+
+        A key loaded from L2 is recorded before its restore can complete,
+        so popping both lists together never returns a reused key without
+        the residency event that precedes it.
+
+        Returns:
+            Residency events in arrival order, and the reused keys.
+        """
+        with self._lock:
+            residency, reused = self._residency_events, self._reused_keys
+            self._residency_events, self._reused_keys = [], []
+        return residency, reused
+
     # L1ManagerListener implementation
 
     def on_l1_keys_write_finished(self, keys: list[ObjectKey]) -> None:
@@ -145,16 +202,39 @@ class StoreListener(L1ManagerListener):
         pass
 
     def on_l1_keys_finish_write_and_reserve_read(self, keys: list[ObjectKey]) -> None:
-        # No op here because we don't want to trigger store when the
-        # objects are prefetched to L1.
-        pass
+        # Never trigger a store for objects prefetched to L1; they came from
+        # L2, so reuse admission records them as already stored.
+        self._record_residency(L2Residency.PRESENT, keys)
 
     def on_l1_keys_accessed(self, keys: list[ObjectKey]) -> None:
         pass
 
+    # L2AdapterListener implementation
+
+    def on_l2_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        """Record keys that an L2 adapter now holds."""
+        self._record_residency(L2Residency.PRESENT, keys)
+
+    def on_l2_keys_accessed(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l2_keys_deleted(self, keys: list[ObjectKey]) -> None:
+        """Record keys that an L2 adapter no longer holds."""
+        self._record_residency(L2Residency.ABSENT, keys)
+
     def close(self) -> None:
         """Close the notifier."""
         self._event_fd.close()
+
+    def _record_residency(self, state: L2Residency, keys: list[ObjectKey]) -> None:
+        """Queue a residency change when tracking is enabled; non-blocking."""
+        if not keys:
+            return
+        with self._lock:
+            if not self._tracks_l2_residency:
+                return
+            self._residency_events.append((state, list(keys)))
+        self._event_fd.notify()
 
 
 class StorePhase(enum.Enum):
@@ -223,6 +303,10 @@ class StoreController(StorageControllerInterface):
     _gauge_registered: bool = False
     _gauge_target: "StoreController | None" = None
 
+    # Bound on remembered L2-resident keys for reuse admission. A forgotten
+    # key that is still in L2 is stored once more on its next reuse.
+    _MAX_TRACKED_L2_KEYS = 131072
+
     def __init__(
         self,
         l1_manager: L1Manager,
@@ -240,6 +324,11 @@ class StoreController(StorageControllerInterface):
         }
         self._policy = policy
 
+        # Reuse admission state, touched only by the store loop thread.
+        self._tracks_l2_residency = policy.uses_reuse_admission()
+        self._l2_resident: OrderedDict[ObjectKey, None] = OrderedDict()
+        self._reuse_in_flight: set[ObjectKey] = set()
+
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
         self._draining: dict[int, threading.Event] = {}
@@ -252,6 +341,10 @@ class StoreController(StorageControllerInterface):
 
         self._listener = StoreListener()
         self._l1_manager.register_listener(self._listener)
+        if self._tracks_l2_residency:
+            self._listener.enable_l2_residency_tracking()
+            for adapter in self._l2_adapters.values():
+                adapter.register_listener(self._listener)
         self._event_bus = get_event_bus()
 
         # (adapter_index, task_id) -> InFlightStoreTask
@@ -328,11 +421,27 @@ class StoreController(StorageControllerInterface):
             "is_healthy": is_healthy,
             "thread_alive": is_healthy,
             "pending_keys_count": self._listener.pending_count(),
+            "pending_reused_keys_count": self._listener.pending_reused_count(),
             "in_flight_task_count": self._status_in_flight_count,
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - num_draining,
             "num_draining_adapters": num_draining,
         }
+
+    def submit_reused_keys(self, keys: list[ObjectKey]) -> None:
+        """
+        Report keys that a completed restore read from L1.
+
+        With a reuse-admission policy, keys not yet known to be in L2 are
+        offered to ``StorePolicy.select_reuse_targets`` by the background
+        loop. Other policies ignore the report. Non-blocking.
+
+        Args:
+            keys: Keys whose restore, including the consumer's copy, has
+                completed.
+        """
+        if keys:
+            self._listener.enqueue_reused_keys(keys)
 
     def add_adapter(
         self,
@@ -469,6 +578,7 @@ class StoreController(StorageControllerInterface):
                         keys = self._listener.pop_pending_keys()
                         if keys:
                             self._process_new_keys(keys)
+                        self._process_reuse_events()
                     else:
                         adapter_idx = self._efd_to_adapter_index.get(fd)
                         if adapter_idx is not None:
@@ -508,6 +618,8 @@ class StoreController(StorageControllerInterface):
             self._pending_adapter_ops = []
         for op in ops:
             if isinstance(op, AddAdapterOp):
+                if self._tracks_l2_residency:
+                    op.adapter.register_listener(self._listener)
                 self._l2_adapters[op.adapter_id] = op.adapter
                 self._adapter_descriptors[op.adapter_id] = op.descriptor
                 efd = op.adapter.get_store_event_fd()
@@ -570,19 +682,43 @@ class StoreController(StorageControllerInterface):
         for group in _group_keys_by_shape(keys).values():
             self._submit_store_for_single_shape(group)
 
-    def _submit_store_for_single_shape(self, keys: list[ObjectKey]) -> None:
-        """Submit ``keys`` (all same shape) to their target adapters."""
-        # Only route to adapters that are live (not draining). Descriptors
-        # for draining adapters are kept for in-flight completion handling
-        # but excluded here so no new task targets them.
-        routing_descriptors = [
+    def _process_reuse_events(self) -> None:
+        """Apply L2 residency changes, then store keys reused for the first time."""
+        residency, reused = self._listener.pop_reuse_events()
+        for state, keys in residency:
+            if state is L2Residency.PRESENT:
+                self._remember_l2_resident(keys)
+            else:
+                for key in keys:
+                    self._l2_resident.pop(key, None)
+        fresh = [
+            key
+            for key in dict.fromkeys(reused)
+            if key not in self._l2_resident and key not in self._reuse_in_flight
+        ]
+        for group in _group_keys_by_shape(fresh).values():
+            plan = self._policy.select_reuse_targets(group, self._routing_descriptors())
+            self._reuse_in_flight.update(self._submit_plan(plan))
+
+    def _routing_descriptors(self) -> list[AdapterDescriptor]:
+        """Return descriptors of live adapters that may receive new stores."""
+        # Descriptors for draining adapters are kept for in-flight completion
+        # handling but excluded here so no new task targets them.
+        return [
             desc
             for adapter_id, desc in self._adapter_descriptors.items()
             if adapter_id not in self._draining
         ]
-        plan = self._policy.select_store_targets(keys, routing_descriptors)
 
+    def _submit_store_for_single_shape(self, keys: list[ObjectKey]) -> None:
+        """Submit ``keys`` (all same shape) to their target adapters."""
+        plan = self._policy.select_store_targets(keys, self._routing_descriptors())
+        self._submit_plan(plan)
+
+    def _submit_plan(self, plan: dict[int, list[ObjectKey]]) -> list[ObjectKey]:
+        """Submit one store task per adapter in ``plan``; return submitted keys."""
         l1_mgr = self._l1_manager
+        submitted: list[ObjectKey] = []
 
         for adapter_index, target_keys in plan.items():
             if not target_keys:
@@ -624,8 +760,8 @@ class StoreController(StorageControllerInterface):
                 successful_objs.append(obj)
 
             # L1 read-failure anomaly reporting: target_keys come from an
-            # L1_WRITE_FINISHED notification, so failing to reserve_read them
-            # immediately after means an unexpected eviction or lock race.
+            # L1_WRITE_FINISHED notification or a just-completed restore, so
+            # failing to reserve_read them means an eviction or lock race.
             if not_found_keys:
                 self._event_bus.publish(
                     Event(
@@ -654,6 +790,7 @@ class StoreController(StorageControllerInterface):
 
             adapter = self._l2_adapters[adapter_index]
             task_id = adapter.submit_store_task(successful_keys, successful_objs)
+            submitted.extend(successful_keys)
 
             self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
                 adapter_index=adapter_index,
@@ -688,6 +825,7 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 len(successful_keys),
             )
+        return submitted
 
     def _drain_l2_store_completions(self, signaled_adapters: set[int]) -> None:
         """Deposit each signaled adapter's L2 outcomes onto their in-flight
@@ -733,6 +871,7 @@ class StoreController(StorageControllerInterface):
         l1_mgr.finish_read(task.read_locked_keys)
         del self._in_flight_tasks[task_key]
         self._status_in_flight_count -= 1
+        self._reuse_in_flight.difference_update(task.keys)
 
         l2_name = self._adapter_descriptors[adapter_index].type_name
         completion_meta: dict[str, object] = {
@@ -759,6 +898,8 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 len(task.keys),
             )
+            if self._tracks_l2_residency:
+                self._remember_l2_resident(task.keys)
             delete_keys = self._policy.select_l1_deletions(task.keys)
             if delete_keys:
                 l1_mgr.delete(delete_keys)
@@ -779,6 +920,14 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 task.keys,
             )
+
+    def _remember_l2_resident(self, keys: list[ObjectKey]) -> None:
+        """Record keys as present in L2, forgetting the oldest beyond the bound."""
+        for key in keys:
+            self._l2_resident[key] = None
+            self._l2_resident.move_to_end(key)
+        while len(self._l2_resident) > self._MAX_TRACKED_L2_KEYS:
+            self._l2_resident.popitem(last=False)
 
     def _cleanup_in_flight_tasks(self) -> None:
         """

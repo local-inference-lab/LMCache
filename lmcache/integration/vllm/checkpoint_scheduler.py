@@ -22,6 +22,11 @@ from lmcache.v1.multiprocess.protocols.base import RequestType
 
 logger = init_logger(__name__)
 
+# Directory lookups per request, including the first. A failed restore makes
+# the server invalidate the missing generation, so each retry receives the
+# longest candidate that is still listed rather than recomputing the prompt.
+_MAX_LOOKUP_ATTEMPTS = 4
+
 if TYPE_CHECKING:
     # Third Party
     from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
@@ -56,6 +61,7 @@ class _Lookup:
     done: bool = False
     task_id: str | None = None
     checkpoint_id: int | None = None
+    attempts: int = 1
 
 
 class CheckpointSchedulerBridge:
@@ -396,6 +402,7 @@ class CheckpointSchedulerBridge:
                 self._cache.release(pending.checkpoint)
             else:
                 state = self._lookups.get(pending.request_id)
+                retry = False
                 if (
                     all(pending.acknowledgements.values())
                     and pending.request_id not in self._cancelled
@@ -412,7 +419,27 @@ class CheckpointSchedulerBridge:
                     self._manager.discard_external_boundary_checkpoint(
                         pending.checkpoint.checkpoint_id
                     )
-                if state is not None:
+                    retry = (
+                        state is not None
+                        and pending.request_id not in self._cancelled
+                        and state.attempts < _MAX_LOOKUP_ATTEMPTS
+                    )
+                if state is not None and retry:
+                    # A shorter checkpoint can survive eviction or a restart
+                    # when the longest one did not; look it up again.
+                    logger.info(
+                        "Recurrent checkpoint restore of %d tokens missed for "
+                        "request %s; looking up a shorter checkpoint (attempt %d)",
+                        pending.task.manifest.prefix.num_tokens,
+                        pending.request_id,
+                        state.attempts + 1,
+                    )
+                    state.task_id = None
+                    state.attempts += 1
+                    state.future = self._client.submit_request(
+                        RequestType.CHECKPOINT_FIND, [state.roots.roots]
+                    )
+                elif state is not None:
                     state.done = True
             del self._tasks[task_id]
             if pending.request_id in self._cancelled:
