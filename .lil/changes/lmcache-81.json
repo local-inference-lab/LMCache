@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-81",
+  "category": "feature",
+  "summary": "Store recurrent checkpoints to disk only after reuse",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The checkpoint_on_reuse store policy writes checkpoint pages to L2 only after a restore reused them; the launcher selects it with LMCACHE_L2_CHECKPOINT_WRITES=on-reuse.",
+    "A restore that misses falls back to the longest remaining checkpoint instead of recomputing the whole prompt."
+  ],
+  "pull_requests": [
+    81
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-82",
+  "category": "fix",
+  "summary": "Bound checkpoint admission waits and log restore fallbacks",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "A checkpoint lookup without a reply within lmcache.mp.mq_timeout admits the request with recomputation instead of parking it.",
+    "A store begin without a reply is aborted after the same timeout, releasing its pinned source.",
+    "Skipped, rejected, capacity-deferred (with the free-block count) and failed restores are logged."
+  ],
+  "pull_requests": [
+    82
+  ]
+}
