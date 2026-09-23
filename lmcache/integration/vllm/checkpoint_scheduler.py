@@ -5,6 +5,8 @@
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import json
+import math
+import time
 import uuid
 
 # First Party
@@ -21,6 +23,11 @@ from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocols.base import RequestType
 
 logger = init_logger(__name__)
+
+# Directory lookups per request, including the first. A failed restore makes
+# the server invalidate the missing generation, so each retry receives the
+# longest candidate that is still listed rather than recomputing the prompt.
+_MAX_LOOKUP_ATTEMPTS = 4
 
 if TYPE_CHECKING:
     # Third Party
@@ -47,6 +54,7 @@ class _PendingTask:
     begin: MessagingFuture[bool] | None = None
     acknowledgements: dict[int, bool] = field(default_factory=dict)
     sent: bool = False
+    created: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -56,6 +64,9 @@ class _Lookup:
     done: bool = False
     task_id: str | None = None
     checkpoint_id: int | None = None
+    attempts: int = 1
+    started: float = field(default_factory=time.monotonic)
+    capacity_refusal_logged: bool = False
 
 
 class CheckpointSchedulerBridge:
@@ -68,6 +79,11 @@ class CheckpointSchedulerBridge:
             Worker layout is added after all ranks report identical descriptors.
         world_size: Number of engine ranks contributing to one atomic generation.
         max_tasks: Admission limit for collective stores and restores.
+        lookup_timeout: Seconds a request may wait for directory replies,
+            including shorter-checkpoint retries, and a store for its begin
+            reply. A request whose lookup has not been answered by then is
+            admitted to recompute its prompt; an unanswered store is aborted.
+            A started worker copy is never abandoned.
 
     The scheduler must keep issuing connector-only steps while has_pending is
     true, including after a producer request finishes. Request cancellation
@@ -82,11 +98,15 @@ class CheckpointSchedulerBridge:
         world_size: int,
         *,
         max_tasks: int = 32,
+        lookup_timeout: float = 60.0,
     ) -> None:
         if manager.boundary_checkpoints is None or world_size < 1 or max_tasks < 1:
             raise ValueError(
                 "Semantic transfers require a boundary allocator and ranks"
             )
+        if not 0 < lookup_timeout < math.inf:
+            raise ValueError("Checkpoint lookup timeout must be finite and positive")
+        self._lookup_timeout = lookup_timeout
         self._manager = manager
         self._cache = manager.boundary_checkpoints
         self._client = client
@@ -167,15 +187,43 @@ class CheckpointSchedulerBridge:
             return False
         if state.done:
             return True
-        if state.task_id is not None or not state.future.query():
+        if state.task_id is not None:
             return False
-        manifest = state.future.result()
+        if not state.future.query():
+            if time.monotonic() - state.started < self._lookup_timeout:
+                return False
+            # An unanswered lookup must not park the request indefinitely.
+            logger.warning(
+                "Recurrent checkpoint lookup for request %s got no reply within "
+                "%.0f s; recomputing its prompt",
+                request.request_id,
+                self._lookup_timeout,
+            )
+            state.done = True
+            return True
+        try:
+            manifest = state.future.result()
+        except Exception:
+            logger.exception(
+                "Recurrent checkpoint lookup failed for request %s; recomputing "
+                "its prompt",
+                request.request_id,
+            )
+            state.done = True
+            return True
         if manifest is None or (
             local is not None and manifest.prefix.num_tokens <= local.num_tokens
         ):
             state.done = True
             return True
         if len(self._tasks) >= self._max_tasks:
+            logger.info(
+                "Recurrent checkpoint restore of %d tokens skipped for request %s: "
+                "%d checkpoint copies in flight; recomputing its prompt",
+                manifest.prefix.num_tokens,
+                request.request_id,
+                len(self._tasks),
+            )
             state.done = True
             return True
         try:
@@ -189,12 +237,29 @@ class CheckpointSchedulerBridge:
                 num_ranks=self._world_size,
             )
         except (ValueError, KeyError, TypeError):
+            logger.warning(
+                "Recurrent checkpoint restore of %d tokens rejected for request "
+                "%s; recomputing its prompt",
+                manifest.prefix.num_tokens,
+                request.request_id,
+                exc_info=True,
+            )
             state.done = True
             return True
         if checkpoint is None:
             # Insufficient GPU capacity is not an external-cache miss. Permit
             # ordinary admission, but retain the manifest so an unadmitted
             # request can retry its import after other owners release pages.
+            if not state.capacity_refusal_logged:
+                state.capacity_refusal_logged = True
+                logger.info(
+                    "Recurrent checkpoint restore of %d tokens deferred for "
+                    "request %s: not enough free GPU blocks (%d free); it is "
+                    "admitted without the restore unless capacity returns first",
+                    manifest.prefix.num_tokens,
+                    request.request_id,
+                    self._manager.block_pool.get_num_free_blocks(),
+                )
             return True
         task = self._make_task(manifest, checkpoint, "RETRIEVE")
         self._tasks[task.task_id] = _PendingTask(task, checkpoint, request.request_id)
@@ -342,14 +407,30 @@ class CheckpointSchedulerBridge:
             if pending.sent:
                 continue
             if pending.begin is not None:
-                if not pending.begin.query():
+                answered = pending.begin.query()
+                if (
+                    not answered
+                    and time.monotonic() - pending.created < self._lookup_timeout
+                ):
                     continue
-                try:
-                    accepted = pending.begin.result()
-                except Exception:
-                    logger.exception("Recurrent checkpoint begin operation failed")
+                accepted = False
+                abort = not answered
+                if answered:
+                    try:
+                        accepted = pending.begin.result()
+                    except Exception:
+                        logger.exception("Recurrent checkpoint begin operation failed")
+                        abort = True
+                else:
+                    logger.warning(
+                        "Recurrent checkpoint store of %d tokens got no begin reply "
+                        "within %.0f s; aborting it",
+                        pending.task.manifest.prefix.num_tokens,
+                        self._lookup_timeout,
+                    )
+                if abort:
                     # No worker has received this task. Its GPU source pin can
-                    # be released even if the server's begin reply was lost.
+                    # be released even if the server's begin reply is lost.
                     try:
                         self._client.submit_request(
                             RequestType.CHECKPOINT_ABORT,
@@ -357,7 +438,6 @@ class CheckpointSchedulerBridge:
                         )
                     except Exception:
                         logger.exception("Recurrent checkpoint abort submission failed")
-                    accepted = False
                 if not accepted:
                     self._cache.release(pending.checkpoint)
                     del self._tasks[task_id]
@@ -396,6 +476,7 @@ class CheckpointSchedulerBridge:
                 self._cache.release(pending.checkpoint)
             else:
                 state = self._lookups.get(pending.request_id)
+                retry = False
                 if (
                     all(pending.acknowledgements.values())
                     and pending.request_id not in self._cancelled
@@ -412,7 +493,40 @@ class CheckpointSchedulerBridge:
                     self._manager.discard_external_boundary_checkpoint(
                         pending.checkpoint.checkpoint_id
                     )
-                if state is not None:
+                    retry = (
+                        state is not None
+                        and pending.request_id not in self._cancelled
+                        and state.attempts < _MAX_LOOKUP_ATTEMPTS
+                        and time.monotonic() - state.started < self._lookup_timeout
+                    )
+                    logger.info(
+                        "Recurrent checkpoint restore of %d tokens failed for "
+                        "request %s on ranks %s%s",
+                        pending.task.manifest.prefix.num_tokens,
+                        pending.request_id,
+                        sorted(
+                            rank
+                            for rank, success in pending.acknowledgements.items()
+                            if not success
+                        ),
+                        "" if retry else "; recomputing its prompt",
+                    )
+                if state is not None and retry:
+                    # A shorter checkpoint can survive eviction or a restart
+                    # when the longest one did not; look it up again.
+                    logger.info(
+                        "Recurrent checkpoint restore of %d tokens missed for "
+                        "request %s; looking up a shorter checkpoint (attempt %d)",
+                        pending.task.manifest.prefix.num_tokens,
+                        pending.request_id,
+                        state.attempts + 1,
+                    )
+                    state.task_id = None
+                    state.attempts += 1
+                    state.future = self._client.submit_request(
+                        RequestType.CHECKPOINT_FIND, [state.roots.roots]
+                    )
+                elif state is not None:
                     state.done = True
             del self._tasks[task_id]
             if pending.request_id in self._cancelled:

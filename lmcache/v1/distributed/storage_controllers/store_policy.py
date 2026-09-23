@@ -91,6 +91,42 @@ class StorePolicy(ABC):
             Keys to delete from L1. Empty list means keep all.
         """
 
+    def uses_reuse_admission(self) -> bool:
+        """
+        Whether this policy stores some keys only after they are reused.
+
+        The store controller tracks which keys are already in L2 only for
+        such policies, so write-through policies pay no bookkeeping cost.
+
+        Returns:
+            False for the base class; policies that override
+            ``select_reuse_targets`` return True.
+        """
+        return False
+
+    def select_reuse_targets(
+        self,
+        keys: list[ObjectKey],
+        adapters: list[AdapterDescriptor],
+    ) -> dict[int, list[ObjectKey]]:
+        """
+        Decide which keys to store to which L2 adapters after their reuse.
+
+        Called once a consumer has restored these keys from L1. A key is
+        offered at most once while the controller knows it is in L2.
+        Write-through policies already stored every key, so the base class
+        stores nothing.
+
+        Args:
+            keys: Keys that a completed restore read from L1.
+            adapters: Descriptors of available L2 adapters.
+
+        Returns:
+            Mapping from adapter index to keys to store. An empty mapping
+            stores nothing.
+        """
+        return {}
+
 
 # -----------------------------------------------------------------------------
 # Registry: store policy name -> policy class

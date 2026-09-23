@@ -19,7 +19,11 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.api import (
+    RECURRENT_CHECKPOINT_MODEL_PREFIX,
+    MemoryLayoutDesc,
+    ObjectKey,
+)
 from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
 from lmcache.v1.distributed.eviction_policy.noop import (
     NoOpEvictionPolicy,
@@ -28,6 +32,9 @@ from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2Adapter,
     MockL2AdapterConfig,
+)
+from lmcache.v1.distributed.storage_controllers.checkpoint_reuse_store_policy import (
+    CheckpointReuseStorePolicy,
 )
 from lmcache.v1.distributed.storage_controllers.store_controller import (
     StoreController,
@@ -723,5 +730,163 @@ class TestBufferOnlyMode:
         )
         assert ok, "All keys should be deleted from L1 after buffer-only cleanup"
 
+        ctrl.stop()
+        adapter.close()
+
+
+# =============================================================================
+# Reuse Admission Tests
+# =============================================================================
+
+
+def make_checkpoint_key(chunk_id: int) -> ObjectKey:
+    """Create a key named like a recurrent checkpoint payload page."""
+    return ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(chunk_id),
+        model_name=f"{RECURRENT_CHECKPOINT_MODEL_PREFIX}v3-{'a' * 64}",
+        kv_rank=0,
+    )
+
+
+class CountingL2Adapter(MockL2Adapter):
+    """MockL2Adapter that records every key submitted for storage."""
+
+    def __init__(self, config: MockL2AdapterConfig) -> None:
+        super().__init__(config)
+        self.submitted: list[ObjectKey] = []
+
+    def submit_store_task(self, keys, objects):
+        self.submitted.extend(keys)
+        return super().submit_store_task(keys, objects)
+
+
+def make_counting_adapter() -> CountingL2Adapter:
+    """Create a CountingL2Adapter with fast bandwidth."""
+    return CountingL2Adapter(
+        MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+    )
+
+
+def settle(ctrl: StoreController) -> bool:
+    """Wait until the controller has no queued keys or in-flight stores."""
+
+    def idle() -> bool:
+        status = ctrl.report_status()
+        return (
+            status["pending_keys_count"] == 0
+            and status["pending_reused_keys_count"] == 0
+            and status["in_flight_task_count"] == 0
+        )
+
+    return wait_for_condition(idle)
+
+
+class TestStoreControllerReuseAdmission:
+    """checkpoint_on_reuse stores checkpoint pages once, after their reuse."""
+
+    def start(self, l1_manager, adapter, policy) -> StoreController:
+        ctrl = StoreController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=policy,
+        )
+        ctrl.start()
+        return ctrl
+
+    def test_checkpoint_pages_wait_for_reuse(self, l1_manager):
+        adapter = make_counting_adapter()
+        ctrl = self.start(l1_manager, adapter, CheckpointReuseStorePolicy())
+        ordinary = [make_object_key(i) for i in range(2)]
+        pages = [make_checkpoint_key(i) for i in range(3)]
+        write_keys_to_l1(l1_manager, ordinary + pages, make_layout())
+
+        assert wait_for_condition(lambda: set(adapter.submitted) == set(ordinary))
+        assert settle(ctrl)
+        assert not any(adapter.debug_has_key(key) for key in pages)
+
+        ctrl.submit_reused_keys(pages)
+        assert wait_for_condition(
+            lambda: all(adapter.debug_has_key(key) for key in pages)
+        )
+        ctrl.stop()
+        adapter.close()
+
+    def test_reused_pages_are_stored_once(self, l1_manager):
+        adapter = make_counting_adapter()
+        ctrl = self.start(l1_manager, adapter, CheckpointReuseStorePolicy())
+        pages = [make_checkpoint_key(i) for i in range(3)]
+        write_keys_to_l1(l1_manager, pages, make_layout())
+
+        ctrl.submit_reused_keys(pages)
+        assert wait_for_condition(lambda: len(adapter.submitted) == 3)
+        assert settle(ctrl)
+        ctrl.submit_reused_keys(pages + pages)
+        time.sleep(0.2)
+        assert settle(ctrl)
+
+        assert sorted(adapter.submitted, key=lambda k: k.chunk_hash) == sorted(
+            pages, key=lambda k: k.chunk_hash
+        )
+        ctrl.stop()
+        adapter.close()
+
+    def test_pages_loaded_from_l2_are_not_stored_again(self, l1_manager):
+        adapter = make_counting_adapter()
+        ctrl = self.start(l1_manager, adapter, CheckpointReuseStorePolicy())
+        pages = [make_checkpoint_key(i) for i in range(3)]
+        # A prefetch writes loaded L2 data and read-locks it atomically.
+        reserved = l1_manager.reserve_write(
+            keys=pages,
+            is_temporary=[False] * len(pages),
+            layout_desc=make_layout(),
+            mode="new",
+        )
+        assert all(obj is not None for _error, obj in reserved.values())
+        l1_manager.finish_write_and_reserve_read(pages)
+
+        ctrl.submit_reused_keys(pages)
+        time.sleep(0.2)
+        assert settle(ctrl)
+
+        assert adapter.submitted == []
+        l1_manager.finish_read(pages)
+        ctrl.stop()
+        adapter.close()
+
+    def test_l2_deletion_allows_the_next_reuse_to_store(self, l1_manager):
+        adapter = make_counting_adapter()
+        ctrl = self.start(l1_manager, adapter, CheckpointReuseStorePolicy())
+        pages = [make_checkpoint_key(i) for i in range(2)]
+        write_keys_to_l1(l1_manager, pages, make_layout())
+
+        ctrl.submit_reused_keys(pages)
+        assert wait_for_condition(
+            lambda: all(adapter.debug_has_key(key) for key in pages)
+        )
+        assert settle(ctrl)
+        adapter.delete(pages)
+        ctrl.submit_reused_keys(pages)
+
+        assert wait_for_condition(lambda: len(adapter.submitted) == 4)
+        assert wait_for_condition(
+            lambda: all(adapter.debug_has_key(key) for key in pages)
+        )
+        ctrl.stop()
+        adapter.close()
+
+    def test_write_through_policy_ignores_reuse_reports(self, l1_manager):
+        adapter = make_counting_adapter()
+        ctrl = self.start(l1_manager, adapter, DefaultStorePolicy())
+        pages = [make_checkpoint_key(i) for i in range(3)]
+        write_keys_to_l1(l1_manager, pages, make_layout())
+        assert wait_for_condition(lambda: len(adapter.submitted) == 3)
+        assert settle(ctrl)
+
+        ctrl.submit_reused_keys(pages)
+        time.sleep(0.2)
+        assert settle(ctrl)
+
+        assert len(adapter.submitted) == 3
         ctrl.stop()
         adapter.close()
