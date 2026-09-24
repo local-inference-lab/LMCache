@@ -104,6 +104,19 @@ class StorePolicy(ABC):
         """
         return False
 
+    def writes_checkpoints_on_evict(self) -> bool:
+        """
+        Whether checkpoint pages reach L2 only when L1 evicts them.
+
+        Such policies hold checkpoint pages back at write time, store a page
+        through ``select_reuse_targets`` when L1 is about to evict it, and do
+        not store pages merely because a restore read them.
+
+        Returns:
+            False for the base class.
+        """
+        return False
+
     def select_reuse_targets(
         self,
         keys: list[ObjectKey],

@@ -3,9 +3,12 @@
 
 # Standard
 from pathlib import Path
+import json
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.distributed.admission import AdmissionFailure
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.multiprocess.checkpoint_index import (
     CheckpointIndex,
     CheckpointManifest,
@@ -14,6 +17,7 @@ from lmcache.v1.multiprocess.checkpoint_index import (
 from lmcache.v1.multiprocess.checkpoint_storage import (
     CheckpointPayloadStore,
     CheckpointSlots,
+    checkpoint_object_keys,
     checkpoint_page_groups,
 )
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
@@ -23,6 +27,21 @@ from lmcache.v1.multiprocess.protocols.checkpoint import (
     CheckpointCapabilities,
     CheckpointLeaseResponse,
 )
+
+logger = init_logger(__name__)
+
+# Ancestors examined per supersession, newest first. Older ones were handled
+# by earlier turns or have long left the cache tiers.
+_MAX_SUPERSEDED_ANCESTORS = 32
+
+
+def _payload_keys(manifest: CheckpointManifest) -> list[ObjectKey]:
+    return [
+        key
+        for rank in range(manifest.world_size)
+        for group in checkpoint_object_keys(manifest, rank)
+        for key in group
+    ]
 
 
 def _ready(slots: CheckpointSlots) -> CheckpointLeaseResponse:
@@ -91,6 +110,7 @@ class CheckpointModule:
             (RequestType.CHECKPOINT_POLL_RETRIEVE, self.poll_retrieve),
             (RequestType.CHECKPOINT_FINISH_RETRIEVE, self.finish_retrieve),
             (RequestType.CHECKPOINT_CANCEL_RETRIEVE, self.cancel_retrieve),
+            (RequestType.CHECKPOINT_SUPERSEDE, self.supersede),
         )
         return [
             HandlerSpec(
@@ -123,6 +143,48 @@ class CheckpointModule:
         A candidate is not a cache hit until all payload ranks restore it.
         """
         return self._index.find(prefixes)
+
+    def supersede(self, prefixes: tuple[CheckpointPrefix, ...], generation: str) -> int:
+        """Mark the pages only older checkpoints of a sequence still use.
+
+        Called after ``generation`` is published, with the roots of the token
+        sequence that produced it. Every published shorter checkpoint of that
+        sequence is superseded, except ``instruction`` checkpoints, which
+        other conversations share. Pages the new checkpoint references are
+        current again. Superseded pages are evicted first and are never
+        written to L2 on eviction; their manifests stay listed, so a request
+        that branches from an older turn can still restore it while the
+        pages last.
+
+        Returns:
+            Number of pages newly marked superseded.
+        """
+        current = self._index.get(generation)
+        if current is None or not prefixes:
+            return 0
+        if any(prefix.namespace != current.prefix.namespace for prefix in prefixes):
+            raise ValueError("checkpoint supersession mixes namespaces")
+        retention = self._ctx.storage_manager.checkpoint_retention
+        current_keys = set(_payload_keys(current))
+        retention.mark_current(current_keys)
+        ancestors = [
+            ancestor
+            for ancestor in self._index.ancestors(prefixes, current.prefix.num_tokens)
+            if not retention.is_superseded_generation(ancestor.generation)
+            and json.loads(ancestor.payload).get("kind") != "instruction"
+        ][-_MAX_SUPERSEDED_ANCESTORS:]
+        marked = 0
+        for ancestor in ancestors:
+            unique = [key for key in _payload_keys(ancestor) if key not in current_keys]
+            marked += retention.mark_superseded(ancestor.generation, unique)
+        if ancestors:
+            logger.debug(
+                "Checkpoint of %d tokens superseded %d older checkpoints (%d pages)",
+                current.prefix.num_tokens,
+                len(ancestors),
+                marked,
+            )
+        return marked
 
     def abort(self, generation: str) -> bool:
         """Prevent publication; rank copy leases still require explicit finish."""

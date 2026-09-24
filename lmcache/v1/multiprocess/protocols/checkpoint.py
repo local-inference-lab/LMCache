@@ -56,6 +56,7 @@ REQUEST_NAMES = [
     "CHECKPOINT_POLL_RETRIEVE",
     "CHECKPOINT_FINISH_RETRIEVE",
     "CHECKPOINT_CANCEL_RETRIEVE",
+    "CHECKPOINT_SUPERSEDE",
 ]
 
 
@@ -83,4 +84,9 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         ),
         "CHECKPOINT_FINISH_RETRIEVE": ProtocolDefinition([str], bool, blocking),
         "CHECKPOINT_CANCEL_RETRIEVE": ProtocolDefinition([str], bool, blocking),
+        # Roots of the producing sequence and the new generation; returns the
+        # number of pages newly marked superseded.
+        "CHECKPOINT_SUPERSEDE": ProtocolDefinition(
+            [tuple[CheckpointPrefix, ...], str], int, blocking
+        ),
     }

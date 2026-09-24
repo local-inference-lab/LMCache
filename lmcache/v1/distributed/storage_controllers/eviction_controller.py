@@ -33,6 +33,7 @@ from lmcache.v1.mp_observability.event_bus import get_event_bus
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.distributed.checkpoint_retention import CheckpointRetention
     from lmcache.v1.distributed.quota_manager import QuotaManager
 
 logger = init_logger(__name__)
@@ -99,6 +100,10 @@ class EvictionController(StorageControllerInterface):
         pass
 
 
+# Superseded checkpoint pages dropped per eviction pass, before LRU victims.
+_SUPERSEDED_DROP_BATCH = 4096
+
+
 class L1EvictionController(EvictionController):
     """
     Eviction controller for L1 cache.
@@ -149,6 +154,7 @@ class L1EvictionController(EvictionController):
         self._last_backup_flush = time.monotonic()
         self._backup_flush_cursor = 0
         self._emergency_evict_lock = threading.Lock()
+        self._retention: "CheckpointRetention | None" = None
         if self._write_back_enabled:
             # Register the durable destination even when no adapter is
             # currently compatible. This is the fail-closed invariant: policy
@@ -158,6 +164,59 @@ class L1EvictionController(EvictionController):
             )
         if l2_adapters:
             self.set_l2_adapters(l2_adapters)
+
+    def set_checkpoint_retention(self, retention: "CheckpointRetention") -> None:
+        """Order eviction by checkpoint supersession and write-on-evict state."""
+        self._retention = retention
+
+    def _eligibility_filter(
+        self, to_persist: list[ObjectKey]
+    ) -> Callable[[ObjectKey], bool]:
+        """Return the key filter for one eviction pass.
+
+        With write-on-evict checkpoint storage, a current checkpoint page that
+        is not in L2 yet is skipped and collected in ``to_persist``; the caller
+        requests its L2 write, and a later pass evicts it once stored.
+        """
+        base = (
+            self._is_writeback_evictable
+            if self._write_back_enabled
+            else self._l1_manager.is_key_evictable
+        )
+        retention = self._retention
+        if retention is None or not retention.write_on_evict:
+            return base
+
+        def eligible(key: ObjectKey) -> bool:
+            if not base(key):
+                return False
+            if retention.needs_persist_before_evict(key):
+                to_persist.append(key)
+                return False
+            return True
+
+        return eligible
+
+    def _request_persist(self, to_persist: list[ObjectKey]) -> None:
+        if self._retention is not None and to_persist:
+            self._retention.request_persist(list(dict.fromkeys(to_persist)))
+
+    def _drop_superseded(self) -> int:
+        """Evict superseded checkpoint pages from L1 before any LRU victim."""
+        retention = self._retention
+        if retention is None:
+            return 0
+        victims = [
+            key
+            for key in retention.superseded_keys()
+            if self._l1_manager.is_key_evictable(key)
+        ][:_SUPERSEDED_DROP_BATCH]
+        if not victims:
+            return 0
+        result = self._l1_manager.delete(victims)
+        dropped = sum(1 for error in result.values() if error == L1Error.SUCCESS)
+        retention.record_l1_superseded_drops(dropped)
+        return dropped
 
     def request_immediate_eviction(self) -> None:
         """Wake the eviction loop for a capacity-blocked store."""
@@ -389,16 +448,19 @@ class L1EvictionController(EvictionController):
                 watermark,
                 " immediately" if immediate else "",
             )
+            if self._drop_superseded():
+                used_bytes, total_bytes = self._l1_manager.get_memory_usage()
+                if total_bytes and used_bytes / total_bytes < watermark:
+                    self._publish_triggered(usage, watermark)
+                    continue
+            to_persist: list[ObjectKey] = []
             actions = self._eviction_policy.get_eviction_actions(
                 eviction_ratio,
-                key_eligible_filter=(
-                    self._is_writeback_evictable
-                    if self._write_back_enabled
-                    else self._l1_manager.is_key_evictable
-                ),
+                key_eligible_filter=self._eligibility_filter(to_persist),
             )
             for action in actions:
                 self.execute_eviction_action(action)
+            self._request_persist(to_persist)
             self._publish_triggered(usage, watermark)
 
     def execute_eviction_action(self, action: EvictionAction):
@@ -456,6 +518,10 @@ class L1EvictionController(EvictionController):
             start = time.monotonic()
             initial_free = free
             initial_objects = self._l1_manager.num_objects()
+            to_persist: list[ObjectKey] = []
+            if self._drop_superseded():
+                used, total = self._l1_manager.get_memory_usage()
+                free = max(0, total - used)
             while free < target_free_bytes and time.monotonic() < deadline:
                 num_objects = self._l1_manager.num_objects()
                 if num_objects <= 0:
@@ -483,11 +549,7 @@ class L1EvictionController(EvictionController):
                     )
                 actions = self._eviction_policy.get_eviction_actions(
                     min(1.0, need_keys / max(1, tracked)),
-                    key_eligible_filter=(
-                        self._is_writeback_evictable
-                        if self._write_back_enabled
-                        else self._l1_manager.is_key_evictable
-                    ),
+                    key_eligible_filter=self._eligibility_filter(to_persist),
                     cache_salt=cache_salt,
                 )
                 if not actions:
@@ -514,6 +576,7 @@ class L1EvictionController(EvictionController):
                 if free <= free_before_pass:
                     break
 
+            self._request_persist(to_persist)
             evicted_keys = max(0, initial_objects - self._l1_manager.num_objects())
 
             logger.info(
@@ -792,6 +855,7 @@ class L2EvictionController(StorageControllerInterface):
     ):
         self._adapter_states = l2_adapter_states
         self._quota_manager = quota_manager
+        self._retention: "CheckpointRetention | None" = None
         # Guards _adapter_states against concurrent runtime add/remove.
         self._states_lock = threading.Lock()
         self._stop_flag = threading.Event()
@@ -807,6 +871,34 @@ class L2EvictionController(StorageControllerInterface):
     def stop(self):
         self._stop_flag.set()
         self._thread.join()
+
+    def set_checkpoint_retention(self, retention: "CheckpointRetention") -> None:
+        """Evict superseded checkpoint pages before LRU victims."""
+        self._retention = retention
+
+    def _evict_superseded(self, state: L2AdapterEvictionState) -> bool:
+        """Delete superseded checkpoint pages first; return True if any went."""
+        retention = self._retention
+        if retention is None:
+            return False
+        usage = state.adapter.get_usage()
+        budget = int(usage.total_bytes_used * state.eviction_config.eviction_ratio)
+        victims, size = retention.superseded_in_adapter(
+            state.adapter_id, max(1, budget)
+        )
+        if not victims:
+            return False
+        self._execute_eviction_action(
+            state.adapter,
+            EvictionAction(keys=victims, destination=EvictionDestination.DISCARD),
+        )
+        retention.record_l2_superseded_evictions(len(victims), size)
+        logger.info(
+            "L2 eviction removed %d superseded checkpoint pages (%.1f MB) first",
+            len(victims),
+            size / 1e6,
+        )
+        return True
 
     def add_adapter_state(self, state: L2AdapterEvictionState) -> None:
         """Register a new adapter's eviction state at runtime."""
@@ -894,6 +986,10 @@ class L2EvictionController(StorageControllerInterface):
             current_usage,
             watermark,
         )
+        if self._evict_superseded(state):
+            current_usage = state.adapter.get_usage().usage_fraction
+            if current_usage < watermark:
+                return
         actions = state.eviction_policy.get_eviction_actions(eviction_ratio)
         for action in actions:
             self._execute_eviction_action(state.adapter, action)

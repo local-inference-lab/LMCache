@@ -502,6 +502,14 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
                         assert mapping[offset : offset + size] == pattern
 
         worker = CheckpointTransferWorker(client, copy_pages)
+        supersessions: list[list[Any]] = []
+        submit_request = client.submit_request
+
+        def record(kind: RequestType, args: list[Any]) -> Any:
+            if kind == RequestType.CHECKPOINT_SUPERSEDE:
+                supersessions.append(args)
+            return submit_request(kind, args)
+
         try:
             for rank in range(4):
                 future = worker.submit(
@@ -513,9 +521,19 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
                     )
                 )
                 assert future is not None and future.result(timeout=5)
-                bridge.complete({store_task.task_id: {rank: True}})
+                with monkeypatch.context() as patch:
+                    patch.setattr(client, "submit_request", record)
+                    bridge.complete({store_task.task_id: {rank: True}})
                 assert manager.reset_prefix_cache() == (rank == 3)
             assert not bridge.has_pending
+            # Publication reports the producing sequence so older checkpoints
+            # of it are superseded; this first checkpoint has none.
+            assert len(supersessions) == 1
+            roots, generation = supersessions[0]
+            assert generation == store_task.manifest.generation
+            prefix = store_task.manifest.prefix
+            assert roots and all(root.namespace == prefix.namespace for root in roots)
+            assert sum(len(root.tail_tokens) for root in roots) >= prefix.num_tokens
             consumer = make_request("consumer")
             if outcome == "capacity-retry":
                 # Ordinary admission may also fail while another request owns

@@ -103,6 +103,7 @@ class RequestType(enum.Enum):
     CHECKPOINT_POLL_RETRIEVE = enum.auto()
     CHECKPOINT_FINISH_RETRIEVE = enum.auto()
     CHECKPOINT_CANCEL_RETRIEVE = enum.auto()
+    CHECKPOINT_SUPERSEDE = enum.auto()
 
 
 @dataclass

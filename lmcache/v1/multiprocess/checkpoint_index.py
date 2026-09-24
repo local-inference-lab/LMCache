@@ -316,6 +316,68 @@ class CheckpointIndex:
                     )
             return best
 
+    def get(self, generation: str) -> CheckpointManifest | None:
+        """Return one published manifest by generation, without touching LRU."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT namespace,start_tokens,prefix_hash,tail,world_size,payload "
+                "FROM checkpoints WHERE generation=?",
+                (generation,),
+            ).fetchone()
+        if row is None:
+            return None
+        namespace, start_tokens, prefix_hash, tail_blob, world_size, payload = row
+        prefix = CheckpointPrefix(
+            namespace, start_tokens, prefix_hash, tuple(json.loads(tail_blob))
+        )
+        return CheckpointManifest(generation, prefix, world_size, payload)
+
+    def ancestors(
+        self, prefixes: tuple[CheckpointPrefix, ...], below_tokens: int
+    ) -> list[CheckpointManifest]:
+        """Return every published manifest that is a proper prefix of a sequence.
+
+        Args:
+            prefixes: The sequence's hash-block roots, as for :meth:`find`.
+            below_tokens: Only manifests shorter than this are returned.
+
+        Returns:
+            Matching manifests, shortest first. Access order is unchanged.
+
+        Raises:
+            ValueError: If the query mixes isolation namespaces.
+        """
+        if len({prefix.namespace for prefix in prefixes}) > 1:
+            raise ValueError("checkpoint lookup cannot mix namespaces")
+        found: list[CheckpointManifest] = []
+        with self._lock:
+            for query in prefixes:
+                if query.start_tokens >= below_tokens:
+                    continue
+                rows = self._db.execute(
+                    "SELECT tail,generation,world_size,payload FROM checkpoints "
+                    "WHERE namespace=? AND start_tokens=? AND prefix_hash=? "
+                    "AND num_tokens<? AND num_tokens<=?",
+                    (
+                        query.namespace,
+                        query.start_tokens,
+                        query.prefix_hash,
+                        below_tokens,
+                        query.num_tokens,
+                    ),
+                )
+                for tail_blob, generation, world_size, payload in rows:
+                    tail = tuple(json.loads(tail_blob))
+                    if query.tail_tokens[: len(tail)] != tail:
+                        continue
+                    prefix = CheckpointPrefix(
+                        query.namespace, query.start_tokens, query.prefix_hash, tail
+                    )
+                    found.append(
+                        CheckpointManifest(generation, prefix, world_size, payload)
+                    )
+        return sorted(found, key=lambda manifest: manifest.prefix.num_tokens)
+
     def abort(self, generation: str) -> None:
         """Discard an unpublished generation after its payload writers drain.
 
