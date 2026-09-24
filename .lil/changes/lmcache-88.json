@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-88",
+  "category": "fix",
+  "summary": "A failed disk-to-RAM prefetch no longer leaves unloaded data readable",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Buffers whose L2 load failed are discarded without ever becoming readable, so a concurrent reader cannot keep them as valid cache entries."
+  ],
+  "pull_requests": [
+    88
+  ]
+}
