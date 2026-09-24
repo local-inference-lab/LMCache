@@ -995,6 +995,20 @@ class StorageManager:
         """
         self._l1_manager.touch_keys(keys)
 
+    def touch_keys(self, keys: list[ObjectKey]) -> None:
+        """Refresh keys in L1 and L2 eviction order without reading them.
+
+        Use this when a lookup proves data is still wanted but no tier is
+        read, for example because the engine already holds it. Each tier
+        ignores keys it does not hold. No access event is published and
+        store admission is unchanged.
+
+        Args:
+            keys: Keys to move to the most recently used position.
+        """
+        self._eviction_controller.touch_keys(keys)
+        self._l2_eviction_controller.touch_keys(keys)
+
     def delete_l1_keys(
         self, keys: list[ObjectKey], force: bool = False
     ) -> tuple[int, int]:
