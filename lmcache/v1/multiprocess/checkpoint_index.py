@@ -14,15 +14,51 @@ import json
 import sqlite3
 import threading
 
-# Stored tails are JSON token arrays. A stored tail is a token prefix of the
-# :tail query exactly when the query repeats it without the closing bracket
-# and continues with "," or "]". Matching in SQLite keeps lookups independent
-# of Python decoding, which matters because every checkpoint shorter than one
-# hash block shares a lookup bucket.
+# Every checkpoint that ends inside the same hash block shares one lookup
+# bucket, so a lookup must not scan the bucket. Each published tail also gets
+# a polynomial hash in checkpoint_tails; a query hashes each of its own
+# prefixes and probes only those. The hash only selects candidates.
+_TAIL_HASH_BASE = 1_000_003
+_TAIL_HASH_MODULUS = (1 << 61) - 1
+
+# Stored tails are JSON token arrays. A candidate's tail is a token prefix of
+# the :tail query exactly when the query repeats it without the closing
+# bracket and continues with "," or "]". This confirms every hash candidate.
 _TAIL_IS_PREFIX_OF_QUERY = (
-    "substr(:tail, 1, length(tail) - 1) = substr(tail, 1, length(tail) - 1) "
-    "AND substr(:tail, length(tail), 1) IN (x'2c', x'5d')"
+    "substr(:tail, 1, length(c.tail) - 1) = substr(c.tail, 1, length(c.tail) - 1) "
+    "AND substr(:tail, length(c.tail), 1) IN (x'2c', x'5d')"
 )
+
+# Published candidates whose tail hash equals one of the query's prefix hashes.
+_CANDIDATES = (
+    "SELECT c.tail,c.generation,c.world_size,c.payload FROM checkpoint_tails t "
+    "JOIN checkpoints c ON c.generation=t.generation "
+    "WHERE t.namespace=:namespace AND t.start_tokens=:start "
+    "AND t.prefix_hash=:prefix_hash "
+    "AND t.tail_hash IN (SELECT value FROM json_each(:prefix_hashes)) "
+    f"AND c.num_tokens<=:num_tokens AND {_TAIL_IS_PREFIX_OF_QUERY}"
+)
+
+
+def _prefix_hashes(tokens: tuple[int, ...]) -> list[int]:
+    """Return the tail hash of every nonempty prefix of ``tokens``."""
+    hashes = []
+    value = 0
+    for token in tokens:
+        value = (value * _TAIL_HASH_BASE + token + 1) % _TAIL_HASH_MODULUS
+        hashes.append(value)
+    return hashes
+
+
+def _query_parameters(query: "CheckpointPrefix") -> dict[str, object]:
+    return {
+        "namespace": query.namespace,
+        "start": query.start_tokens,
+        "prefix_hash": query.prefix_hash,
+        "num_tokens": query.num_tokens,
+        "tail": json.dumps(query.tail_tokens).encode(),
+        "prefix_hashes": json.dumps(_prefix_hashes(query.tail_tokens)),
+    }
 
 
 @dataclass(frozen=True)
@@ -155,6 +191,36 @@ class CheckpointIndex:
                 "CREATE INDEX IF NOT EXISTS checkpoints_access_order "
                 "ON checkpoints(access_order)"
             )
+            # A separate table keeps the checkpoints schema readable and
+            # writable by older builds. Rows they add or replace are
+            # reconciled here on the next open; lookups join on generation,
+            # so a stale row never matches.
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS checkpoint_tails ("
+                "generation TEXT PRIMARY KEY, namespace TEXT NOT NULL, "
+                "start_tokens INTEGER NOT NULL, prefix_hash BLOB NOT NULL, "
+                "tail_hash INTEGER NOT NULL)"
+            )
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS checkpoint_tails_lookup ON "
+                "checkpoint_tails(namespace, start_tokens, prefix_hash, tail_hash)"
+            )
+            self._db.execute(
+                "DELETE FROM checkpoint_tails WHERE generation NOT IN "
+                "(SELECT generation FROM checkpoints)"
+            )
+            missing = self._db.execute(
+                "SELECT generation,namespace,start_tokens,prefix_hash,tail "
+                "FROM checkpoints WHERE generation NOT IN "
+                "(SELECT generation FROM checkpoint_tails)"
+            ).fetchall()
+            self._db.executemany(
+                "INSERT INTO checkpoint_tails VALUES (?,?,?,?,?)",
+                (
+                    (*row[:4], _prefix_hashes(tuple(json.loads(row[4])))[-1])
+                    for row in missing
+                ),
+            )
             self._db.execute("PRAGMA user_version=1")
         self._access_order = self._db.execute(
             "SELECT COALESCE(MAX(access_order), 0) FROM checkpoints"
@@ -233,14 +299,22 @@ class CheckpointIndex:
                 return False
             prefix = manifest.prefix
             self._access_order += 1
+            tail = json.dumps(prefix.tail_tokens).encode()
             with self._db:
+                # The generation replaced for this exact prefix, if any.
+                self._db.execute(
+                    "DELETE FROM checkpoint_tails WHERE generation IN ("
+                    "SELECT generation FROM checkpoints WHERE namespace=? "
+                    "AND start_tokens=? AND prefix_hash=? AND tail=?)",
+                    (prefix.namespace, prefix.start_tokens, prefix.prefix_hash, tail),
+                )
                 self._db.execute(
                     "INSERT OR REPLACE INTO checkpoints VALUES (?,?,?,?,?,?,?,?,?)",
                     (
                         prefix.namespace,
                         prefix.start_tokens,
                         prefix.prefix_hash,
-                        json.dumps(prefix.tail_tokens).encode(),
+                        tail,
                         prefix.num_tokens,
                         generation,
                         manifest.world_size,
@@ -249,11 +323,22 @@ class CheckpointIndex:
                     ),
                 )
                 self._db.execute(
-                    "DELETE FROM checkpoints WHERE generation IN ("
-                    "SELECT generation FROM checkpoints ORDER BY access_order DESC "
-                    "LIMIT -1 OFFSET ?)",
-                    (self._max_entries,),
+                    "INSERT OR REPLACE INTO checkpoint_tails VALUES (?,?,?,?,?)",
+                    (
+                        generation,
+                        prefix.namespace,
+                        prefix.start_tokens,
+                        prefix.prefix_hash,
+                        _prefix_hashes(prefix.tail_tokens)[-1],
+                    ),
                 )
+                for table in ("checkpoint_tails", "checkpoints"):
+                    self._db.execute(
+                        f"DELETE FROM {table} WHERE generation IN ("
+                        "SELECT generation FROM checkpoints "
+                        "ORDER BY access_order DESC LIMIT -1 OFFSET ?)",
+                        (self._max_entries,),
+                    )
             del self._pending[generation]
             return True
 
@@ -301,18 +386,8 @@ class CheckpointIndex:
                 if best is not None and query.num_tokens <= best.prefix.num_tokens:
                     break
                 row = self._db.execute(
-                    "SELECT tail,generation,world_size,payload FROM checkpoints "
-                    "WHERE namespace=:namespace AND start_tokens=:start "
-                    "AND prefix_hash=:prefix_hash AND num_tokens<=:num_tokens "
-                    f"AND {_TAIL_IS_PREFIX_OF_QUERY} "
-                    "ORDER BY num_tokens DESC LIMIT 1",
-                    {
-                        "namespace": query.namespace,
-                        "start": query.start_tokens,
-                        "prefix_hash": query.prefix_hash,
-                        "num_tokens": query.num_tokens,
-                        "tail": json.dumps(query.tail_tokens).encode(),
-                    },
+                    f"{_CANDIDATES} ORDER BY c.num_tokens DESC LIMIT 1",
+                    _query_parameters(query),
                 ).fetchone()
                 if row is None:
                     continue
@@ -373,18 +448,8 @@ class CheckpointIndex:
                 if query.start_tokens >= below_tokens:
                     continue
                 rows = self._db.execute(
-                    "SELECT tail,generation,world_size,payload FROM checkpoints "
-                    "WHERE namespace=:namespace AND start_tokens=:start "
-                    "AND prefix_hash=:prefix_hash AND num_tokens<:below "
-                    f"AND num_tokens<=:num_tokens AND {_TAIL_IS_PREFIX_OF_QUERY}",
-                    {
-                        "namespace": query.namespace,
-                        "start": query.start_tokens,
-                        "prefix_hash": query.prefix_hash,
-                        "below": below_tokens,
-                        "num_tokens": query.num_tokens,
-                        "tail": json.dumps(query.tail_tokens).encode(),
-                    },
+                    f"{_CANDIDATES} AND c.num_tokens<:below",
+                    {**_query_parameters(query), "below": below_tokens},
                 )
                 for tail_blob, generation, world_size, payload in rows:
                     prefix = CheckpointPrefix(
@@ -415,9 +480,10 @@ class CheckpointIndex:
                 Invalidating a replaced generation cannot remove its replacement.
         """
         with self._lock, self._db:
-            self._db.execute(
-                "DELETE FROM checkpoints WHERE generation=?", (generation,)
-            )
+            for table in ("checkpoint_tails", "checkpoints"):
+                self._db.execute(
+                    f"DELETE FROM {table} WHERE generation=?", (generation,)
+                )
 
     def report_status(self) -> dict[str, int]:
         """Return directory counts without asserting that payload pages are resident.

@@ -11,6 +11,7 @@ import sqlite3
 import pytest
 
 # First Party
+from lmcache.v1.multiprocess import checkpoint_index
 from lmcache.v1.multiprocess.checkpoint_index import (
     CheckpointIndex,
     CheckpointManifest,
@@ -259,6 +260,41 @@ def test_capacity_keeps_recently_found_entries(tmp_path: Path) -> None:
     assert index.find((entries[0].prefix,)) == entries[0]
     assert index.find((entries[1].prefix,)) is None
     assert index.report_status()["published_generations"] == 3
+    assert tail_rows(index) == {"producer-0", "producer-2", "producer-3"}
+    index.close()
+
+
+def tail_rows(index: CheckpointIndex) -> set[str]:
+    rows = index._db.execute("SELECT generation FROM checkpoint_tails")
+    return {generation for (generation,) in rows}
+
+
+def test_replaced_and_invalidated_generations_leave_no_lookup_rows() -> None:
+    index = CheckpointIndex()
+    first, second = manifest("producer-a"), manifest("producer-b")
+    publish(index, first)
+    publish(index, second)  # same exact prefix: replaces the first generation
+    assert index.find((first.prefix,)) == second
+    assert tail_rows(index) == {"producer-b"}
+    index.invalidate(second.generation)
+    assert index.find((first.prefix,)) is None
+    assert tail_rows(index) == set()
+    index.close()
+
+
+def test_hash_candidates_are_confirmed_against_the_stored_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every tail hashes alike, so lookups rely on the exact tail comparison.
+    monkeypatch.setattr(
+        checkpoint_index, "_prefix_hashes", lambda tokens: [7] * len(tokens)
+    )
+    index = CheckpointIndex()
+    kept = manifest("kept", (1, 2))
+    for entry in (kept, manifest("decoy-a", (1, 20)), manifest("decoy-b", (12,))):
+        publish(index, entry)
+    assert index.find((replace(kept.prefix, tail_tokens=(1, 2, 3)),)) == kept
+    assert index.find((replace(kept.prefix, tail_tokens=(1, 3)),)) is None
     index.close()
 
 
@@ -268,11 +304,21 @@ def test_existing_directory_gains_recency_index(tmp_path: Path) -> None:
     entry = manifest()
     publish(index, entry)
     index.close()
+    # As written by an older build: no recency index and no tail lookup table,
+    # plus a lookup row whose manifest no longer exists.
     with sqlite3.connect(path) as db:
         db.execute("DROP INDEX checkpoints_access_order")
+        db.execute("DROP TABLE checkpoint_tails")
+        db.execute(
+            "CREATE TABLE checkpoint_tails (generation TEXT PRIMARY KEY, "
+            "namespace TEXT NOT NULL, start_tokens INTEGER NOT NULL, "
+            "prefix_hash BLOB NOT NULL, tail_hash INTEGER NOT NULL)"
+        )
+        db.execute("INSERT INTO checkpoint_tails VALUES ('gone', 'ns', 0, x'', 1)")
     reopened = CheckpointIndex(path)
     assert reopened.find((entry.prefix,)) == entry
+    assert tail_rows(reopened) == {entry.generation}
     reopened.close()
     with sqlite3.connect(path) as db:
         names = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
-    assert "checkpoints_access_order" in names
+    assert {"checkpoints_access_order", "checkpoint_tails_lookup"} <= names

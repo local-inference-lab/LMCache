@@ -10,7 +10,7 @@
   "compatibility": "No user action required.",
   "details": [
     "The checkpoint directory keeps 65536 manifests instead of 8192; --checkpoint-index-max-entries changes it.",
-    "Checkpoint lookups match inside SQLite, so a larger directory does not slow them down."
+    "Checkpoint lookups use an index, so a larger directory does not slow them down. The first start on an existing directory builds that index once (about 3 s for 8192 manifests)."
   ],
   "pull_requests": [
     86
