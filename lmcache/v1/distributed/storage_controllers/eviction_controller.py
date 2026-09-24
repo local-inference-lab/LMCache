@@ -414,6 +414,7 @@ class L1EvictionController(EvictionController):
             self._immediate_request.clear()
             if self._stop_flag.is_set():
                 break
+            self._l1_manager.reclaim_abandoned_writes()
             used_bytes, total_bytes = self._l1_manager.get_memory_usage()
             if self._eviction_config.extra_logging_enabled:
                 self._maybe_log_memory_usage(used_bytes, total_bytes)

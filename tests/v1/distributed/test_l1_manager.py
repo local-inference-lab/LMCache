@@ -43,6 +43,7 @@ interface docstrings. The tests focus on:
 
 # Standard
 import threading
+import time
 
 # Third Party
 import pytest
@@ -1079,6 +1080,78 @@ class TestAbortWrite:
         assert wait_result is AdmissionWaitResult.SHUTDOWN
         assert observed == generation
         manager.close()
+
+
+# =============================================================================
+# Tests for writes whose writer never finished
+# =============================================================================
+
+
+@pytest.fixture
+def expiring_l1_config(basic_memory_config):
+    """An L1ManagerConfig whose write locks expire after one second."""
+    return L1ManagerConfig(
+        memory_config=basic_memory_config,
+        write_ttl_seconds=1,
+        read_ttl_seconds=300,
+    )
+
+
+class TestAbandonedWrites:
+    """A write lock that expires must never publish an unfinished write."""
+
+    def test_expired_new_write_is_never_readable(
+        self, expiring_l1_config, basic_layout
+    ):
+        l1_manager = L1Manager(expiring_l1_config)
+        key = make_object_key(1)
+        l1_manager.reserve_write([key], [False], basic_layout, mode="new")
+        time.sleep(1.1)
+        error, obj = l1_manager.reserve_read([key])[key]
+        assert error == L1Error.KEY_NOT_READABLE
+        assert obj is None
+        assert l1_manager.reclaim_abandoned_writes() == 1
+        assert l1_manager.get_object_state(key) is None
+        assert l1_manager.get_memory_usage()[0] == 0
+        error, obj = l1_manager.reserve_write([key], [False], basic_layout, "new")[key]
+        assert error == L1Error.SUCCESS
+        l1_manager.close()
+
+    def test_expired_update_is_not_readable(self, expiring_l1_config, basic_layout):
+        l1_manager = L1Manager(expiring_l1_config)
+        key = make_object_key(1)
+        l1_manager.reserve_write([key], [False], basic_layout, mode="new")
+        assert l1_manager.finish_write([key])[key] == L1Error.SUCCESS
+        l1_manager.reserve_write([key], [False], basic_layout, mode="update")
+        time.sleep(1.1)
+        assert l1_manager.reserve_read([key])[key][0] == L1Error.KEY_NOT_READABLE
+        assert l1_manager.reclaim_abandoned_writes() == 1
+        assert l1_manager.get_object_state(key) is None
+        l1_manager.close()
+
+    def test_late_finish_write_does_not_publish(self, expiring_l1_config, basic_layout):
+        l1_manager = L1Manager(expiring_l1_config)
+        key = make_object_key(1)
+        l1_manager.reserve_write([key], [False], basic_layout, mode="new")
+        time.sleep(1.1)
+        assert l1_manager.finish_write([key])[key] == L1Error.KEY_IN_WRONG_STATE
+        assert l1_manager.reserve_read([key])[key][0] == L1Error.KEY_NOT_READABLE
+        l1_manager.close()
+
+    def test_finished_and_in_flight_writes_are_kept(
+        self, expiring_l1_config, basic_layout
+    ):
+        l1_manager = L1Manager(expiring_l1_config)
+        finished, in_flight = make_object_key(1), make_object_key(2)
+        l1_manager.reserve_write([finished], [False], basic_layout, mode="new")
+        l1_manager.finish_write([finished])
+        time.sleep(1.1)
+        l1_manager.reserve_write([in_flight], [False], basic_layout, mode="new")
+        assert l1_manager.reclaim_abandoned_writes() == 0
+        assert l1_manager.reserve_read([finished])[finished][0] == L1Error.SUCCESS
+        l1_manager.finish_read([finished])
+        assert l1_manager.finish_write([in_flight])[in_flight] == L1Error.SUCCESS
+        l1_manager.close()
 
 
 # =============================================================================

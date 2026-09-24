@@ -52,13 +52,18 @@ class L1ObjectState:
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
 
+    committed: bool = False
+    """ Whether the last write finished. An expired write lock releases the
+    object but never makes an unfinished write readable. """
+
     def available_for_read(self) -> bool:
         """Check if the object is available for read.
 
         Returns:
-            True if the object is not write-locked, False otherwise.
+            True if the last write finished and the object is not
+            write-locked, False otherwise.
         """
-        return not self.write_lock.is_locked()
+        return self.committed and not self.write_lock.is_locked()
 
     def available_for_write(self) -> bool:
         """Check if the object is available for write.
@@ -213,6 +218,9 @@ class L1Manager:
         )
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds
+        # Keys whose current write has not finished; reclaimed once the
+        # writer's lock expires. Bounded by in-flight writes.
+        self._uncommitted: set[ObjectKey] = set()
 
         self._registered_listeners: list[L1ManagerListener] = []
 
@@ -416,6 +424,7 @@ class L1Manager:
                 need_to_free.append(entry.memory_obj)
                 need_to_free_keys.append(key)
                 del self._objects[key]
+                self._uncommitted.discard(key)
 
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
@@ -493,6 +502,8 @@ class L1Manager:
                 continue
 
             entry.write_lock.lock()
+            entry.committed = False
+            self._uncommitted.add(key)
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
             successful_keys.append(key)
 
@@ -549,6 +560,7 @@ class L1Manager:
                     is_temporary=is_temp,
                 )
                 self._objects[key].write_lock.lock()
+                self._uncommitted.add(key)
                 ret[key] = (L1Error.SUCCESS, mem_obj)
                 successful_keys.append(key)
 
@@ -646,6 +658,8 @@ class L1Manager:
                 continue
 
             entry.write_lock.unlock()
+            entry.committed = True
+            self._uncommitted.discard(key)
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
             successful_keys_meta.append(self._object_meta(entry.memory_obj))
@@ -683,6 +697,7 @@ class L1Manager:
             aborted_keys.append(key)
             aborted_objs.append(entry.memory_obj)
             del self._objects[key]
+            self._uncommitted.discard(key)
             ret[key] = L1Error.SUCCESS
 
         aborted_meta = [self._object_meta(obj) for obj in aborted_objs]
@@ -756,6 +771,8 @@ class L1Manager:
                 continue
 
             entry.write_lock.unlock()
+            entry.committed = True
+            self._uncommitted.discard(key)
             for _ in range(total):
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
@@ -811,6 +828,7 @@ class L1Manager:
 
             need_to_free.append(entry.memory_obj)
             del self._objects[key]
+            self._uncommitted.discard(key)
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
 
@@ -828,6 +846,53 @@ class L1Manager:
             )
         )
         return ret
+
+    @l1_mgr_synchronized
+    def reclaim_abandoned_writes(self) -> int:
+        """Free objects whose writer never finished before its lock expired.
+
+        A writer that dies between ``reserve_write`` and ``finish_write``
+        leaves an object that is neither readable nor tracked by the
+        eviction policy, so nothing else would free it.
+
+        Returns:
+            The number of objects freed.
+        """
+        freed_keys: list[ObjectKey] = []
+        freed_objs: list[MemoryObj] = []
+        for key in list(self._uncommitted):
+            entry = self._objects.get(key)
+            if entry is not None and (
+                entry.write_lock.is_locked() or entry.read_lock.is_locked()
+            ):
+                continue
+            self._uncommitted.discard(key)
+            if entry is None:
+                continue
+            del self._objects[key]
+            freed_keys.append(key)
+            freed_objs.append(entry.memory_obj)
+        if not freed_objs:
+            return 0
+
+        freed_meta = [self._object_meta(obj) for obj in freed_objs]
+        self._memory_manager.free(freed_objs)
+        self._notify_capacity_change()
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_deleted_by_manager(freed_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_KEYS_EVICTED,
+                metadata={"keys": freed_keys, "meta": freed_meta},
+            )
+        )
+        logger.warning(
+            "L1Manager: freed %d objects whose write did not finish within "
+            "the %d s write lock",
+            len(freed_keys),
+            self._write_ttl_seconds,
+        )
+        return len(freed_keys)
 
     def touch_keys(self, keys: list[ObjectKey]):
         """Touch the given keys, marking the keys as accessed(retrieved or stored).
@@ -867,6 +932,7 @@ class L1Manager:
             all_meta = [self._object_meta(obj) for obj in all_memory_objs]
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
+            self._uncommitted.clear()
             if all_memory_objs:
                 self._notify_capacity_change()
             for listener in self._registered_listeners:
@@ -896,6 +962,7 @@ class L1Manager:
 
         for key in keys_to_clear:
             del self._objects[key]
+            self._uncommitted.discard(key)
 
         cleared_meta = [self._object_meta(obj) for obj in objs_to_free]
         self._memory_manager.free(objs_to_free)
@@ -1034,6 +1101,7 @@ class L1Manager:
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
+            self._uncommitted.clear()
             if all_memory_objs:
                 self._notify_capacity_change()
 
