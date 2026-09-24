@@ -169,6 +169,16 @@ class L1EvictionController(EvictionController):
         """Order eviction by checkpoint supersession and write-on-evict state."""
         self._retention = retention
 
+    def touch_keys(self, keys: list[ObjectKey]) -> None:
+        """Move keys to the most recently used position without an L1 read.
+
+        Keys that L1 does not hold are ignored.
+
+        Args:
+            keys: Keys a lookup proved are still wanted.
+        """
+        self._listener.on_l1_keys_accessed(keys)
+
     def _eligibility_filter(
         self, to_persist: list[ObjectKey]
     ) -> Callable[[ObjectKey], bool]:
@@ -899,6 +909,23 @@ class L2EvictionController(StorageControllerInterface):
             size / 1e6,
         )
         return True
+
+    def touch_keys(self, keys: list[ObjectKey]) -> None:
+        """Move keys to the most recently used position in every adapter.
+
+        Only eviction order changes. An adapter ignores keys it does not
+        hold, and store admission is not told that the keys are in L2.
+
+        Args:
+            keys: Keys a lookup proved are still wanted.
+        """
+        if not keys:
+            return
+        # The eviction loop holds _states_lock for a whole pass, so read the
+        # list without it. Removal replaces the list; touching a removed
+        # adapter's policy only reorders memory that is about to be dropped.
+        for state in list(self._adapter_states):
+            state.listener.on_l2_keys_accessed(keys)
 
     def add_adapter_state(self, state: L2AdapterEvictionState) -> None:
         """Register a new adapter's eviction state at runtime."""

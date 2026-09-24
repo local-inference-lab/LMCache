@@ -156,8 +156,21 @@ class CheckpointModule:
         """Return the longest complete candidate for authenticated prefix roots.
 
         A candidate is not a cache hit until all payload ranks restore it.
+        Every rank's payload pages are refreshed in L1 and L2 eviction order:
+        a resumed conversation is often served from the engine's own cache,
+        so its pages are neither read nor rewritten, and its oldest pages,
+        which every later checkpoint of the conversation needs, would
+        otherwise keep the recency of their first write.
         """
-        return self._index.find(prefixes)
+        manifest = self._index.find(prefixes)
+        if manifest is not None:
+            try:
+                keys = _payload_keys(manifest)
+            except ValueError:
+                # Retrieval rejects the same manifest and invalidates it.
+                return manifest
+            self._ctx.storage_manager.touch_keys(keys)
+        return manifest
 
     def supersede(
         self, prefixes: tuple[CheckpointPrefix, ...], generation: str, request: str
