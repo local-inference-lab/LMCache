@@ -10,9 +10,24 @@ import uuid
 import pytest
 
 # First Party
+from lmcache.v1.multiprocess.protocols.checkpoint import (
+    CheckpointCapabilities,
+    CheckpointLeaseResponse,
+)
 from lmcache.v1.multiprocess.transfer_context.shm import ShmPoolMapping
 
 SIZE = 64 * 1024
+
+
+def first_bytes(mapping: ShmPoolMapping, name: str) -> bytes:
+    """Read the pool's first four bytes through a checkpoint lease view."""
+    (view,) = mapping.checkpoint_slot_views(
+        CheckpointCapabilities(format_version=1, shm_name=name, pool_size=SIZE),
+        CheckpointLeaseResponse("ready", "lease", (((0, 4),),)),
+        ((4,),),
+    )[0]
+    assert view is not None
+    return bytes(view.cpu().numpy())
 
 
 @pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="requires POSIX /dev/shm")
@@ -24,6 +39,7 @@ def test_mapping_detects_a_recreated_pool_and_remaps() -> None:
         mapping = ShmPoolMapping(name, SIZE)
         try:
             assert mapping.is_current()
+            assert first_bytes(mapping, name) == b"old!"
             # A restarted server unlinks the pool and creates it again.
             server.close()
             server.unlink()
@@ -32,8 +48,7 @@ def test_mapping_detects_a_recreated_pool_and_remaps() -> None:
             assert not mapping.is_current()
             mapping.remap()
             assert mapping.is_current()
-            assert mapping._shm_buffer is not None
-            assert bytes(mapping._shm_buffer[:4]) == b"new!"
+            assert first_bytes(mapping, name) == b"new!"
         finally:
             mapping.close()
     finally:
