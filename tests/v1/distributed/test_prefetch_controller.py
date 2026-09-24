@@ -424,6 +424,51 @@ class TestSingleAdapterPrefetch:
             for message in warning_messages
         )
 
+    def test_failed_load_buffer_never_becomes_readable(self, l1_manager, monkeypatch):
+        """A failed L2 load must not publish its unloaded L1 buffer.
+
+        A reader that locks the key right after the prefetch marks it written
+        (the store controller, or another engine's lookup) would otherwise
+        keep the unloaded buffer resident as a readable object.
+        """
+        layout = make_layout()
+        keys = [make_object_key(40 + i) for i in range(5)]
+        inner = make_adapter()
+        store_keys_in_l2(inner, keys, layout)
+        fault = FaultInjectL2Adapter(inner, rate=0.0, seed=0, gap_indices=(2,))
+        finish_write = l1_manager.finish_write
+        raced: list[ObjectKey] = []
+
+        def finish_write_then_read(write_keys):
+            result = finish_write(write_keys)
+            if keys[2] in write_keys:
+                l1_manager.reserve_read([keys[2]])
+                raced.append(keys[2])
+            return result
+
+        monkeypatch.setattr(l1_manager, "finish_write", finish_write_then_read)
+        ctrl = PrefetchController(
+            l1_manager=l1_manager,
+            l2_adapters=[fault],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultPrefetchPolicy(),
+        )
+        ctrl.start()
+        try:
+            req_id = ctrl.submit_prefetch_request(
+                PrefetchRequestSpec(keys, {0: layout}, policy=TrimPolicy.PREFIX)
+            )
+            retained = wait_for_prefetch_result_bitmap(ctrl, req_id)
+            assert retained is not None
+            assert retained.get_indices_list() == [0, 1]
+            assert l1_manager.get_object_state(keys[2]) is None
+            l1_manager.finish_read(keys[:2])
+        finally:
+            if raced:
+                l1_manager.finish_read(raced)
+            ctrl.stop()
+            fault.close()
+
     def test_key0_missing(self, l1_manager):
         """L2 has keys {1,2,3} but not 0 → prefix = 0, nothing loaded."""
         adapter = make_adapter()

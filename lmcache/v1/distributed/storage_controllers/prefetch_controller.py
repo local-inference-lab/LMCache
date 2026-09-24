@@ -1489,8 +1489,7 @@ class PrefetchController(StorageControllerInterface):
 
         # Clean up failed keys
         if failed_keys:
-            l1_mgr.finish_write(failed_keys)
-            l1_mgr.delete(failed_keys)
+            self._discard_unloaded_buffers(failed_keys)
 
         self._event_bus.publish(
             Event(
@@ -1617,14 +1616,31 @@ class PrefetchController(StorageControllerInterface):
             result.popcount(),
         )
 
+    def _discard_unloaded_buffers(self, keys: list[ObjectKey]) -> None:
+        """Drop write reservations whose bytes were never loaded from L2.
+
+        ``abort_write`` removes them without ever making them readable.
+        Finishing the write before deleting would briefly publish the
+        buffer, and a reader that locked it in between (the store
+        controller or another engine's lookup) would keep bytes of some
+        earlier object resident as a valid entry. A reservation whose write
+        lock already expired can no longer be aborted and is deleted unless
+        a reader holds it.
+        """
+        results = self._l1_manager.abort_write(keys)
+        expired = [
+            key for key, error in results.items() if error == L1Error.KEY_IN_WRONG_STATE
+        ]
+        if expired:
+            self._l1_manager.delete(expired)
+
     def _cleanup_in_flight_requests(self) -> None:
         """Release resources for any in-flight requests during shutdown."""
         l1_mgr = self._l1_manager
         for request in self._in_flight_requests.values():
             if request.phase == PrefetchPhase.PLAN_AND_LOAD:
                 if request.write_reserved_keys:
-                    l1_mgr.finish_write(request.write_reserved_keys)
-                    l1_mgr.delete(request.write_reserved_keys)
+                    self._discard_unloaded_buffers(request.write_reserved_keys)
             self._release_l2_locks(request, keep={})
             if request.l1_readlocks.popcount() > 0:
                 l1_mgr.finish_read(
