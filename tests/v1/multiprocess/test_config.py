@@ -178,6 +178,13 @@ def test_isolated_ipc_flag_enables():
     assert _parse_mp(["--no-isolated-ipc"]).isolated_ipc is False
 
 
+def test_checkpoint_index_capacity_default_and_flag():
+    assert _parse_mp([]).checkpoint_index_max_entries == 65536
+    assert MPServerConfig().checkpoint_index_max_entries == 65536
+    config = _parse_mp(["--checkpoint-index-max-entries", "200000"])
+    assert config.checkpoint_index_max_entries == 200000
+
+
 # -- Engine type --------------------------------------------------------------
 
 

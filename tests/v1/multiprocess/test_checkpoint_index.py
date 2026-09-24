@@ -5,6 +5,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+import sqlite3
 
 # Third Party
 import pytest
@@ -199,3 +200,79 @@ def test_concurrent_rank_acknowledgements_publish_once() -> None:
     assert sum(results) == 1
     assert index.find((entry.prefix,)) == entry
     index.close()
+
+
+@pytest.mark.parametrize(
+    ("stored", "query", "hit"),
+    [
+        ((1, 2), (1, 2), True),
+        ((1, 2), (1, 2, 3), True),
+        ((1, 2), (1, 20), False),
+        ((1,), (12, 3), False),
+        ((12,), (1, 2, 3), False),
+    ],
+)
+def test_tail_matches_whole_tokens_only(
+    stored: tuple[int, ...], query: tuple[int, ...], hit: bool
+) -> None:
+    index = CheckpointIndex()
+    entry = manifest(tail=stored)
+    publish(index, entry)
+    found = index.find((replace(entry.prefix, tail_tokens=query),))
+    assert found == (entry if hit else None)
+    index.close()
+
+
+def test_ancestors_match_whole_tokens_only() -> None:
+    index = CheckpointIndex()
+    kept = [manifest(f"kept-{tail}", tail) for tail in ((1,), (1, 2))]
+    decoys = [manifest(f"decoy-{tail}", tail) for tail in ((12,), (1, 20))]
+    for entry in kept + decoys:
+        publish(index, entry)
+    query = replace(kept[0].prefix, tail_tokens=(1, 2, 3))
+    found = index.ancestors((query,), below_tokens=query.num_tokens)
+    assert found == kept
+    index.close()
+
+
+def test_longest_match_among_many_tails_sharing_a_hash_block() -> None:
+    # Every checkpoint shorter than one hash block shares a lookup bucket.
+    index = CheckpointIndex()
+    query_tail = tuple(range(1, 301))
+    for length in range(1, 300, 7):
+        publish(index, manifest(f"prefix-{length}", query_tail[:length]))
+        decoy = query_tail[: length - 1] + (10_000 + length,)
+        publish(index, manifest(f"decoy-{length}", decoy))
+    found = index.find((replace(manifest().prefix, tail_tokens=query_tail),))
+    assert found is not None
+    assert found.generation == "prefix-295"
+    index.close()
+
+
+def test_capacity_keeps_recently_found_entries(tmp_path: Path) -> None:
+    index = CheckpointIndex(tmp_path / "index.sqlite3", max_entries=3)
+    entries = [manifest(f"producer-{tail}", (tail,)) for tail in range(3)]
+    for entry in entries:
+        publish(index, entry)
+    assert index.find((entries[0].prefix,)) == entries[0]
+    publish(index, manifest("producer-3", (3,)))
+    assert index.find((entries[0].prefix,)) == entries[0]
+    assert index.find((entries[1].prefix,)) is None
+    assert index.report_status()["published_generations"] == 3
+    index.close()
+
+
+def test_existing_directory_gains_recency_index(tmp_path: Path) -> None:
+    path = tmp_path / "index.sqlite3"
+    index = CheckpointIndex(path)
+    entry = manifest()
+    publish(index, entry)
+    index.close()
+    with sqlite3.connect(path) as db:
+        db.execute("DROP INDEX checkpoints_access_order")
+    reopened = CheckpointIndex(path)
+    assert reopened.find((entry.prefix,)) == entry
+    reopened.close()
+    with sqlite3.connect(path) as db:
+        names = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
+    assert "checkpoints_access_order" in names

@@ -14,6 +14,16 @@ import json
 import sqlite3
 import threading
 
+# Stored tails are JSON token arrays. A stored tail is a token prefix of the
+# :tail query exactly when the query repeats it without the closing bracket
+# and continues with "," or "]". Matching in SQLite keeps lookups independent
+# of Python decoding, which matters because every checkpoint shorter than one
+# hash block shares a lookup bucket.
+_TAIL_IS_PREFIX_OF_QUERY = (
+    "substr(:tail, 1, length(tail) - 1) = substr(tail, 1, length(tail) - 1) "
+    "AND substr(:tail, length(tail), 1) IN (x'2c', x'5d')"
+)
+
 
 @dataclass(frozen=True)
 class CheckpointPrefix:
@@ -97,7 +107,8 @@ class CheckpointIndex:
         path: SQLite database file, or ``None`` for a RAM-only directory. The
             containing directory must already exist and be trusted server data.
         max_entries: Maximum published manifests, evicting least-recently-used
-            entries. Payload eviction is independently owned by storage tiers.
+            entries. Payload eviction is independently owned by storage tiers,
+            so this should cover at least as many generations as L2 retains.
         max_pending: Maximum unpublished generations admitted concurrently.
 
     Raises:
@@ -109,7 +120,7 @@ class CheckpointIndex:
         self,
         path: Path | None = None,
         *,
-        max_entries: int = 8192,
+        max_entries: int = 65536,
         max_pending: int = 128,
     ) -> None:
         if max_entries <= 0 or max_pending <= 0:
@@ -138,6 +149,11 @@ class CheckpointIndex:
                 "world_size INTEGER NOT NULL, payload BLOB NOT NULL, "
                 "access_order INTEGER NOT NULL, "
                 "PRIMARY KEY(namespace, start_tokens, prefix_hash, tail))"
+            )
+            # Capacity trimming walks entries by recency on every publication.
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS checkpoints_access_order "
+                "ON checkpoints(access_order)"
             )
             self._db.execute("PRAGMA user_version=1")
         self._access_order = self._db.execute(
@@ -284,29 +300,31 @@ class CheckpointIndex:
             ):
                 if best is not None and query.num_tokens <= best.prefix.num_tokens:
                     break
-                rows = self._db.execute(
+                row = self._db.execute(
                     "SELECT tail,generation,world_size,payload FROM checkpoints "
-                    "WHERE namespace=? AND start_tokens=? AND prefix_hash=? "
-                    "AND num_tokens<=? ORDER BY num_tokens DESC",
-                    (
-                        query.namespace,
-                        query.start_tokens,
-                        query.prefix_hash,
-                        query.num_tokens,
-                    ),
+                    "WHERE namespace=:namespace AND start_tokens=:start "
+                    "AND prefix_hash=:prefix_hash AND num_tokens<=:num_tokens "
+                    f"AND {_TAIL_IS_PREFIX_OF_QUERY} "
+                    "ORDER BY num_tokens DESC LIMIT 1",
+                    {
+                        "namespace": query.namespace,
+                        "start": query.start_tokens,
+                        "prefix_hash": query.prefix_hash,
+                        "num_tokens": query.num_tokens,
+                        "tail": json.dumps(query.tail_tokens).encode(),
+                    },
+                ).fetchone()
+                if row is None:
+                    continue
+                tail_blob, generation, world_size, payload = row
+                prefix = CheckpointPrefix(
+                    query.namespace,
+                    query.start_tokens,
+                    query.prefix_hash,
+                    tuple(json.loads(tail_blob)),
                 )
-                for tail_blob, generation, world_size, payload in rows:
-                    tail = tuple(json.loads(tail_blob))
-                    if query.tail_tokens[: len(tail)] != tail:
-                        continue
-                    prefix = CheckpointPrefix(
-                        query.namespace, query.start_tokens, query.prefix_hash, tail
-                    )
-                    if best is None or prefix.num_tokens > best.prefix.num_tokens:
-                        best = CheckpointManifest(
-                            generation, prefix, world_size, payload
-                        )
-                    break
+                if best is None or prefix.num_tokens > best.prefix.num_tokens:
+                    best = CheckpointManifest(generation, prefix, world_size, payload)
             if best is not None:
                 self._access_order += 1
                 with self._db:
@@ -356,22 +374,24 @@ class CheckpointIndex:
                     continue
                 rows = self._db.execute(
                     "SELECT tail,generation,world_size,payload FROM checkpoints "
-                    "WHERE namespace=? AND start_tokens=? AND prefix_hash=? "
-                    "AND num_tokens<? AND num_tokens<=?",
-                    (
+                    "WHERE namespace=:namespace AND start_tokens=:start "
+                    "AND prefix_hash=:prefix_hash AND num_tokens<:below "
+                    f"AND num_tokens<=:num_tokens AND {_TAIL_IS_PREFIX_OF_QUERY}",
+                    {
+                        "namespace": query.namespace,
+                        "start": query.start_tokens,
+                        "prefix_hash": query.prefix_hash,
+                        "below": below_tokens,
+                        "num_tokens": query.num_tokens,
+                        "tail": json.dumps(query.tail_tokens).encode(),
+                    },
+                )
+                for tail_blob, generation, world_size, payload in rows:
+                    prefix = CheckpointPrefix(
                         query.namespace,
                         query.start_tokens,
                         query.prefix_hash,
-                        below_tokens,
-                        query.num_tokens,
-                    ),
-                )
-                for tail_blob, generation, world_size, payload in rows:
-                    tail = tuple(json.loads(tail_blob))
-                    if query.tail_tokens[: len(tail)] != tail:
-                        continue
-                    prefix = CheckpointPrefix(
-                        query.namespace, query.start_tokens, query.prefix_hash, tail
+                        tuple(json.loads(tail_blob)),
                     )
                     found.append(
                         CheckpointManifest(generation, prefix, world_size, payload)
