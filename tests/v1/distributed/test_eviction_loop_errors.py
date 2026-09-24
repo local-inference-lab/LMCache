@@ -3,7 +3,7 @@
 
 # Standard
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Generic, TypeVar, cast
 import threading
 import time
 
@@ -25,15 +25,18 @@ def wait_until(predicate, timeout: float = 5.0) -> bool:
     return False
 
 
-class FlakyUsage:
+UsageT = TypeVar("UsageT")
+
+
+class FlakyUsage(Generic[UsageT]):
     """Raise on the first call, then report an idle tier."""
 
-    def __init__(self, idle: Any) -> None:
+    def __init__(self, idle: UsageT) -> None:
         self.calls = 0
         self._idle = idle
         self._lock = threading.Lock()
 
-    def __call__(self) -> Any:
+    def __call__(self) -> UsageT:
         with self._lock:
             self.calls += 1
             first = self.calls == 1
