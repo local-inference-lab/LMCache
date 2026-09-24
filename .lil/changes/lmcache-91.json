@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-91",
+  "category": "fix",
+  "summary": "A checkpoint restore that finds RAM full waits for room instead of deleting the checkpoint",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "After a restart, many conversations restore their checkpoints from disk at once. When RAM was full, a restore loaded none of its pages and the checkpoint was removed from the directory although all pages were on disk, so the conversation was computed again from scratch (1 of 10 Qwen conversations in our restart test).",
+    "The restore now asks eviction for room and repeats its lookup once the pages fit, for at most the storage admission timeout. Only a repeated lookup that had room and still misses removes the checkpoint."
+  ],
+  "pull_requests": [
+    91
+  ]
+}
