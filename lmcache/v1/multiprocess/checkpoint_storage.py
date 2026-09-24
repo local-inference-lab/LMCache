@@ -214,6 +214,7 @@ class _StoreLease:
     manifest: CheckpointManifest
     rank: int
     keys: list[ObjectKey]
+    started: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -242,6 +243,9 @@ class CheckpointPayloadStore:
         index: Directory used for all-rank publication and stale invalidation.
         max_leases: Shared bound for pending stores and retrieves. Exhaustion
             rejects admission without recycling a worker's live SHM buffers.
+        abandoned_after_seconds: Age after which a lease or pending generation
+            is treated as abandoned by a dead worker and released. It must be
+            far longer than any live transfer.
 
     The caller stages a manifest with ``index.begin`` before rank stores. Each
     successful store acknowledgement follows a drained worker D2H transfer.
@@ -254,12 +258,17 @@ class CheckpointPayloadStore:
         index: CheckpointIndex,
         *,
         max_leases: int = 1024,
+        abandoned_after_seconds: float = 600.0,
     ) -> None:
         if max_leases < 1:
             raise ValueError("checkpoint lease capacity must be positive")
+        if not abandoned_after_seconds > 0:
+            raise ValueError("abandoned lease age must be positive")
         self._storage = storage
         self._index = index
         self._max_leases = max_leases
+        self._abandoned_after = abandoned_after_seconds
+        self._last_reclaim = time.monotonic()
         self._stores: dict[str, _StoreLease] = {}
         self._store_ranks: set[tuple[str, int]] = set()
         self._retrieves: dict[str, _RetrieveLease] = {}
@@ -284,6 +293,7 @@ class CheckpointPayloadStore:
         Raises:
             ValueError: For invalid layouts or a duplicate producer rank.
         """
+        self._maybe_reclaim()
         groups = checkpoint_page_groups(manifest)
         key_groups = checkpoint_object_keys(manifest, rank)
         if not self._index.is_pending(manifest):
@@ -453,6 +463,7 @@ class CheckpointPayloadStore:
         Raises:
             ValueError: If the manifest layout or rank is invalid.
         """
+        self._maybe_reclaim()
         keys = [
             key for group in checkpoint_object_keys(manifest, rank) for key in group
         ]
@@ -488,6 +499,77 @@ class CheckpointPayloadStore:
             PrefetchRequestSpec(keys, layouts, policy=TrimPolicy.SPARSE),
             external_request_id=f"checkpoint-{lease_id}",
         )
+
+    def _maybe_reclaim(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_reclaim < min(30.0, self._abandoned_after):
+                return
+            self._last_reclaim = now
+        self.reclaim_abandoned()
+
+    def reclaim_abandoned(self) -> int:
+        """Release leases and pending generations that a dead worker left behind.
+
+        A worker that dies between PREPARE_STORE and FINISH_STORE, or between
+        a ready retrieve and its release, never returns its lease. The lease
+        keeps its L1 locks and counts against ``max_leases``, and its pending
+        generation can never be staged again. Once older than
+        ``abandoned_after_seconds``, store leases are aborted, ready retrieve
+        leases release their read locks, and pending lookups are cancelled and
+        drained as their prefetch completes.
+
+        Returns:
+            Number of leases and pending generations released.
+        """
+        cutoff = time.monotonic() - self._abandoned_after
+        with self._lock:
+            stores = [
+                (lease_id, lease)
+                for lease_id, lease in self._stores.items()
+                if lease.started < cutoff
+            ]
+            for lease_id, lease in stores:
+                del self._stores[lease_id]
+                self._store_ranks.discard((lease.manifest.generation, lease.rank))
+            ready = [
+                (lease_id, lease)
+                for lease_id, lease in self._retrieves.items()
+                if lease.slots is not None and lease.started < cutoff
+            ]
+            for lease_id, _lease in ready:
+                del self._retrieves[lease_id]
+            lookups = [
+                lease_id
+                for lease_id, lease in self._retrieves.items()
+                if lease.slots is None and lease.started < cutoff
+            ]
+            for lease_id in lookups:
+                self._retrieves[lease_id].cancelled = True
+        for _lease_id, store_lease in stores:
+            self._storage.abort_write(store_lease.keys)
+            self._index.abort(store_lease.manifest.generation)
+        for _lease_id, read_lease in ready:
+            self._storage.finish_read_prefetched(read_lease.keys)
+        for lease_id in lookups:
+            try:
+                # A cancelled lookup releases its locks once its prefetch ends.
+                self.poll_retrieve(lease_id)
+            except KeyError:
+                pass
+        stale = self._index.abort_stale(self._abandoned_after)
+        reclaimed = len(stores) + len(ready) + len(lookups) + len(stale)
+        if reclaimed:
+            logger.warning(
+                "Released %d store leases, %d retrieve leases, %d lookups and %d "
+                "pending checkpoint generations abandoned for over %.0f s",
+                len(stores),
+                len(ready),
+                len(lookups),
+                len(stale),
+                self._abandoned_after,
+            )
+        return reclaimed
 
     def report_status(self) -> dict[str, int]:
         """Return live lease counts without releasing worker-owned copy buffers.

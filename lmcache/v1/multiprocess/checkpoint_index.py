@@ -13,6 +13,7 @@ from pathlib import Path
 import json
 import sqlite3
 import threading
+import time
 
 # Every checkpoint that ends inside the same hash block shares one lookup
 # bucket, so a lookup must not scan the bucket. Each published tail also gets
@@ -129,6 +130,7 @@ class CheckpointManifest:
 class _PendingManifest:
     manifest: CheckpointManifest
     ranks: set[int] = field(default_factory=set)
+    started: float = field(default_factory=time.monotonic)
 
 
 class CheckpointIndex:
@@ -468,6 +470,30 @@ class CheckpointIndex:
                         CheckpointManifest(generation, prefix, world_size, payload)
                     )
         return sorted(found, key=lambda manifest: manifest.prefix.num_tokens)
+
+    def abort_stale(self, older_than_seconds: float) -> list[str]:
+        """Discard pending generations whose producers never finished.
+
+        A producer that dies between ``begin`` and its last acknowledgement
+        leaves its generation pending forever: the same generation can never
+        be staged again, and it permanently uses one unit of pending capacity.
+
+        Args:
+            older_than_seconds: Minimum age of a discarded pending generation.
+
+        Returns:
+            The discarded generations.
+        """
+        cutoff = time.monotonic() - older_than_seconds
+        with self._lock:
+            stale = [
+                generation
+                for generation, pending in self._pending.items()
+                if pending.started < cutoff
+            ]
+            for generation in stale:
+                del self._pending[generation]
+        return stale
 
     def abort(self, generation: str) -> None:
         """Discard an unpublished generation after its payload writers drain.
