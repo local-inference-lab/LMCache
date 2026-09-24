@@ -27,8 +27,10 @@ from lmcache.v1.distributed.api import (
     PrefetchRequestSpec,
     Tier,
     TrimPolicy,
+    is_recurrent_checkpoint_key,
 )
 from lmcache.v1.distributed.bitmap_ops import fold_unfold_ranked
+from lmcache.v1.distributed.checkpoint_retention import CheckpointRetention
 from lmcache.v1.distributed.config import (
     EvictionConfig,
     StorageManagerConfig,
@@ -110,11 +112,23 @@ class StorageManager:
         self._l1_config = config.l1_manager_config
         self._event_bus = get_event_bus()
 
+        # Checkpoint supersession and write-on-evict state, shared by the
+        # eviction controllers, the store controller and checkpoint RPCs.
+        store_policy = create_store_policy(config.store_policy)
+        self._checkpoint_shutdown_flush_seconds = (
+            config.checkpoint_shutdown_flush_seconds
+        )
+        self._checkpoint_retention = CheckpointRetention(
+            write_on_evict=store_policy.writes_checkpoints_on_evict(),
+            persist_timeout=config.checkpoint_write_timeout_seconds,
+        )
+
         # L1 eviction controller
         self._eviction_controller = L1EvictionController(
             l1_manager=self._l1_manager,
             eviction_config=config.eviction_config,
         )
+        self._eviction_controller.set_checkpoint_retention(self._checkpoint_retention)
         self._eviction_controller.start()
 
         # L2 adapters and store controller. When an adapter config carries
@@ -134,6 +148,7 @@ class StorageManager:
             adapter_id, adapter, descriptor = self._build_l2_adapter(ac)
             self._l2_adapters[adapter_id] = adapter
             self._adapter_descriptors[adapter_id] = descriptor
+            self._track_checkpoint_residency(adapter_id, adapter)
 
         PeriodicEventNotifier.create(
             interval_ms=config.periodic_notifier_interval_ms,
@@ -172,6 +187,9 @@ class StorageManager:
         self._l2_eviction_controller = L2EvictionController(
             l2_eviction_states, quota_manager=self._quota_manager
         )
+        self._l2_eviction_controller.set_checkpoint_retention(
+            self._checkpoint_retention
+        )
         self._l2_eviction_controller.start()
 
         # Controllers receive the initial set as ordered lists; they key
@@ -181,9 +199,12 @@ class StorageManager:
             l1_manager=self._l1_manager,
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
-            policy=create_store_policy(config.store_policy),
+            policy=store_policy,
         )
         self._store_controller.start()
+        self._checkpoint_retention.set_persist(
+            self._store_controller.submit_reused_keys
+        )
 
         # Prefetch controller
         self._prefetch_controller = PrefetchController(
@@ -233,6 +254,17 @@ class StorageManager:
                 "``l2_name`` (one observation per adapter)."
             ),
             self.get_l2_usages,
+        )
+        register_gauge(
+            "lmcache.l2",
+            "lmcache_mp.checkpoint_retention",
+            (
+                "Recurrent checkpoint retention counters and sizes, tagged by "
+                "``stat``: superseded pages, L1 drops and L2 evictions of "
+                "superseded pages, write-on-evict requests, completions and "
+                "timeouts, and checkpoint bytes held in L2."
+            ),
+            self._checkpoint_retention.observations,
         )
 
     # External APIs for serving engine integration code to call
@@ -549,7 +581,78 @@ class StorageManager:
             keys: Keys read by a restore whose consumer copy has completed.
                 Call this before releasing the restore's read locks.
         """
+        if self._checkpoint_retention.write_on_evict:
+            # Write-on-evict policies store checkpoint pages when L1 evicts
+            # them, not because a restore read them.
+            return
         self._store_controller.submit_reused_keys(keys)
+
+    @property
+    def checkpoint_retention(self) -> CheckpointRetention:
+        """Checkpoint supersession and write-on-evict state."""
+        return self._checkpoint_retention
+
+    def _track_checkpoint_residency(
+        self, adapter_id: int, adapter: L2AdapterInterface
+    ) -> None:
+        """Record which checkpoint pages ``adapter`` holds, now and later."""
+        retention = self._checkpoint_retention
+        listener = retention.listener_for(adapter_id)
+        adapter.register_listener(listener)
+        try:
+            inventory = adapter.get_existing_key_sizes()
+        except Exception:
+            logger.exception(
+                "Could not read the checkpoint inventory of L2 adapter %d",
+                adapter_id,
+            )
+            return
+        if inventory:
+            retention.record_l2_present(
+                adapter_id, list(inventory), list(inventory.values())
+            )
+
+    def _flush_current_checkpoints(self) -> None:
+        """Write current checkpoint pages still only in L1 to L2 on shutdown."""
+        retention = self._checkpoint_retention
+        budget = self._checkpoint_shutdown_flush_seconds
+        if not retention.write_on_evict or budget <= 0 or not self._has_l2_adapters():
+            return
+        count = self._l1_manager.num_objects()
+        keys, _ = self._l1_manager.get_evictable_keys(limit=count, scan_limit=count)
+        pending = [
+            key
+            for key in keys
+            if is_recurrent_checkpoint_key(key)
+            and not retention.is_superseded(key)
+            and not retention.is_l2_resident(key)
+        ]
+        if not pending:
+            return
+        logger.info(
+            "Writing %d current checkpoint pages to L2 before shutdown (budget %.0f s)",
+            len(pending),
+            budget,
+        )
+        start = time.monotonic()
+        retention.request_persist(pending)
+        while time.monotonic() - start < budget:
+            pending = [key for key in pending if not retention.is_l2_resident(key)]
+            if not pending:
+                break
+            time.sleep(0.2)
+        if pending:
+            logger.warning(
+                "Shutdown checkpoint flush left %d pages without an L2 copy "
+                "after %.0f s",
+                len(pending),
+                time.monotonic() - start,
+            )
+        else:
+            logger.info(
+                "Shutdown checkpoint flush completed in %.1f s",
+                time.monotonic() - start,
+            )
 
     @enable_tracing()
     def submit_prefetch_task(
@@ -1167,6 +1270,7 @@ class StorageManager:
             adapter_id, adapter, descriptor = self._build_l2_adapter(config)
             for listener in self._registered_l2_listeners:
                 adapter.register_listener(listener)
+            self._track_checkpoint_residency(adapter_id, adapter)
             with self._adapters_lock:
                 self._l2_adapters[adapter_id] = adapter
                 self._adapter_descriptors[adapter_id] = descriptor
@@ -1227,6 +1331,7 @@ class StorageManager:
             # before detaching eviction state or closing native resources.
             self._eviction_controller.remove_l2_adapter(adapter_id)
             self._l2_eviction_controller.remove_adapter_state(adapter_id)
+            self._checkpoint_retention.forget_adapter(adapter_id)
             with self._adapters_lock:
                 adapter = self._l2_adapters.pop(adapter_id)
                 self._adapter_descriptors.pop(adapter_id, None)
@@ -1266,6 +1371,10 @@ class StorageManager:
         """
         Close the storage manager and release all resources.
         """
+        try:
+            self._flush_current_checkpoints()
+        except Exception:
+            logger.exception("Shutdown checkpoint flush failed")
         self._l1_manager.begin_shutdown()
         self._prefetch_controller.stop()
         self._store_controller.stop()
@@ -1295,6 +1404,7 @@ class StorageManager:
             "prefetch_controller": prefetch,
             "l1_eviction_controller": l1_eviction,
             "l2_eviction_controller": l2_eviction,
+            "checkpoint_retention": self._checkpoint_retention.report_status(),
             "l2_adapters": adapters,
             "num_l2_adapters": len(adapters),
             "store_admission": self.get_admission_stats(),

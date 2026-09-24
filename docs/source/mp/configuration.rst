@@ -480,7 +480,23 @@ Source: ``lmcache/v1/distributed/config.py``
        The ``checkpoint_on_reuse`` policy stores ordinary keys like
        ``default`` but stores a recurrent checkpoint page to L2 only after
        a restore has read it.
-       Choices: ``default``, ``skip_l1``, ``checkpoint_on_reuse``.
+       The ``checkpoint_on_evict`` policy stores ordinary keys like
+       ``default`` and stores a current recurrent checkpoint page to L2
+       once, when L1 is about to evict it; superseded pages are dropped
+       without a write.
+       Choices: ``default``, ``skip_l1``, ``checkpoint_on_reuse``,
+       ``checkpoint_on_evict``.
+   * - ``--checkpoint-write-timeout-seconds``
+     - ``120``
+     - With ``checkpoint_on_evict``, how long L1 keeps a checkpoint page
+       whose L2 write has not completed.  After this the page may be
+       evicted without an L2 copy and a warning is logged.
+   * - ``--checkpoint-shutdown-flush-seconds``
+     - ``30``
+     - With ``checkpoint_on_evict``, how long shutdown waits while current
+       checkpoint pages still only in L1 are written to L2, so the next
+       start can restore them.  ``0`` skips the flush.  Give the process
+       at least this much time between SIGTERM and SIGKILL.
    * - ``--l2-prefetch-policy``
      - ``default``
      - L2 prefetch policy.  Determines which adapter loads each key

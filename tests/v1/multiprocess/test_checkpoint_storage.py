@@ -81,6 +81,7 @@ def open_store(
     *,
     shm_name: str | None = None,
     store_policy: str = "default",
+    shutdown_flush_seconds: float = 30.0,
 ) -> Iterator[tuple[CheckpointPayloadStore, CheckpointIndex, StorageManager, mmap]]:
     name = shm_name or f"lmcache_l1_pool_checkpoint_test_{uuid.uuid4().hex}"
     size = 4 * 1024 * 1024
@@ -98,6 +99,7 @@ def open_store(
                 else []
             ),
             store_policy=store_policy,
+            checkpoint_shutdown_flush_seconds=shutdown_flush_seconds,
         )
     )
     with ExitStack() as cleanup:
@@ -1232,3 +1234,279 @@ def test_reuse_admission_persists_only_restored_checkpoints(
         assert lease_id is not None
         assert poll(service, lease_id) is False
         assert index.find((unused.prefix,)) is None
+
+
+def large_manifest(tail: int, page_bytes: int = 128 * 1024) -> CheckpointManifest:
+    """A one-rank manifest whose pages fill a noticeable part of the 4 MiB L1."""
+    entry = replace(make_manifest(), world_size=1)
+    payload = json.loads(entry.payload)
+    for group in payload["page_groups"]:
+        group["page_bytes"] = page_bytes
+    return replace(
+        entry,
+        generation=uuid.uuid4().hex,
+        prefix=replace(entry.prefix, tail_tokens=(tail,)),
+        payload=json.dumps(payload).encode(),
+    )
+
+
+def entry_keys(entry: CheckpointManifest) -> list[ObjectKey]:
+    return [
+        key
+        for rank in range(entry.world_size)
+        for group in checkpoint_object_keys(entry, rank)
+        for key in group
+    ]
+
+
+def restores(
+    service: CheckpointPayloadStore, mapping: mmap, entry: CheckpointManifest
+) -> bool:
+    """Whether every rank of ``entry`` restores with the bytes it published."""
+    for rank in range(entry.world_size):
+        lease_id = service.begin_retrieve(entry, rank)
+        if lease_id is None:
+            return False
+        lease = poll(service, lease_id)
+        if not isinstance(lease, CheckpointSlots):
+            return False
+        try:
+            for group_id, group in enumerate(lease.groups):
+                for page_id, slot in enumerate(group):
+                    assert slot is not None
+                    assert (
+                        mapping[slot.offset : slot.offset + slot.length]
+                        == bytes([rank * 16 + group_id * 4 + page_id]) * slot.length
+                    )
+        finally:
+            service.finish_retrieve(lease.lease_id)
+    return True
+
+
+def wait_for(condition: Any, message: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.02)
+    raise AssertionError(message)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_evict_admission_writes_checkpoint_only_when_l1_evicts_it(
+    tmp_path: Path, native: bool
+) -> None:
+    """checkpoint_on_evict keeps pages in L1 until eviction, then writes them."""
+    first = large_manifest(100)
+    with open_store(
+        tmp_path, native, store_policy="checkpoint_on_evict", shutdown_flush_seconds=0
+    ) as (service, index, storage, mapping):
+        retention = storage.checkpoint_retention
+        publish_all(service, index, mapping, first)
+        drain_l2_stores(storage)
+        assert not any(retention.is_l2_resident(key) for key in entry_keys(first))
+        assert retention.report_status()["write_on_evict_requests"] == 0
+        # Restores do not trigger writes under this policy.
+        assert restores(service, mapping, first)
+        drain_l2_stores(storage)
+        assert retention.report_status()["write_on_evict_requests"] == 0
+
+        later = [large_manifest(101 + i) for i in range(12)]
+        for entry in later:
+            publish_all(service, index, mapping, entry)
+        wait_for(
+            lambda: all(retention.is_l2_resident(key) for key in entry_keys(first)),
+            "evicted checkpoint pages never reached L2",
+        )
+        status = retention.report_status()
+        assert status["write_on_evict_persisted"] >= len(entry_keys(first))
+        assert status["write_on_evict_timeouts"] == 0
+        assert storage.get_admission_stats()["exhausted_timeouts"] == 0
+        # The newest checkpoint still fits in L1 and has not been written.
+        assert not any(retention.is_l2_resident(key) for key in entry_keys(later[-1]))
+        drain_l2_stores(storage)
+    with open_store(
+        tmp_path, native, store_policy="checkpoint_on_evict", shutdown_flush_seconds=0
+    ) as (service, index, storage, mapping):
+        assert index.find((first.prefix,)) == first
+        assert restores(service, mapping, first)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_superseded_checkpoint_is_dropped_first_and_never_written(
+    tmp_path: Path, native: bool
+) -> None:
+    """An older turn's unique pages leave L1 first and never reach L2."""
+    older, newer = large_manifest(200), large_manifest(201)
+    with open_store(
+        tmp_path, native, store_policy="checkpoint_on_evict", shutdown_flush_seconds=0
+    ) as (service, index, storage, mapping):
+        retention = storage.checkpoint_retention
+        publish_all(service, index, mapping, older)
+        publish_all(service, index, mapping, newer)
+        retention.mark_superseded(older.generation, entry_keys(older))
+        for i in range(12):
+            publish_all(service, index, mapping, large_manifest(300 + i))
+        wait_for(
+            lambda: all(retention.is_l2_resident(key) for key in entry_keys(newer)),
+            "current checkpoint pages never reached L2",
+        )
+        drain_l2_stores(storage)
+        assert not any(retention.is_l2_resident(key) for key in entry_keys(older))
+        assert retention.report_status()["l1_superseded_drops"] >= len(
+            entry_keys(older)
+        )
+    with open_store(
+        tmp_path, native, store_policy="checkpoint_on_evict", shutdown_flush_seconds=0
+    ) as (service, index, storage, mapping):
+        assert restores(service, mapping, newer)
+        assert not restores(service, mapping, older)
+
+
+@pytest.mark.parametrize("flush_seconds", [0.0, 30.0])
+def test_shutdown_flush_writes_current_checkpoints_for_the_next_start(
+    tmp_path: Path, flush_seconds: float
+) -> None:
+    """Current checkpoints still only in L1 reach L2 when the server stops."""
+    current, superseded = make_manifest(), large_manifest(400, page_bytes=128)
+    with open_store(
+        tmp_path,
+        True,
+        store_policy="checkpoint_on_evict",
+        shutdown_flush_seconds=flush_seconds,
+    ) as (service, index, storage, mapping):
+        publish_all(service, index, mapping, current)
+        publish_all(service, index, mapping, superseded)
+        storage.checkpoint_retention.mark_superseded(
+            superseded.generation, entry_keys(superseded)
+        )
+        drain_l2_stores(storage)
+    with open_store(
+        tmp_path, True, store_policy="checkpoint_on_evict", shutdown_flush_seconds=0
+    ) as (service, index, storage, mapping):
+        assert restores(service, mapping, current) == (flush_seconds > 0)
+        assert not restores(service, mapping, superseded)
+
+
+def conversation_manifest(
+    tail: tuple[int, ...], label: str, kind: str = "response"
+) -> CheckpointManifest:
+    """One turn of a conversation: shared attention pages plus unique state."""
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    payload = json.dumps(
+        {
+            "schema_version": 2,
+            "kind": kind,
+            "page_groups": [
+                {
+                    "name": "target.attention.0",
+                    "page_bytes": 128,
+                    "positions": [0, 1],
+                    "content_keys": [digest("shared-0"), digest(f"tail-{label}")],
+                },
+                {
+                    "name": "target.recurrent.0",
+                    "page_bytes": 256,
+                    "positions": [16],
+                    "content_keys": [digest(f"recurrent-{label}")],
+                },
+            ],
+        }
+    ).encode()
+    return CheckpointManifest(
+        uuid.uuid4().hex,
+        CheckpointPrefix("weights-and-layout-and-salt", 4096, b"a" * 32, tail),
+        1,
+        payload,
+    )
+
+
+def test_index_lists_ancestors_of_a_sequence_without_touching_lru() -> None:
+    index = CheckpointIndex(None)
+    try:
+        turns = [
+            conversation_manifest((1,), "a"),
+            conversation_manifest((1, 2), "b"),
+            conversation_manifest((1, 2, 3), "c"),
+            conversation_manifest((1, 9), "branch"),
+        ]
+        for turn in turns:
+            assert index.begin(turn)
+            assert index.acknowledge(turn.generation, 0)
+        assert index.get(turns[1].generation) == turns[1]
+        assert index.get("missing") is None
+        query = replace(turns[2].prefix, tail_tokens=(1, 2, 3, 4))
+        assert index.ancestors((query,), 4096 + 3) == turns[:2]
+        assert index.ancestors((query,), 4096 + 4) == turns[:3]
+        with pytest.raises(ValueError, match="mix namespaces"):
+            index.ancestors((query, replace(query, namespace="other")), 10**6)
+    finally:
+        index.close()
+
+
+def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
+    """A new prompt supersedes earlier requests' checkpoints, not its own."""
+    name = f"lmcache_l1_pool_checkpoint_supersede_{uuid.uuid4().hex}"
+    with open_store(shm_name=name) as (_, _, storage, mapping):
+        module = CheckpointModule(
+            cast(
+                MPCacheServerContext,
+                SimpleNamespace(
+                    storage_manager=storage,
+                    shm_pool_info={"shm_name": name, "pool_size": 4 * 1024 * 1024},
+                ),
+            )
+        )
+        try:
+            instruction = conversation_manifest((1,), "i", kind="instruction")
+            # Turn 1: its response ends in tokens the chat template rewrites,
+            # so the next prompt extends the prompt, not the response.
+            prompt_1 = conversation_manifest((1, 2), "p1", kind="prompt")
+            response_1 = conversation_manifest((1, 2, 5), "r1")
+            tail_2 = conversation_manifest((1, 2, 3), "t2", kind="prefill_tail")
+            prompt_2 = conversation_manifest((1, 2, 3, 4), "p2", kind="prompt")
+            response_2 = conversation_manifest((1, 2, 3, 4, 6), "r2")
+            turns = (instruction, prompt_1, response_1, tail_2, prompt_2, response_2)
+            for turn in turns:
+                # Shared pages already resident come back without a slot.
+                assert module._index.begin(turn)
+                lease = module._payloads.prepare_store(turn, 0)
+                assert isinstance(lease, CheckpointSlots)
+                for group in lease.groups:
+                    for slot in group:
+                        if slot is not None:
+                            mapping[slot.offset : slot.offset + slot.length] = (
+                                b"\x01" * slot.length
+                            )
+                assert module._payloads.finish_store(lease.lease_id, True)
+
+            def roots(entry: CheckpointManifest) -> tuple[CheckpointPrefix, ...]:
+                return (entry.prefix,)
+
+            retention = storage.checkpoint_retention
+            requests = ("r0", "r1", "r1", "r2", "r2", "r2")
+            # Only a prompt supersedes, and turn 1 has no earlier request.
+            for turn, request in zip(turns[:4], requests[:4], strict=True):
+                assert module.supersede(roots(turn), turn.generation, request) == 0
+            assert retention.superseded_keys() == []
+
+            marked = module.supersede(roots(prompt_2), prompt_2.generation, "r2")
+            current = set(entry_keys(prompt_2))
+            expected = (set(entry_keys(prompt_1)) | set(entry_keys(response_1))) - (
+                current
+            )
+            assert marked == len(expected) > 0
+            assert set(retention.superseded_keys()) == expected
+            for kept in (instruction, tail_2, prompt_2):
+                assert not any(retention.is_superseded(k) for k in entry_keys(kept))
+            # The same request's response supersedes nothing.
+            assert module.supersede(roots(response_2), response_2.generation, "r2") == 0
+            assert module.supersede(roots(prompt_2), "unknown-generation", "r2") == 0
+            with pytest.raises(ValueError, match="mixes namespaces"):
+                module.supersede(
+                    (replace(prompt_2.prefix, namespace="other"),),
+                    prompt_2.generation,
+                    "r2",
+                )
+        finally:
+            module.close()

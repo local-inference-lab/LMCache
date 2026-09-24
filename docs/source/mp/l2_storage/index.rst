@@ -114,6 +114,14 @@ Select policies via CLI:
        it, once per page.  Checkpoints that are never restored never reach
        L2; after a restart or eviction, restores fall back to the longest
        checkpoint that still exists.
+   * - ``--l2-store-policy``
+     - ``checkpoint_on_evict``
+     - Store ordinary keys like ``default``.  Keep new recurrent checkpoint
+       pages in L1 and store a page to L2 once, when L1 is about to evict it
+       and no newer checkpoint of the same conversation has superseded it.
+       On shutdown, current pages still only in L1 are written within
+       ``--checkpoint-shutdown-flush-seconds``.  See
+       :ref:`checkpoint-retention`.
    * - ``--l2-prefetch-policy``
      - ``default``
      - For each key, pick the first (lowest-indexed) adapter that has it.
@@ -427,3 +435,55 @@ Expected log messages when L2 is active:
     LMCache DEBUG: Submitted store task ...
     LMCache DEBUG: L2 store task N completed ...
     LMCache DEBUG: Prefetch request submitted: X total keys, Y L1 prefix hits, Z remaining for L2
+
+.. _checkpoint-retention:
+
+Recurrent Checkpoint Retention
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Hybrid models (for example Qwen3.8-Flash-Next and GLM-5.3-Flash with its
+MTP draft state) publish recurrent checkpoints at request boundaries: the
+complete prompt, the response endpoint, and sometimes a prefill tail and the
+leading instructions.  Checkpoints of one conversation share attention pages
+by content, but the recurrent state, the partial last attention page and
+auxiliary state are unique to each.
+
+The vLLM integration reports each published checkpoint with its token
+sequence and request.  When the prompt checkpoint of a new request is
+published, the server marks as *superseded* the unique pages of every
+shorter checkpoint of that sequence produced by an earlier request, and of
+the other checkpoints those requests published.  That includes a response
+endpoint that the chat template rewrote and the next prompt therefore does
+not extend.  Checkpoints of the same request and ``instruction``
+checkpoints, which other conversations share, are never marked.  With every
+store policy:
+
+* L1 eviction drops superseded pages before any LRU victim.
+* L2 eviction deletes superseded pages before any LRU victim.
+
+With ``--l2-store-policy checkpoint_on_evict`` in addition:
+
+* A current checkpoint page is written to L2 once, when L1 is about to
+  evict it, instead of on every request.  L1 keeps the page until the
+  write completes (at most ``--checkpoint-write-timeout-seconds``).
+* A superseded page is never written to L2.
+* Shutdown writes current pages still only in L1, so they can be restored
+  after a restart.
+
+Superseded manifests stay listed, so a request that branches from an older
+turn can still restore it while its pages last; when a page is gone, the
+restore falls back to the longest remaining checkpoint.
+
+**Sizing.**  With write-through (``default``) the L2 retention time is about::
+
+    L2 capacity / (requests per minute x checkpoint bytes per request)
+
+With ``checkpoint_on_evict`` the L2 receives roughly one current checkpoint
+per conversation that leaves L1, so retention is about::
+
+    L2 capacity / (conversations leaving L1 per minute x checkpoint bytes)
+
+and superseded pages are reclaimed first.  The
+``lmcache_mp_checkpoint_retention`` gauge reports, per ``stat``, superseded
+pages, L1 drops and L2 evictions of superseded pages, write-on-evict
+requests, completions and timeouts, and the checkpoint bytes held in L2.

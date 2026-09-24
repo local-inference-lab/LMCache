@@ -59,6 +59,8 @@ class _PendingTask:
     acknowledgements: dict[int, bool] = field(default_factory=dict)
     sent: bool = False
     created: float = field(default_factory=time.monotonic)
+    # Roots of the producing sequence, for superseding its older checkpoints.
+    roots: CheckpointTokenRoots | None = None
 
 
 @dataclass
@@ -354,6 +356,7 @@ class CheckpointSchedulerBridge:
                 begin=self._client.submit_request(
                     RequestType.CHECKPOINT_BEGIN, [manifest]
                 ),
+                roots=roots,
             )
         except BaseException:
             self._cache.release(pinned)
@@ -477,6 +480,23 @@ class CheckpointSchedulerBridge:
                     self._client.submit_request(
                         RequestType.CHECKPOINT_ABORT, [pending.task.manifest.generation]
                     )
+                elif pending.roots is not None:
+                    # Published: a new prompt supersedes older checkpoints of
+                    # its sequence, and the server links this request's
+                    # checkpoints. The reply is not needed.
+                    try:
+                        self._client.submit_request(
+                            RequestType.CHECKPOINT_SUPERSEDE,
+                            [
+                                pending.roots.roots,
+                                pending.task.manifest.generation,
+                                pending.request_id,
+                            ],
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not report superseded checkpoints", exc_info=True
+                        )
                 self._cache.release(pending.checkpoint)
             else:
                 state = self._lookups.get(pending.request_id)

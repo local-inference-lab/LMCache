@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-85",
+  "category": "feature",
+  "summary": "Keep the newest checkpoint of each conversation; write checkpoints to disk when they leave RAM",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required. LMCACHE_L2_CHECKPOINT_WRITES=on-evict selects the new store policy; give the container at least 40 s to stop so the shutdown flush can finish.",
+  "details": [
+    "When a newer checkpoint of the same conversation is published, the pages only older turns use are marked superseded; L1 and L2 eviction remove them before any LRU victim.",
+    "The checkpoint_on_evict store policy writes a current checkpoint page to L2 once, when L1 is about to evict it, and never writes superseded pages, so disk writes fall from every request to about one checkpoint per conversation leaving RAM.",
+    "On shutdown, current checkpoint pages still only in RAM are written to L2 (up to --checkpoint-shutdown-flush-seconds, default 30 s) so they can be restored after a restart.",
+    "New gauge lmcache_mp_checkpoint_retention reports superseded pages, drops, write-on-evict writes and timeouts, and checkpoint bytes in L2."
+  ],
+  "pull_requests": [
+    85
+  ]
+}
