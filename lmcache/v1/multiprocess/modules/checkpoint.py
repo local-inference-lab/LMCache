@@ -37,6 +37,12 @@ logger = init_logger(__name__)
 _MAX_SUPERSEDED_ANCESTORS = 32
 # Requests whose published generations are remembered for supersession.
 _MAX_TRACKED_REQUESTS = 65536
+# Default manifest capacity. A persistent directory should cover what L2
+# retains; a RAM-only directory holds manifests in server memory (tens to
+# hundreds of KiB each for long GLM prompts) while its payloads live only in
+# L1, which holds far fewer checkpoints.
+_PERSISTENT_INDEX_MAX_ENTRIES = 65536
+_RAM_INDEX_MAX_ENTRIES = 8192
 
 
 def _kind(manifest: CheckpointManifest) -> str | None:
@@ -78,7 +84,9 @@ class CheckpointModule:
             a RAM-only directory. Filesystem payloads alone do not imply a
             durable manifest directory.
         max_leases: Shared limit for pending rank stores and retrieves.
-        index_max_entries: Published manifests kept before LRU removal.
+        index_max_entries: Published manifests kept before LRU removal, or
+            None for 65536 with ``index_path`` and 8192 for a RAM-only
+            directory.
 
     Shutdown requires workers to finish or abort all submitted copy leases.
     A timeout must not recycle SHM while a worker can still access its bytes.
@@ -90,11 +98,17 @@ class CheckpointModule:
         index_path: Path | None = None,
         *,
         max_leases: int = 1024,
-        index_max_entries: int = 65536,
+        index_max_entries: int | None = None,
     ) -> None:
         if not ctx.shm_pool_info["shm_name"] or ctx.shm_pool_info["pool_size"] <= 0:
             raise ValueError("Recurrent checkpoint transfers require an SHM pool")
         self._ctx = ctx
+        if index_max_entries is None:
+            index_max_entries = (
+                _PERSISTENT_INDEX_MAX_ENTRIES
+                if index_path is not None
+                else _RAM_INDEX_MAX_ENTRIES
+            )
         self._index = CheckpointIndex(index_path, max_entries=index_max_entries)
         self._payloads = CheckpointPayloadStore(
             ctx.storage_manager, self._index, max_leases=max_leases
