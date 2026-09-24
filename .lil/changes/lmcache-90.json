@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-90",
+  "category": "fix",
+  "summary": "Keep the RAM-only checkpoint directory at 8192 manifests",
+  "models": ["Qwen3.8-Flash-Next", "GLM-5.3-Flash"],
+  "compatibility": "No user action required. --checkpoint-index-max-entries still overrides both defaults.",
+  "details": [
+    "A persistent checkpoint directory (--checkpoint-index-path, used with disk storage) keeps 65536 manifests so it covers what L2 retains.",
+    "A RAM-only directory keeps manifests in server memory, tens to hundreds of KiB each for long GLM prompts, while its payloads live only in RAM; it stays at the previous 8192."
+  ],
+  "pull_requests": [90],
+  "requires": ["lmcache-86"]
+}

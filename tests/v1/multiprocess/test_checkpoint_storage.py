@@ -1510,3 +1510,30 @@ def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
                 )
         finally:
             module.close()
+
+
+@pytest.mark.parametrize(
+    ("persistent", "explicit", "expected"),
+    [(False, None, 8192), (True, None, 65536), (False, 123, 123)],
+)
+def test_checkpoint_directory_capacity_follows_persistence(
+    tmp_path: Path, persistent: bool, explicit: int | None, expected: int
+) -> None:
+    """RAM-only manifests live in server memory; persistent ones cover L2."""
+    name = f"lmcache_l1_pool_checkpoint_capacity_{uuid.uuid4().hex}"
+    with open_store(shm_name=name) as (_, _, storage, _mapping):
+        module = CheckpointModule(
+            cast(
+                MPCacheServerContext,
+                SimpleNamespace(
+                    storage_manager=storage,
+                    shm_pool_info={"shm_name": name, "pool_size": 4 * 1024 * 1024},
+                ),
+            ),
+            tmp_path / "index.sqlite3" if persistent else None,
+            index_max_entries=explicit,
+        )
+        try:
+            assert module._index._max_entries == expected
+        finally:
+            module.close()

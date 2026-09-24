@@ -96,10 +96,13 @@ class MPServerConfig:
     None keeps manifests in RAM. The parent directory must exist and be trusted.
     Tensor payload durability is independently configured through L2 storage."""
 
-    checkpoint_index_max_entries: int = 65536
+    checkpoint_index_max_entries: int | None = None
     """Published checkpoint manifests kept by the directory before the least
     recently used are dropped. A dropped manifest cannot be restored even when
-    its payload is still in L2, so this should cover L2's retained generations."""
+    its payload is still in L2, so this should cover L2's retained generations.
+    None selects 65536 for a directory at ``checkpoint_index_path`` and 8192
+    for a RAM-only directory, whose manifests live in server memory and whose
+    payloads live only in L1."""
 
     script_allowed_imports: list[str] = field(default_factory=list)
     """Modules that /run_script endpoint is allowed to import."""
@@ -443,10 +446,12 @@ def add_mp_server_args(
     mp_group.add_argument(
         "--checkpoint-index-max-entries",
         type=int,
-        default=65536,
+        default=None,
         help="Recurrent checkpoint manifests kept before the least recently "
         "used are dropped. A dropped manifest cannot be restored even when its "
-        "payload is still in L2, so size this to cover L2's retained checkpoints.",
+        "payload is still in L2, so size this to cover L2's retained checkpoints. "
+        "Default: 65536 with --checkpoint-index-path, 8192 for a RAM-only "
+        "directory.",
     )
     mp_group.add_argument(
         "--enable",
