@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-87",
+  "category": "fix",
+  "summary": "A checkpoint lookup keeps the conversation it found from being evicted first",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The pages of a checkpoint found by a lookup move to the most recently used position in RAM and disk eviction order, even when the engine already holds the conversation and reads nothing."
+  ],
+  "pull_requests": [
+    87
+  ]
+}
