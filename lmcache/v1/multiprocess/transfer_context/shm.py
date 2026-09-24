@@ -125,7 +125,8 @@ class ShmPoolMapping:
         self._pool_size = pool_size
         self._shm: shared_memory.SharedMemory | None = None
         self._shm_buffer: memoryview | None = None
-        self._identity: tuple[int, int] | None = None
+        # (device, inode) of the mapped pool; empty when it cannot be checked.
+        self._identity: tuple[int, ...] = ()
         self._pinned = False
         self._pinned_ptr = 0
         self._pinned_size = 0
@@ -163,7 +164,7 @@ class ShmPoolMapping:
         size. A worker that kept the old mapping would copy into bytes the
         server no longer reads and read bytes it no longer writes.
         """
-        if self._identity is None:
+        if not self._identity:
             return True
         try:
             current = os.stat(self._pool_path())
@@ -181,7 +182,7 @@ class ShmPoolMapping:
         DMA that used it.
         """
         self.close()
-        self._identity = None
+        self._identity = ()
         self._open()
 
     def checkpoint_slot_views(
