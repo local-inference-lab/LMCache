@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-89",
+  "category": "fix",
+  "summary": "Data from a write that a crashed engine never finished is never reused",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "An unfinished RAM write stays unreadable after its write lock expires and is freed by the eviction loop, instead of becoming readable after 10 minutes.",
+    "Checkpoint deduplication can no longer publish a checkpoint that points at such data."
+  ],
+  "pull_requests": [
+    89
+  ]
+}
