@@ -44,6 +44,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# A retrieve waiting for RAM asks the L1 eviction loop again after this many
+# seconds, as store admission does: a pass frees nothing while its victims are
+# still pinned by other restores or L2 writes.
+_ROOM_REQUEST_INTERVAL_SECONDS = 0.5
+
 
 @dataclass(frozen=True)
 class CheckpointPageGroup:
@@ -216,10 +221,17 @@ class _RetrieveLease:
     manifest: CheckpointManifest
     rank: int
     keys: list[ObjectKey]
-    handle: PrefetchHandle
+    # None while the lease waits for RAM before repeating its lookup.
+    handle: PrefetchHandle | None
     slots: CheckpointSlots | None = None
     cancelled: bool = False
     started: float = field(default_factory=time.monotonic)
+    lookups: int = 1
+    # Readable pages of the last incomplete lookup, the RAM its unread pages
+    # need, and when eviction was last asked to make that room.
+    readable: int = 0
+    unread_bytes: int = 0
+    eviction_requested: float = 0.0
 
 
 class CheckpointPayloadStore:
@@ -441,14 +453,9 @@ class CheckpointPayloadStore:
         Raises:
             ValueError: If the manifest layout or rank is invalid.
         """
-        groups = checkpoint_page_groups(manifest)
         keys = [
             key for group in checkpoint_object_keys(manifest, rank) for key in group
         ]
-        layouts = {
-            group_id: MemoryLayoutDesc([torch.Size([group.page_bytes])], [torch.uint8])
-            for group_id, group in enumerate(groups)
-        }
         lease_id = uuid.uuid4().hex
         with self._lock:
             if (
@@ -460,10 +467,7 @@ class CheckpointPayloadStore:
                 return None
             self._retrieve_admissions.add(lease_id)
         try:
-            handle = self._storage.submit_prefetch_task(
-                PrefetchRequestSpec(keys, layouts, policy=TrimPolicy.SPARSE),
-                external_request_id=f"checkpoint-{lease_id}",
-            )
+            handle = self._lookup(lease_id, manifest, keys)
             with self._lock:
                 self._retrieves[lease_id] = _RetrieveLease(manifest, rank, keys, handle)
                 self._retrieve_admissions.remove(lease_id)
@@ -471,6 +475,19 @@ class CheckpointPayloadStore:
             with self._lock:
                 self._retrieve_admissions.discard(lease_id)
         return lease_id
+
+    def _lookup(
+        self, lease_id: str, manifest: CheckpointManifest, keys: list[ObjectKey]
+    ) -> PrefetchHandle:
+        """Submit the RAM/filesystem lookup that pins every page of one rank."""
+        layouts = {
+            group_id: MemoryLayoutDesc([torch.Size([group.page_bytes])], [torch.uint8])
+            for group_id, group in enumerate(checkpoint_page_groups(manifest))
+        }
+        return self._storage.submit_prefetch_task(
+            PrefetchRequestSpec(keys, layouts, policy=TrimPolicy.SPARSE),
+            external_request_id=f"checkpoint-{lease_id}",
+        )
 
     def report_status(self) -> dict[str, int]:
         """Return live lease counts without releasing worker-owned copy buffers.
@@ -498,6 +515,14 @@ class CheckpointPayloadStore:
             the pinned slots. A miss releases all acquired locks and invalidates
             only the failed generation. It must not advance computed tokens.
 
+            The storage manager loads pages from L2 only into RAM it reserved
+            for all of them, so a full RAM leaves stored pages unread. A lookup
+            with unread pages is therefore repeated once RAM has room for them,
+            and only a repeated lookup that had that room invalidates the
+            generation. The lease stays pending while eviction makes room, for
+            at most the storage admission timeout; a lease that never gets
+            room misses without invalidating its generation.
+
         Raises:
             KeyError: If the lease is unknown or already finished.
             ValueError: If stored payload byte layouts do not match the manifest.
@@ -506,28 +531,15 @@ class CheckpointPayloadStore:
             lease = self._retrieves[lease_id]
             if lease.slots is not None:
                 return lease.slots
+            if lease.handle is None:
+                return self._repeat_with_room(lease_id, lease)
             found = self._storage.query_prefetch_status(lease.handle)
             if found is None:
                 return None
             readable_keys = [key for i, key in enumerate(lease.keys) if found.test(i)]
             if len(readable_keys) != len(lease.keys) or lease.cancelled:
                 self._storage.finish_read_prefetched(readable_keys)
-                del self._retrieves[lease_id]
-                if not lease.cancelled:
-                    self._index.invalidate(lease.manifest.generation)
-                logger.info(
-                    "Checkpoint retrieve of %d tokens for rank %d %s after %.1f s: "
-                    "%d of %d pages were readable",
-                    lease.manifest.prefix.num_tokens,
-                    lease.rank,
-                    "was cancelled by the engine"
-                    if lease.cancelled
-                    else "missed; its checkpoint is no longer listed",
-                    time.monotonic() - lease.started,
-                    len(readable_keys),
-                    len(lease.keys),
-                )
-                return False
+                return self._repeat_or_miss(lease_id, lease, readable_keys)
             try:
                 keys, objects = self._storage.unsafe_read(lease.keys)
                 if keys != lease.keys or len(objects) != len(keys):
@@ -550,6 +562,77 @@ class CheckpointPayloadStore:
                 self._index.invalidate(lease.manifest.generation)
                 del self._retrieves[lease_id]
                 raise
+
+    def _repeat_or_miss(
+        self, lease_id: str, lease: _RetrieveLease, readable_keys: list[ObjectKey]
+    ) -> bool | None:
+        """Repeat or end a lookup whose pages were not all pinned.
+
+        Called with the lookup's read locks already released. Returns None
+        when the lookup will be repeated, otherwise False after forgetting the
+        lease. Only a repeated lookup that had room in RAM invalidates.
+        """
+        lease.readable = len(readable_keys)
+        if lease.cancelled:
+            return self._miss(lease_id, lease, "was cancelled by the engine")
+        groups = checkpoint_page_groups(lease.manifest)
+        readable = set(readable_keys)
+        lease.unread_bytes = sum(
+            groups[key.object_group_id].page_bytes
+            for key in lease.keys
+            if key not in readable
+        )
+        used, total = self._storage.get_l1_usage()
+        # Without L2, or with more pages than RAM can hold, no repeat loads them.
+        if (
+            self._storage.l2_adapters()
+            and lease.unread_bytes <= total
+            and (lease.lookups == 1 or total - used < lease.unread_bytes)
+        ):
+            lease.handle = None
+            return self._repeat_with_room(lease_id, lease)
+        self._index.invalidate(lease.manifest.generation)
+        return self._miss(lease_id, lease, "missed; its checkpoint is no longer listed")
+
+    def _repeat_with_room(self, lease_id: str, lease: _RetrieveLease) -> bool | None:
+        """Repeat a waiting lookup once RAM can hold its unread pages.
+
+        Until then the L1 eviction loop is asked to make room. Returns None
+        while waiting or after resubmitting, or False once the lease is
+        cancelled or the storage admission timeout expires. Its pages remain
+        stored, so the generation stays listed.
+        """
+        if lease.cancelled:
+            return self._miss(lease_id, lease, "was cancelled by the engine")
+        used, total = self._storage.get_l1_usage()
+        if total - used >= lease.unread_bytes:
+            lease.handle = self._lookup(lease_id, lease.manifest, lease.keys)
+            lease.lookups += 1
+            return None
+        now = time.monotonic()
+        if now - lease.started >= self._storage.store_admission_timeout_seconds:
+            return self._miss(
+                lease_id, lease, "found no room in RAM; its checkpoint stays listed"
+            )
+        if now - lease.eviction_requested >= _ROOM_REQUEST_INTERVAL_SECONDS:
+            lease.eviction_requested = now
+            self._storage.request_immediate_eviction()
+        return None
+
+    def _miss(self, lease_id: str, lease: _RetrieveLease, outcome: str) -> bool:
+        """Forget a lease whose read locks are released, and say why."""
+        del self._retrieves[lease_id]
+        logger.info(
+            "Checkpoint retrieve of %d tokens for rank %d %s after %.1f s: "
+            "%d of %d pages were readable",
+            lease.manifest.prefix.num_tokens,
+            lease.rank,
+            outcome,
+            time.monotonic() - lease.started,
+            lease.readable,
+            len(lease.keys),
+        )
+        return False
 
     def finish_retrieve(self, lease_id: str) -> None:
         """Release a prepared read lease after the consumer's CUDA event completes.

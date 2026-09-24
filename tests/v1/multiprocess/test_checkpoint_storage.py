@@ -82,6 +82,8 @@ def open_store(
     shm_name: str | None = None,
     store_policy: str = "default",
     shutdown_flush_seconds: float = 30.0,
+    admission_timeout_seconds: float = 8.0,
+    prefetch_policy: str = "default",
 ) -> Iterator[tuple[CheckpointPayloadStore, CheckpointIndex, StorageManager, mmap]]:
     name = shm_name or f"lmcache_l1_pool_checkpoint_test_{uuid.uuid4().hex}"
     size = 4 * 1024 * 1024
@@ -99,7 +101,9 @@ def open_store(
                 else []
             ),
             store_policy=store_policy,
+            prefetch_policy=prefetch_policy,
             checkpoint_shutdown_flush_seconds=shutdown_flush_seconds,
+            store_admission_timeout_seconds=admission_timeout_seconds,
         )
     )
     with ExitStack() as cleanup:
@@ -1386,6 +1390,110 @@ def test_shutdown_flush_writes_current_checkpoints_for_the_next_start(
     ) as (service, index, storage, mapping):
         assert restores(service, mapping, current) == (flush_seconds > 0)
         assert not restores(service, mapping, superseded)
+
+
+def publish_before_restart(
+    path: Path, native: bool, entries: list[CheckpointManifest]
+) -> None:
+    """Publish checkpoints and let their pages reach L2 before a restart."""
+    with open_store(path, native) as (service, index, storage, mapping):
+        for entry in entries:
+            publish_all(service, index, mapping, entry)
+        drain_l2_stores(storage)
+
+
+def begin_rank0_retrieve(
+    service: CheckpointPayloadStore, entry: CheckpointManifest
+) -> str:
+    lease_id = service.begin_retrieve(entry, 0)
+    assert lease_id is not None
+    return lease_id
+
+
+def hold_restores(
+    service: CheckpointPayloadStore, entries: list[CheckpointManifest]
+) -> list[CheckpointSlots]:
+    """Restore rank 0 of each entry and keep its pages pinned in RAM."""
+    leases = []
+    for entry in entries:
+        lease = poll(service, begin_rank0_retrieve(service, entry))
+        assert isinstance(lease, CheckpointSlots)
+        leases.append(lease)
+    return leases
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_restore_after_restart_waits_for_ram_held_by_other_restores(
+    tmp_path: Path, native: bool
+) -> None:
+    """A restore that finds RAM full waits for room instead of missing.
+
+    After a restart, resumed conversations load their checkpoints from L2
+    into RAM, where they stay until evicted. While other restores hold that
+    RAM, no page of this one can be loaded. Its pages are still in L2, so it
+    must complete once eviction makes room, and its checkpoint must stay
+    listed.
+    """
+    entry = large_manifest(500)
+    others = [large_manifest(501 + i) for i in range(4)]
+    publish_before_restart(tmp_path, native, [entry, *others])
+    with open_store(tmp_path, native, prefetch_policy="retain") as (
+        service,
+        index,
+        storage,
+        mapping,
+    ):
+        held = hold_restores(service, others)
+        used, total = storage.get_l1_usage()
+        assert total - used < len(entry_keys(entry)) * 128 * 1024
+
+        def finish_held() -> None:
+            for other in held:
+                service.finish_retrieve(other.lease_id)
+
+        release = threading.Timer(0.3, finish_held)
+        release.start()
+        try:
+            lease = poll(service, begin_rank0_retrieve(service, entry))
+        finally:
+            release.join()
+        assert isinstance(lease, CheckpointSlots)
+        try:
+            for group_id, group in enumerate(lease.groups):
+                for page_id, slot in enumerate(group):
+                    assert slot is not None
+                    assert mapping[slot.offset : slot.offset + slot.length] == (
+                        bytes([group_id * 4 + page_id]) * slot.length
+                    )
+        finally:
+            service.finish_retrieve(lease.lease_id)
+        assert index.find((entry.prefix,)) == entry
+
+
+def test_restore_that_never_gets_ram_keeps_its_checkpoint_listed(
+    tmp_path: Path,
+) -> None:
+    """Running out of RAM does not make a stored checkpoint missing.
+
+    A restore that gets no room within the admission timeout misses, but its
+    pages are still in L2: the directory keeps listing the checkpoint, and a
+    later restore succeeds.
+    """
+    entry = large_manifest(500)
+    others = [large_manifest(501 + i) for i in range(4)]
+    publish_before_restart(tmp_path, True, [entry, *others])
+    with open_store(
+        tmp_path, True, admission_timeout_seconds=0.3, prefetch_policy="retain"
+    ) as (service, index, storage, mapping):
+        held = hold_restores(service, others)
+        try:
+            assert poll(service, begin_rank0_retrieve(service, entry)) is False
+        finally:
+            for lease in held:
+                service.finish_retrieve(lease.lease_id)
+        assert index.find((entry.prefix,)) == entry
+        storage.delete_l1_keys([key for other in others for key in entry_keys(other)])
+        assert restores(service, mapping, entry)
 
 
 def conversation_manifest(
