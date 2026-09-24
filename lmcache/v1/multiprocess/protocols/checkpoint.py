@@ -87,6 +87,6 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         # Roots of the producing sequence and the new generation; returns the
         # number of pages newly marked superseded.
         "CHECKPOINT_SUPERSEDE": ProtocolDefinition(
-            [tuple[CheckpointPrefix, ...], str], int, blocking
+            [tuple[CheckpointPrefix, ...], str, str], int, blocking
         ),
     }

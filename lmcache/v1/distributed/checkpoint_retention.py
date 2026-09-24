@@ -222,7 +222,7 @@ class CheckpointRetention:
         victims: list[ObjectKey] = []
         total = 0
         with self._lock:
-            resident = self._resident.get(adapter_id, {})
+            resident: dict[ObjectKey, int] = self._resident.get(adapter_id, {})
             for key in self._superseded.items():
                 size = resident.get(key)
                 if size is None:

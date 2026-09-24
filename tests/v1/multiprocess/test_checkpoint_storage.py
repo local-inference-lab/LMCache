@@ -1445,7 +1445,7 @@ def test_index_lists_ancestors_of_a_sequence_without_touching_lru() -> None:
 
 
 def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
-    """The newest turn's pages stay current; instruction checkpoints are kept."""
+    """A new prompt supersedes earlier requests' checkpoints, not its own."""
     name = f"lmcache_l1_pool_checkpoint_supersede_{uuid.uuid4().hex}"
     with open_store(shm_name=name) as (_, _, storage, mapping):
         module = CheckpointModule(
@@ -1459,9 +1459,15 @@ def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
         )
         try:
             instruction = conversation_manifest((1,), "i", kind="instruction")
-            first = conversation_manifest((1, 2), "a")
-            second = conversation_manifest((1, 2, 3), "b")
-            for turn in (instruction, first, second):
+            # Turn 1: its response ends in tokens the chat template rewrites,
+            # so the next prompt extends the prompt, not the response.
+            prompt_1 = conversation_manifest((1, 2), "p1", kind="prompt")
+            response_1 = conversation_manifest((1, 2, 5), "r1")
+            tail_2 = conversation_manifest((1, 2, 3), "t2", kind="prefill_tail")
+            prompt_2 = conversation_manifest((1, 2, 3, 4), "p2", kind="prompt")
+            response_2 = conversation_manifest((1, 2, 3, 4, 6), "r2")
+            turns = (instruction, prompt_1, response_1, tail_2, prompt_2, response_2)
+            for turn in turns:
                 # Shared pages already resident come back without a slot.
                 assert module._index.begin(turn)
                 lease = module._payloads.prepare_store(turn, 0)
@@ -1473,20 +1479,34 @@ def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
                                 b"\x01" * slot.length
                             )
                 assert module._payloads.finish_store(lease.lease_id, True)
-            roots = (replace(second.prefix, tail_tokens=(1, 2, 3)),)
+
+            def roots(entry: CheckpointManifest) -> tuple[CheckpointPrefix, ...]:
+                return (entry.prefix,)
+
             retention = storage.checkpoint_retention
-            marked = module.supersede(roots, second.generation)
-            unique = set(entry_keys(first)) - set(entry_keys(second))
-            assert marked == len(unique) == 2
-            assert set(retention.superseded_keys()) == unique
-            assert not any(retention.is_superseded(k) for k in entry_keys(second))
-            assert not any(retention.is_superseded(k) for k in entry_keys(instruction))
-            # Idempotent: the same ancestor is not processed again.
-            assert module.supersede(roots, second.generation) == 0
-            assert module.supersede(roots, "unknown-generation") == 0
+            requests = ("r0", "r1", "r1", "r2", "r2", "r2")
+            # Only a prompt supersedes, and turn 1 has no earlier request.
+            for turn, request in zip(turns[:4], requests[:4], strict=True):
+                assert module.supersede(roots(turn), turn.generation, request) == 0
+            assert retention.superseded_keys() == []
+
+            marked = module.supersede(roots(prompt_2), prompt_2.generation, "r2")
+            current = set(entry_keys(prompt_2))
+            expected = (set(entry_keys(prompt_1)) | set(entry_keys(response_1))) - (
+                current
+            )
+            assert marked == len(expected) > 0
+            assert set(retention.superseded_keys()) == expected
+            for kept in (instruction, tail_2, prompt_2):
+                assert not any(retention.is_superseded(k) for k in entry_keys(kept))
+            # The same request's response supersedes nothing.
+            assert module.supersede(roots(response_2), response_2.generation, "r2") == 0
+            assert module.supersede(roots(prompt_2), "unknown-generation", "r2") == 0
             with pytest.raises(ValueError, match="mixes namespaces"):
                 module.supersede(
-                    (replace(roots[0], namespace="other"),), second.generation
+                    (replace(prompt_2.prefix, namespace="other"),),
+                    prompt_2.generation,
+                    "r2",
                 )
         finally:
             module.close()

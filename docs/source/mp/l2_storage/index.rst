@@ -442,19 +442,21 @@ Recurrent Checkpoint Retention
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Hybrid models (for example Qwen3.8-Flash-Next and GLM-5.3-Flash with its
-MTP draft state) publish recurrent checkpoints at request boundaries.  Each
-turn of a conversation publishes a new checkpoint; its attention pages are
-shared with the previous turn by content, but the recurrent state, the
-partial last attention page and auxiliary state are unique to it.  Once the
-next turn is published, those unique pages of the older turn are
-*superseded*: a request that continues the conversation restores the newer
-checkpoint instead.
+MTP draft state) publish recurrent checkpoints at request boundaries: the
+complete prompt, the response endpoint, and sometimes a prefill tail and the
+leading instructions.  Checkpoints of one conversation share attention pages
+by content, but the recurrent state, the partial last attention page and
+auxiliary state are unique to each.
 
-The vLLM integration reports each published checkpoint together with its
-token sequence.  The server then marks the unique pages of every older
-checkpoint of that sequence as superseded (``instruction`` checkpoints,
-which other conversations share, are never marked).  With every store
-policy:
+The vLLM integration reports each published checkpoint with its token
+sequence and request.  When the prompt checkpoint of a new request is
+published, the server marks as *superseded* the unique pages of every
+shorter checkpoint of that sequence produced by an earlier request, and of
+the other checkpoints those requests published.  That includes a response
+endpoint that the chat template rewrote and the next prompt therefore does
+not extend.  Checkpoints of the same request and ``instruction``
+checkpoints, which other conversations share, are never marked.  With every
+store policy:
 
 * L1 eviction drops superseded pages before any LRU victim.
 * L2 eviction deletes superseded pages before any LRU victim.

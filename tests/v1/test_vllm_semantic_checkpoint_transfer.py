@@ -529,8 +529,9 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
             # Publication reports the producing sequence so older checkpoints
             # of it are superseded; this first checkpoint has none.
             assert len(supersessions) == 1
-            roots, generation = supersessions[0]
+            roots, generation, request_id = supersessions[0]
             assert generation == store_task.manifest.generation
+            assert request_id == producer.request_id
             prefix = store_task.manifest.prefix
             assert roots and all(root.namespace == prefix.namespace for root in roots)
             assert sum(len(root.tail_tokens) for root in roots) >= prefix.num_tokens

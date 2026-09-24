@@ -2,8 +2,10 @@
 """CPU-only SHM service for atomic recurrent checkpoint generations."""
 
 # Standard
+from collections import OrderedDict
 from pathlib import Path
 import json
+import threading
 
 # First Party
 from lmcache.logging import init_logger
@@ -30,9 +32,18 @@ from lmcache.v1.multiprocess.protocols.checkpoint import (
 
 logger = init_logger(__name__)
 
-# Ancestors examined per supersession, newest first. Older ones were handled
-# by earlier turns or have long left the cache tiers.
+# Checkpoints superseded per call, newest first. Older ones were handled by
+# earlier turns or have long left the cache tiers.
 _MAX_SUPERSEDED_ANCESTORS = 32
+# Requests whose published generations are remembered for supersession.
+_MAX_TRACKED_REQUESTS = 65536
+
+
+def _kind(manifest: CheckpointManifest) -> str | None:
+    try:
+        return json.loads(manifest.payload).get("kind")
+    except (ValueError, AttributeError):
+        return None
 
 
 def _payload_keys(manifest: CheckpointManifest) -> list[ObjectKey]:
@@ -92,6 +103,10 @@ class CheckpointModule:
             pool_size=ctx.shm_pool_info["pool_size"],
             durable_index=index_path is not None,
         )
+        # Generations each recent request published, and the reverse map.
+        self._lineage_lock = threading.Lock()
+        self._request_generations: OrderedDict[str, list[str]] = OrderedDict()
+        self._generation_request: dict[str, str] = {}
 
     @property
     def context(self) -> MPCacheServerContext:
@@ -144,17 +159,24 @@ class CheckpointModule:
         """
         return self._index.find(prefixes)
 
-    def supersede(self, prefixes: tuple[CheckpointPrefix, ...], generation: str) -> int:
-        """Mark the pages only older checkpoints of a sequence still use.
+    def supersede(
+        self, prefixes: tuple[CheckpointPrefix, ...], generation: str, request: str
+    ) -> int:
+        """Mark the pages only superseded checkpoints still use.
 
-        Called after ``generation`` is published, with the roots of the token
-        sequence that produced it. Every published shorter checkpoint of that
-        sequence is superseded, except ``instruction`` checkpoints, which
-        other conversations share. Pages the new checkpoint references are
-        current again. Superseded pages are evicted first and are never
-        written to L2 on eviction; their manifests stay listed, so a request
-        that branches from an older turn can still restore it while the
-        pages last.
+        Called after ``generation`` is published by ``request``, with the
+        roots of the token sequence that produced it. Only a ``prompt``
+        checkpoint supersedes: the complete prompt of a new request replaces
+        every published shorter checkpoint of its sequence that an earlier
+        request produced, together with the other checkpoints of those
+        requests (a response endpoint that the chat template rewrote, a
+        prefill tail). Checkpoints of the same request and ``instruction``
+        checkpoints, which other conversations share, are kept. Pages the
+        new checkpoint references are current again.
+
+        Superseded pages are evicted first and are never written to L2 on
+        eviction. Their manifests stay listed, so a request that branches
+        from an older turn can still restore one while its pages last.
 
         Returns:
             Number of pages newly marked superseded.
@@ -164,27 +186,68 @@ class CheckpointModule:
             return 0
         if any(prefix.namespace != current.prefix.namespace for prefix in prefixes):
             raise ValueError("checkpoint supersession mixes namespaces")
+        self._remember(request, generation)
         retention = self._ctx.storage_manager.checkpoint_retention
         current_keys = set(_payload_keys(current))
         retention.mark_current(current_keys)
-        ancestors = [
-            ancestor
-            for ancestor in self._index.ancestors(prefixes, current.prefix.num_tokens)
-            if not retention.is_superseded_generation(ancestor.generation)
-            and json.loads(ancestor.payload).get("kind") != "instruction"
-        ][-_MAX_SUPERSEDED_ANCESTORS:]
+        if _kind(current) != "prompt":
+            return 0
+        victims: dict[str, CheckpointManifest] = {}
+        for ancestor in self._index.ancestors(prefixes, current.prefix.num_tokens):
+            owner = self._request_of(ancestor.generation)
+            if owner == request:
+                continue
+            victims[ancestor.generation] = ancestor
+            for sibling in self._generations_of(owner):
+                if sibling not in victims and sibling != generation:
+                    manifest = self._index.get(sibling)
+                    if manifest is not None:
+                        victims[sibling] = manifest
+        selected = sorted(
+            (
+                victim
+                for victim in victims.values()
+                if _kind(victim) != "instruction"
+                and victim.prefix.namespace == current.prefix.namespace
+                and not retention.is_superseded_generation(victim.generation)
+            ),
+            key=lambda victim: victim.prefix.num_tokens,
+        )[-_MAX_SUPERSEDED_ANCESTORS:]
         marked = 0
-        for ancestor in ancestors:
-            unique = [key for key in _payload_keys(ancestor) if key not in current_keys]
-            marked += retention.mark_superseded(ancestor.generation, unique)
-        if ancestors:
+        for victim in selected:
+            unique = [key for key in _payload_keys(victim) if key not in current_keys]
+            marked += retention.mark_superseded(victim.generation, unique)
+        if selected:
             logger.debug(
-                "Checkpoint of %d tokens superseded %d older checkpoints (%d pages)",
+                "Prompt checkpoint of %d tokens superseded %d older checkpoints "
+                "(%d pages)",
                 current.prefix.num_tokens,
-                len(ancestors),
+                len(selected),
                 marked,
             )
         return marked
+
+    def _remember(self, request: str, generation: str) -> None:
+        with self._lineage_lock:
+            generations = self._request_generations.setdefault(request, [])
+            self._request_generations.move_to_end(request)
+            if generation not in generations:
+                generations.append(generation)
+                self._generation_request[generation] = request
+            while len(self._request_generations) > _MAX_TRACKED_REQUESTS:
+                _, forgotten = self._request_generations.popitem(last=False)
+                for old in forgotten:
+                    self._generation_request.pop(old, None)
+
+    def _request_of(self, generation: str) -> str | None:
+        with self._lineage_lock:
+            return self._generation_request.get(generation)
+
+    def _generations_of(self, request: str | None) -> list[str]:
+        if request is None:
+            return []
+        with self._lineage_lock:
+            return list(self._request_generations.get(request, ()))
 
     def abort(self, generation: str) -> bool:
         """Prevent publication; rank copy leases still require explicit finish."""

@@ -481,12 +481,17 @@ class CheckpointSchedulerBridge:
                         RequestType.CHECKPOINT_ABORT, [pending.task.manifest.generation]
                     )
                 elif pending.roots is not None:
-                    # Published: older checkpoints of this sequence now yield
-                    # their unique pages first. The reply is not needed.
+                    # Published: a new prompt supersedes older checkpoints of
+                    # its sequence, and the server links this request's
+                    # checkpoints. The reply is not needed.
                     try:
                         self._client.submit_request(
                             RequestType.CHECKPOINT_SUPERSEDE,
-                            [pending.roots.roots, pending.task.manifest.generation],
+                            [
+                                pending.roots.roots,
+                                pending.task.manifest.generation,
+                                pending.request_id,
+                            ],
                         )
                     except Exception:
                         logger.warning(
