@@ -148,7 +148,8 @@ class CheckpointIndex:
         max_pending: Maximum unpublished generations admitted concurrently.
 
     Raises:
-        ValueError: If either capacity is not positive or the schema is unknown.
+        ValueError: If either capacity is not a positive integer or the schema
+            is unknown.
         sqlite3.Error: If the database cannot be opened or committed.
     """
 
@@ -159,8 +160,13 @@ class CheckpointIndex:
         max_entries: int = 65536,
         max_pending: int = 128,
     ) -> None:
-        if max_entries <= 0 or max_pending <= 0:
-            raise ValueError("checkpoint directory capacities must be positive")
+        if any(
+            type(capacity) is not int or capacity <= 0
+            for capacity in (max_entries, max_pending)
+        ):
+            raise ValueError(
+                "checkpoint directory capacities must be positive integers"
+            )
         self._max_entries = max_entries
         self._max_pending = max_pending
         self._pending: dict[str, _PendingManifest] = {}

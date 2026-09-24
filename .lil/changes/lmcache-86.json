@@ -2,14 +2,14 @@
   "schema": "local-inference-release-change/v1",
   "id": "lmcache-86",
   "category": "fix",
-  "summary": "Resumed conversations find their checkpoint for as long as L2 keeps its pages",
+  "summary": "Resumed conversations keep finding their checkpoint much longer",
   "models": [
     "Qwen3.8-Flash-Next",
     "GLM-5.3-Flash"
   ],
   "compatibility": "No user action required.",
   "details": [
-    "The checkpoint directory keeps 65536 manifests instead of 8192; --checkpoint-index-max-entries changes it.",
+    "The checkpoint directory keeps 65536 manifests instead of 8192, so it forgets conversations far less often while their pages are still in L2; --checkpoint-index-max-entries changes it.",
     "Checkpoint lookups use an index, so a larger directory does not slow them down. The first start on an existing directory builds that index once (about 3 s for 8192 manifests)."
   ],
   "pull_requests": [

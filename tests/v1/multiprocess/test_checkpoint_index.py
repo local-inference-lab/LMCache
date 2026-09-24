@@ -269,6 +269,14 @@ def tail_rows(index: CheckpointIndex) -> set[str]:
     return {generation for (generation,) in rows}
 
 
+@pytest.mark.parametrize("capacity", [0, -1, 2.5, True])
+def test_capacities_must_be_positive_integers(capacity: object) -> None:
+    with pytest.raises(ValueError, match="positive integers"):
+        CheckpointIndex(max_entries=capacity)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="positive integers"):
+        CheckpointIndex(max_pending=capacity)  # type: ignore[arg-type]
+
+
 def test_replaced_and_invalidated_generations_leave_no_lookup_rows() -> None:
     index = CheckpointIndex()
     first, second = manifest("producer-a"), manifest("producer-b")
