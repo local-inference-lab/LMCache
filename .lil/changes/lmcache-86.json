@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-86",
+  "category": "fix",
+  "summary": "Resumed conversations find their checkpoint for as long as L2 keeps its pages",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The checkpoint directory keeps 65536 manifests instead of 8192; --checkpoint-index-max-entries changes it.",
+    "Checkpoint lookups match inside SQLite, so a larger directory does not slow them down."
+  ],
+  "pull_requests": [
+    86
+  ]
+}
