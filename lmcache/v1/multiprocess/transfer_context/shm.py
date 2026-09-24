@@ -7,6 +7,7 @@ from multiprocessing import shared_memory
 from multiprocessing.resource_tracker import unregister
 from typing import Any
 import ctypes
+import os
 
 # Third Party
 import torch
@@ -124,19 +125,27 @@ class ShmPoolMapping:
         self._pool_size = pool_size
         self._shm: shared_memory.SharedMemory | None = None
         self._shm_buffer: memoryview | None = None
+        self._identity: tuple[int, int] | None = None
         self._pinned = False
         self._pinned_ptr = 0
         self._pinned_size = 0
+        self._open()
+
+    def _open(self) -> None:
         try:
             self._shm = shared_memory.SharedMemory(
-                name=shm_name.lstrip("/"), create=False
+                name=self._shm_name.lstrip("/"), create=False
             )
             # The SHM segment is owned by the server process. Unregister it
             # from this worker's resource tracker so that Python does not
             # unlink the segment when this worker exits.
             unregister(f"/{self._shm.name}", "shared_memory")
-            if self._shm.size != pool_size:
+            if self._shm.size != self._pool_size:
                 raise ValueError("Negotiated SHM capacity differs from the mapped pool")
+            fd = getattr(self._shm, "_fd", -1)
+            if fd >= 0 and os.path.exists(self._pool_path()):
+                mapped = os.fstat(fd)
+                self._identity = (mapped.st_dev, mapped.st_ino)
             self._shm_buffer = self._shm.buf
             # pin memory is per process
             # the shm might be pinned on lmcache server side already
@@ -146,6 +155,34 @@ class ShmPoolMapping:
         except Exception:
             self.close()
             raise
+
+    def is_current(self) -> bool:
+        """Whether the server still owns the pool object this worker mapped.
+
+        A restarted server unlinks and recreates a pool with the same name and
+        size. A worker that kept the old mapping would copy into bytes the
+        server no longer reads and read bytes it no longer writes.
+        """
+        if self._identity is None:
+            return True
+        try:
+            current = os.stat(self._pool_path())
+        except FileNotFoundError:
+            return False
+        return (current.st_dev, current.st_ino) == self._identity
+
+    def _pool_path(self) -> str:
+        return f"/dev/shm/{self._shm_name.lstrip('/')}"
+
+    def remap(self) -> None:
+        """Replace this mapping with the server's current pool of the same name.
+
+        The caller must hold no views of the old mapping and have drained all
+        DMA that used it.
+        """
+        self.close()
+        self._identity = None
+        self._open()
 
     def checkpoint_slot_views(
         self,

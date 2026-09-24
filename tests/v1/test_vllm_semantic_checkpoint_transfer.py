@@ -4,10 +4,12 @@
 # Standard
 from concurrent.futures import Future
 from dataclasses import replace
+from multiprocessing import shared_memory
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 import json
+import os
 import time
 
 # Third Party
@@ -204,6 +206,59 @@ def test_checkpoint_raw_pages_roundtrip_without_token_chunk_registration() -> No
         finally:
             worker.close()
             mapping.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA DMA")
+def test_replaced_server_pool_fails_the_lease_closed_and_is_remapped() -> None:
+    """A restarted LMCache server recreates its pool under the same name.
+
+    A worker that kept the old mapping would publish or restore bytes the
+    server never wrote. The first lease after the replacement must fail
+    without publishing, and the worker must map the new pool.
+    """
+    with open_checkpoint_rpc() as (client, module, _memory, _name):
+        capability: CheckpointCapabilities = client.submit_request(
+            RequestType.CHECKPOINT_CAPABILITIES, []
+        ).result(timeout=5)
+        mapping = ShmPoolMapping(capability.shm_name, capability.pool_size)
+        pool = torch.zeros(16, 128, device="cuda", dtype=torch.uint8)
+        layout = {"schema_version": 1, "page_bytes": 128}
+        copier = CheckpointPageCopier(pool, layout, lambda _: None, mapping, capability)
+        entry = make_manifest()
+        payload = json.loads(entry.payload)
+        for group in payload["page_groups"]:
+            group["page_bytes"] = 128
+        payload["worker_layout"] = layout
+        entry = replace(entry, world_size=1, payload=json.dumps(payload).encode())
+        path = f"/dev/shm/{capability.shm_name.lstrip('/')}"
+        os.rename(path, path + ".old")
+        replacement = shared_memory.SharedMemory(
+            name=capability.shm_name.lstrip("/"), create=True, size=capability.pool_size
+        )
+        worker = CheckpointTransferWorker(client, copier)
+        try:
+            assert not mapping.is_current()
+            assert module.begin(entry)
+            event = torch.cuda.Event()
+            event.record()
+            stored = worker.submit(
+                CheckpointTransferJob(
+                    entry, 0, "STORE", ((1, 2, 3), (4,), (5, 6), (7,)), event
+                )
+            )
+            assert stored is not None
+            with pytest.raises(ValueError, match="replaced"):
+                stored.result(timeout=5)
+            assert module.find((entry.prefix,)) is None
+            status = module.report_status()["recurrent_checkpoints"]
+            assert status["store_leases"] == 0
+            assert mapping.is_current()
+        finally:
+            worker.close()
+            mapping.close()
+            replacement.close()
+            replacement.unlink()
+            os.rename(path + ".old", path)
 
 
 def test_lora_requests_do_not_read_or_publish_the_base_weight_namespace() -> None:

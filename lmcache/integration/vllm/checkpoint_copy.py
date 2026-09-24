@@ -107,22 +107,33 @@ class CheckpointPageCopier:
         ids_flat = [block for ids in job.block_ids for block in ids]
         if len(ids_flat) != len(set(ids_flat)):
             raise ValueError("Checkpoint groups must own distinct physical pages")
-        buffers = self._transfer.checkpoint_slot_views(
-            self._capabilities,
-            lease,
-            tuple(tuple(group.page_bytes for _ in group.positions) for group in groups),
+        page_sizes = tuple(
+            tuple(group.page_bytes for _ in group.positions) for group in groups
         )
-        if job.direction == "RETRIEVE" and any(
-            page is None for group in buffers for page in group
-        ):
-            raise ValueError("Checkpoint retrieval cannot omit payload pages")
         # One enqueue burst per lease prevents interleaving producer waits with
         # another task's copies on the shared stream. No model-thread barrier.
+        # Views are borrowed under the same lock so a remap never runs while
+        # another copy still holds bytes of the old mapping.
         with (
             self._lock,
             torch_dev.device(self._pool.device),
             torch_dev.stream(self._stream),
         ):
+            if not self._transfer.is_current():
+                # The LMCache server restarted and recreated its pool. This
+                # lease may belong to either server, so it is not trusted; later
+                # leases come from the new server and use the new mapping.
+                self._transfer.remap()
+                raise ValueError(
+                    "LMCache replaced its checkpoint SHM pool; lease not trusted"
+                )
+            buffers = self._transfer.checkpoint_slot_views(
+                self._capabilities, lease, page_sizes
+            )
+            if job.direction == "RETRIEVE" and any(
+                page is None for group in buffers for page in group
+            ):
+                raise ValueError("Checkpoint retrieval cannot omit payload pages")
             try:
                 if job.producer_event is not None:
                     self._stream.wait_event(job.producer_event)
