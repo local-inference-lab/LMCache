@@ -113,13 +113,16 @@ class ECCacheEngine:
             self._storage_manager.close()
 
     def _make_cache_key(self, mm_hash: str) -> CacheEngineKey:
+        request_configs = {}
+        if getattr(self.config, "cache_namespace", None):
+            request_configs["lmcache.tag.ns"] = self.config.cache_namespace
         return CacheEngineKey(
             model_name=self._model_name,
             world_size=_EC_KEY_WORLD_SIZE,
             worker_id=_EC_KEY_WORKER_ID,
             chunk_hash=_stable_u64_from_str(mm_hash),
             dtype=self._dtype,
-            request_configs={},
+            request_configs=request_configs,
         )
 
     def contains(self, mm_hash: str) -> bool:

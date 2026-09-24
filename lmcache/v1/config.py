@@ -117,6 +117,17 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": str,
     },
     "remote_serde": {"type": Optional[str], "default": "naive", "env_converter": str},
+    # Optional engine-level cache namespace. Injected as a constant "ns" key
+    # tag on every CacheEngineKey this engine mints, so persistent or shared
+    # caches cannot replay KV chunks across incompatible runtime builds that
+    # share model_name/world_size/dtype (set it to e.g. a serving-image digest
+    # prefix). Keep values short: the legacy client/server protocol caps
+    # serialized keys at 150 bytes.
+    "cache_namespace": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
     # Feature toggles
     "use_layerwise": {
         "type": bool,
