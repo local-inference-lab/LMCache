@@ -287,6 +287,7 @@ def _build_modules(
                 Path(mp_config.checkpoint_index_path)
                 if mp_config.checkpoint_index_path is not None
                 else None,
+                index_max_entries=mp_config.checkpoint_index_max_entries,
             )
         )
 

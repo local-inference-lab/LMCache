@@ -14,6 +14,52 @@ import json
 import sqlite3
 import threading
 
+# Every checkpoint that ends inside the same hash block shares one lookup
+# bucket, so a lookup must not scan the bucket. Each published tail also gets
+# a polynomial hash in checkpoint_tails; a query hashes each of its own
+# prefixes and probes only those. The hash only selects candidates.
+_TAIL_HASH_BASE = 1_000_003
+_TAIL_HASH_MODULUS = (1 << 61) - 1
+
+# Stored tails are JSON token arrays. A candidate's tail is a token prefix of
+# the :tail query exactly when the query repeats it without the closing
+# bracket and continues with "," or "]". This confirms every hash candidate.
+_TAIL_IS_PREFIX_OF_QUERY = (
+    "substr(:tail, 1, length(c.tail) - 1) = substr(c.tail, 1, length(c.tail) - 1) "
+    "AND substr(:tail, length(c.tail), 1) IN (x'2c', x'5d')"
+)
+
+# Published candidates whose tail hash equals one of the query's prefix hashes.
+_CANDIDATES = (
+    "SELECT c.tail,c.generation,c.world_size,c.payload FROM checkpoint_tails t "
+    "JOIN checkpoints c ON c.generation=t.generation "
+    "WHERE t.namespace=:namespace AND t.start_tokens=:start "
+    "AND t.prefix_hash=:prefix_hash "
+    "AND t.tail_hash IN (SELECT value FROM json_each(:prefix_hashes)) "
+    f"AND c.num_tokens<=:num_tokens AND {_TAIL_IS_PREFIX_OF_QUERY}"
+)
+
+
+def _prefix_hashes(tokens: tuple[int, ...]) -> list[int]:
+    """Return the tail hash of every nonempty prefix of ``tokens``."""
+    hashes = []
+    value = 0
+    for token in tokens:
+        value = (value * _TAIL_HASH_BASE + token + 1) % _TAIL_HASH_MODULUS
+        hashes.append(value)
+    return hashes
+
+
+def _query_parameters(query: "CheckpointPrefix") -> dict[str, object]:
+    return {
+        "namespace": query.namespace,
+        "start": query.start_tokens,
+        "prefix_hash": query.prefix_hash,
+        "num_tokens": query.num_tokens,
+        "tail": json.dumps(query.tail_tokens).encode(),
+        "prefix_hashes": json.dumps(_prefix_hashes(query.tail_tokens)),
+    }
+
 
 @dataclass(frozen=True)
 class CheckpointPrefix:
@@ -97,11 +143,13 @@ class CheckpointIndex:
         path: SQLite database file, or ``None`` for a RAM-only directory. The
             containing directory must already exist and be trusted server data.
         max_entries: Maximum published manifests, evicting least-recently-used
-            entries. Payload eviction is independently owned by storage tiers.
+            entries. Payload eviction is independently owned by storage tiers,
+            so this should cover at least as many generations as L2 retains.
         max_pending: Maximum unpublished generations admitted concurrently.
 
     Raises:
-        ValueError: If either capacity is not positive or the schema is unknown.
+        ValueError: If either capacity is not a positive integer or the schema
+            is unknown.
         sqlite3.Error: If the database cannot be opened or committed.
     """
 
@@ -109,11 +157,16 @@ class CheckpointIndex:
         self,
         path: Path | None = None,
         *,
-        max_entries: int = 8192,
+        max_entries: int = 65536,
         max_pending: int = 128,
     ) -> None:
-        if max_entries <= 0 or max_pending <= 0:
-            raise ValueError("checkpoint directory capacities must be positive")
+        if any(
+            type(capacity) is not int or capacity <= 0
+            for capacity in (max_entries, max_pending)
+        ):
+            raise ValueError(
+                "checkpoint directory capacities must be positive integers"
+            )
         self._max_entries = max_entries
         self._max_pending = max_pending
         self._pending: dict[str, _PendingManifest] = {}
@@ -138,6 +191,41 @@ class CheckpointIndex:
                 "world_size INTEGER NOT NULL, payload BLOB NOT NULL, "
                 "access_order INTEGER NOT NULL, "
                 "PRIMARY KEY(namespace, start_tokens, prefix_hash, tail))"
+            )
+            # Capacity trimming walks entries by recency on every publication.
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS checkpoints_access_order "
+                "ON checkpoints(access_order)"
+            )
+            # A separate table keeps the checkpoints schema readable and
+            # writable by older builds. Rows they add or replace are
+            # reconciled here on the next open; lookups join on generation,
+            # so a stale row never matches.
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS checkpoint_tails ("
+                "generation TEXT PRIMARY KEY, namespace TEXT NOT NULL, "
+                "start_tokens INTEGER NOT NULL, prefix_hash BLOB NOT NULL, "
+                "tail_hash INTEGER NOT NULL)"
+            )
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS checkpoint_tails_lookup ON "
+                "checkpoint_tails(namespace, start_tokens, prefix_hash, tail_hash)"
+            )
+            self._db.execute(
+                "DELETE FROM checkpoint_tails WHERE generation NOT IN "
+                "(SELECT generation FROM checkpoints)"
+            )
+            missing = self._db.execute(
+                "SELECT generation,namespace,start_tokens,prefix_hash,tail "
+                "FROM checkpoints WHERE generation NOT IN "
+                "(SELECT generation FROM checkpoint_tails)"
+            ).fetchall()
+            self._db.executemany(
+                "INSERT INTO checkpoint_tails VALUES (?,?,?,?,?)",
+                (
+                    (*row[:4], _prefix_hashes(tuple(json.loads(row[4])))[-1])
+                    for row in missing
+                ),
             )
             self._db.execute("PRAGMA user_version=1")
         self._access_order = self._db.execute(
@@ -217,14 +305,22 @@ class CheckpointIndex:
                 return False
             prefix = manifest.prefix
             self._access_order += 1
+            tail = json.dumps(prefix.tail_tokens).encode()
             with self._db:
+                # The generation replaced for this exact prefix, if any.
+                self._db.execute(
+                    "DELETE FROM checkpoint_tails WHERE generation IN ("
+                    "SELECT generation FROM checkpoints WHERE namespace=? "
+                    "AND start_tokens=? AND prefix_hash=? AND tail=?)",
+                    (prefix.namespace, prefix.start_tokens, prefix.prefix_hash, tail),
+                )
                 self._db.execute(
                     "INSERT OR REPLACE INTO checkpoints VALUES (?,?,?,?,?,?,?,?,?)",
                     (
                         prefix.namespace,
                         prefix.start_tokens,
                         prefix.prefix_hash,
-                        json.dumps(prefix.tail_tokens).encode(),
+                        tail,
                         prefix.num_tokens,
                         generation,
                         manifest.world_size,
@@ -233,11 +329,22 @@ class CheckpointIndex:
                     ),
                 )
                 self._db.execute(
-                    "DELETE FROM checkpoints WHERE generation IN ("
-                    "SELECT generation FROM checkpoints ORDER BY access_order DESC "
-                    "LIMIT -1 OFFSET ?)",
-                    (self._max_entries,),
+                    "INSERT OR REPLACE INTO checkpoint_tails VALUES (?,?,?,?,?)",
+                    (
+                        generation,
+                        prefix.namespace,
+                        prefix.start_tokens,
+                        prefix.prefix_hash,
+                        _prefix_hashes(prefix.tail_tokens)[-1],
+                    ),
                 )
+                for table in ("checkpoint_tails", "checkpoints"):
+                    self._db.execute(
+                        f"DELETE FROM {table} WHERE generation IN ("
+                        "SELECT generation FROM checkpoints "
+                        "ORDER BY access_order DESC LIMIT -1 OFFSET ?)",
+                        (self._max_entries,),
+                    )
             del self._pending[generation]
             return True
 
@@ -284,29 +391,21 @@ class CheckpointIndex:
             ):
                 if best is not None and query.num_tokens <= best.prefix.num_tokens:
                     break
-                rows = self._db.execute(
-                    "SELECT tail,generation,world_size,payload FROM checkpoints "
-                    "WHERE namespace=? AND start_tokens=? AND prefix_hash=? "
-                    "AND num_tokens<=? ORDER BY num_tokens DESC",
-                    (
-                        query.namespace,
-                        query.start_tokens,
-                        query.prefix_hash,
-                        query.num_tokens,
-                    ),
+                row = self._db.execute(
+                    f"{_CANDIDATES} ORDER BY c.num_tokens DESC LIMIT 1",
+                    _query_parameters(query),
+                ).fetchone()
+                if row is None:
+                    continue
+                tail_blob, generation, world_size, payload = row
+                prefix = CheckpointPrefix(
+                    query.namespace,
+                    query.start_tokens,
+                    query.prefix_hash,
+                    tuple(json.loads(tail_blob)),
                 )
-                for tail_blob, generation, world_size, payload in rows:
-                    tail = tuple(json.loads(tail_blob))
-                    if query.tail_tokens[: len(tail)] != tail:
-                        continue
-                    prefix = CheckpointPrefix(
-                        query.namespace, query.start_tokens, query.prefix_hash, tail
-                    )
-                    if best is None or prefix.num_tokens > best.prefix.num_tokens:
-                        best = CheckpointManifest(
-                            generation, prefix, world_size, payload
-                        )
-                    break
+                if best is None or prefix.num_tokens > best.prefix.num_tokens:
+                    best = CheckpointManifest(generation, prefix, world_size, payload)
             if best is not None:
                 self._access_order += 1
                 with self._db:
@@ -355,23 +454,15 @@ class CheckpointIndex:
                 if query.start_tokens >= below_tokens:
                     continue
                 rows = self._db.execute(
-                    "SELECT tail,generation,world_size,payload FROM checkpoints "
-                    "WHERE namespace=? AND start_tokens=? AND prefix_hash=? "
-                    "AND num_tokens<? AND num_tokens<=?",
-                    (
+                    f"{_CANDIDATES} AND c.num_tokens<:below",
+                    {**_query_parameters(query), "below": below_tokens},
+                )
+                for tail_blob, generation, world_size, payload in rows:
+                    prefix = CheckpointPrefix(
                         query.namespace,
                         query.start_tokens,
                         query.prefix_hash,
-                        below_tokens,
-                        query.num_tokens,
-                    ),
-                )
-                for tail_blob, generation, world_size, payload in rows:
-                    tail = tuple(json.loads(tail_blob))
-                    if query.tail_tokens[: len(tail)] != tail:
-                        continue
-                    prefix = CheckpointPrefix(
-                        query.namespace, query.start_tokens, query.prefix_hash, tail
+                        tuple(json.loads(tail_blob)),
                     )
                     found.append(
                         CheckpointManifest(generation, prefix, world_size, payload)
@@ -395,9 +486,10 @@ class CheckpointIndex:
                 Invalidating a replaced generation cannot remove its replacement.
         """
         with self._lock, self._db:
-            self._db.execute(
-                "DELETE FROM checkpoints WHERE generation=?", (generation,)
-            )
+            for table in ("checkpoint_tails", "checkpoints"):
+                self._db.execute(
+                    f"DELETE FROM {table} WHERE generation=?", (generation,)
+                )
 
     def report_status(self) -> dict[str, int]:
         """Return directory counts without asserting that payload pages are resident.

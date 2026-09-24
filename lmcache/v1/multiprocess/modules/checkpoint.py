@@ -78,6 +78,7 @@ class CheckpointModule:
             a RAM-only directory. Filesystem payloads alone do not imply a
             durable manifest directory.
         max_leases: Shared limit for pending rank stores and retrieves.
+        index_max_entries: Published manifests kept before LRU removal.
 
     Shutdown requires workers to finish or abort all submitted copy leases.
     A timeout must not recycle SHM while a worker can still access its bytes.
@@ -89,11 +90,12 @@ class CheckpointModule:
         index_path: Path | None = None,
         *,
         max_leases: int = 1024,
+        index_max_entries: int = 65536,
     ) -> None:
         if not ctx.shm_pool_info["shm_name"] or ctx.shm_pool_info["pool_size"] <= 0:
             raise ValueError("Recurrent checkpoint transfers require an SHM pool")
         self._ctx = ctx
-        self._index = CheckpointIndex(index_path)
+        self._index = CheckpointIndex(index_path, max_entries=index_max_entries)
         self._payloads = CheckpointPayloadStore(
             ctx.storage_manager, self._index, max_leases=max_leases
         )
