@@ -131,3 +131,105 @@ def test_take_tasks_releases_a_parked_request_when_its_copy_wedges(
             )
         finally:
             worker.close()
+
+
+def test_reaper_retains_the_task_for_a_late_draining_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy that drains after the deadline still finishes through the normal path.
+
+    The reaper releases the parked request but must never delete the task or
+    free its pages: ``complete()`` raises ValueError on an unknown task id,
+    so a late-draining copy completing through the all-rank path after the
+    reaper fired is the public proof of retention.
+    """
+    monkeypatch.setenv("LMCACHE_CHECKPOINT_TASK_TIMEOUT", "0.2")
+    with open_checkpoint_rpc() as (client, module, mapping, _name):
+        manager = make_manager()
+        bridge = make_bridge(client, manager, lookup_timeout=5.0)
+        producer = make_request("producer")
+        checkpoint = manager.reserve_external_boundary_checkpoint(
+            producer,
+            11,
+            manager.boundary_checkpoint_page_positions(11),
+            draft_prefix_len=11,
+            kind="prompt",
+            num_ranks=4,
+        )
+        assert checkpoint is not None
+        for rank in range(4):
+            manager.acknowledge_external_boundary_checkpoint(
+                checkpoint.checkpoint_id, rank
+            )
+        bridge.store(producer, checkpoint)
+        bridge.finish_request(producer.request_id)
+        store_tasks = bridge.take_tasks()
+        deadline = time.monotonic() + 5
+        while not store_tasks and time.monotonic() < deadline:
+            store_tasks = bridge.take_tasks()
+            time.sleep(0.001)
+        assert len(store_tasks) == 1
+        store_task = store_tasks[0]
+
+        def copy_pages(job, lease) -> None:
+            for group_id, group in enumerate(lease.slots):
+                for page_id, (offset, size) in enumerate(group):
+                    pattern = bytes([job.rank * 16 + group_id * 4 + page_id]) * size
+                    mapping[offset : offset + size] = pattern
+
+        # First Party
+        from lmcache.v1.multiprocess.checkpoint_transfer import (  # noqa: E402
+            CheckpointTransferJob,
+            CheckpointTransferWorker,
+        )
+
+        worker = CheckpointTransferWorker(client, copy_pages)
+        try:
+            for rank in range(4):
+                future = worker.submit(
+                    CheckpointTransferJob(
+                        store_task.manifest,
+                        rank,
+                        "STORE",
+                        store_task.block_ids,
+                    )
+                )
+                assert future is not None and future.result(timeout=10)
+                bridge.complete({store_task.task_id: {rank: True}})
+                manager.reset_prefix_cache()
+            assert not bridge.has_pending
+
+            consumer = make_request("consumer")
+            retrieve = []
+            deadline = time.monotonic() + 5
+            while not retrieve and time.monotonic() < deadline:
+                bridge.poll_prefix(consumer)
+                retrieve = [
+                    task for task in bridge.take_tasks() if task.direction == "RETRIEVE"
+                ]
+                time.sleep(0.001)
+            assert len(retrieve) == 1
+            retrieve_task = retrieve[0]
+            # The copy wedges past the task deadline; only take_tasks runs.
+            time.sleep(0.4)
+            bridge.take_tasks()
+            assert bridge.poll_prefix(consumer), (
+                "the parked request was not released to recompute"
+            )
+            # The reaper must not delete the task: a second take_tasks
+            # delivers nothing new, and the late drain still completes.
+            assert bridge.take_tasks() == []
+            for rank in range(4):
+                future = worker.submit(
+                    CheckpointTransferJob(
+                        retrieve_task.manifest,
+                        rank,
+                        "RETRIEVE",
+                        retrieve_task.block_ids,
+                    )
+                )
+                assert future is not None and future.result(timeout=10)
+                bridge.complete({retrieve_task.task_id: {rank: True}})
+            assert not bridge.has_pending
+        finally:
+            worker.close()
