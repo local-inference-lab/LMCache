@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import json
 import math
+import os
 import time
 import uuid
 
@@ -23,6 +24,12 @@ from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocols.base import RequestType
 
 logger = init_logger(__name__)
+
+# A byte layout that has not been negotiated from every rank within this
+# many seconds is treated as failed: polls stop parking requests and the
+# engine stops spinning connector-only steps for a layout that may never
+# arrive.
+_LAYOUT_TIMEOUT_SECONDS = 120.0
 
 # Directory lookups per request, including the first. A failed restore makes
 # the server invalidate the missing generation, so each retry receives the
@@ -113,6 +120,13 @@ class CheckpointSchedulerBridge:
         if not 0 < lookup_timeout < math.inf:
             raise ValueError("Checkpoint lookup timeout must be finite and positive")
         self._lookup_timeout = lookup_timeout
+        self._layout_timeout = float(
+            os.environ.get(
+                "LMCACHE_CHECKPOINT_LAYOUT_TIMEOUT", _LAYOUT_TIMEOUT_SECONDS
+            )
+        )
+        self._born = time.monotonic()
+        self._layout_failed = False
         self._manager = manager
         self._cache = manager.boundary_checkpoints
         self._client = client
@@ -128,7 +142,9 @@ class CheckpointSchedulerBridge:
     @property
     def has_pending(self) -> bool:
         """Whether connector-only steps are needed to negotiate or drain copies."""
-        return self._layout is None or bool(self._tasks)
+        return (
+            self._layout is None and not self._layout_failed
+        ) or bool(self._tasks)
 
     def handles(self, request: "Request") -> bool:
         """Require a text request whose complete weight identity is authenticated.
@@ -181,6 +197,17 @@ class CheckpointSchedulerBridge:
         if local is not None and local.num_tokens == request.num_tokens:
             return True
         if self._layout is None:
+            if self._layout_failed or (
+                time.monotonic() - self._born >= self._layout_timeout
+            ):
+                if not self._layout_failed:
+                    self._layout_failed = True
+                    logger.warning(
+                        "Recurrent checkpoint byte layout not negotiated "
+                        "within %.0f s; serving without external checkpoints",
+                        self._layout_timeout,
+                    )
+                return True
             return False
         state = self._lookups.get(request.request_id)
         if state is None:
@@ -296,6 +323,21 @@ class CheckpointSchedulerBridge:
             or self._layout is None
             or len(self._tasks) >= self._max_tasks
         ):
+            # Stores arriving before byte layouts are negotiated were
+            # silently skipped; one log line makes the window visible from
+            # stock logs. Fires only while negotiation is still pending:
+            # once the deadline has failed it, the one-time warning already
+            # covers the state and per-store logging would spam.
+            if (
+                self._layout is None
+                and self.handles(request)
+                and not self._layout_failed
+            ):
+                logger.info(
+                    "Recurrent checkpoint store for request %s skipped: "
+                    "byte layout not negotiated yet",
+                    request.request_id,
+                )
             return
         pinned = self._cache.acquire(checkpoint.checkpoint_id)
         if pinned is None:
