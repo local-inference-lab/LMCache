@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-92",
+  "category": "fix",
+  "summary": "A shared cache server releases what a crashed engine was holding",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "When an engine crashes during a checkpoint transfer, the checkpoint writes, reads and pending entries it held are released after 10 minutes instead of pinning cache memory until the cache server restarts.",
+    "The same checkpoint can then be stored again by a surviving engine; a warning names how many were released."
+  ],
+  "pull_requests": [92]
+}
