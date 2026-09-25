@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import json
 import math
+import os
 import time
 import uuid
 
@@ -33,6 +34,13 @@ _MAX_LOOKUP_ATTEMPTS = 4
 # the request waits in the scheduler, deferred, for the whole restore.
 _SLOW_RESTORE_SECONDS = 10.0
 
+# A copy that has not drained within this many seconds is treated as wedged.
+# The reaper NEVER frees pages or deletes the task: a late-draining copy is
+# still writing into pinned destinations, so the task must drain through the
+# normal all-rank completion path; the reaper only releases the parked
+# request (lookup state done -> recompute).
+_TASK_TIMEOUT_SECONDS = 180.0
+
 if TYPE_CHECKING:
     # Third Party
     from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
@@ -58,6 +66,7 @@ class _PendingTask:
     begin: MessagingFuture[bool] | None = None
     acknowledgements: dict[int, bool] = field(default_factory=dict)
     sent: bool = False
+    timed_out: bool = False
     created: float = field(default_factory=time.monotonic)
     # Roots of the producing sequence, for superseding its older checkpoints.
     roots: CheckpointTokenRoots | None = None
@@ -113,6 +122,9 @@ class CheckpointSchedulerBridge:
         if not 0 < lookup_timeout < math.inf:
             raise ValueError("Checkpoint lookup timeout must be finite and positive")
         self._lookup_timeout = lookup_timeout
+        self._task_timeout = float(
+            os.environ.get("LMCACHE_CHECKPOINT_TASK_TIMEOUT", _TASK_TIMEOUT_SECONDS)
+        )
         self._manager = manager
         self._cache = manager.boundary_checkpoints
         self._client = client
@@ -407,8 +419,53 @@ class CheckpointSchedulerBridge:
         keys = tuple(tuple(next(flat_keys) for _ in range(width)) for width in widths)
         return keys, next(flat_keys)
 
+    def _reap_stale_tasks(self) -> None:
+        """Release parked requests from wedged copies on wall-clock deadlines.
+
+        take_tasks runs every step via build_connector_meta, including
+        connector-only steps while the waiting pass is budget-gated, so a
+        deadline evaluated here holds even when poll_prefix is never
+        re-entered for the request. The task itself is NEVER deleted and no
+        pages are freed: a late-draining copy still writes into pinned
+        destinations, so it must drain through the normal all-rank
+        completion path; only the parked request is released.
+        """
+        now = time.monotonic()
+        for task_id, pending in tuple(self._tasks.items()):
+            if now - pending.created < self._task_timeout:
+                continue
+            if pending.timed_out:
+                continue
+            pending.timed_out = True
+            logger.warning(
+                "Recurrent checkpoint %s of %d tokens for request %s exceeded "
+                "%.0f s without completing; releasing the request to recompute",
+                pending.task.direction.lower(),
+                pending.task.manifest.prefix.num_tokens,
+                pending.request_id,
+                self._task_timeout,
+            )
+            state = self._lookups.get(pending.request_id)
+            if state is not None and state.task_id == task_id:
+                state.done = True
+        for request_id, state in tuple(self._lookups.items()):
+            if (
+                state.task_id is None
+                and not state.done
+                and not state.future.query()
+                and now - state.started >= self._lookup_timeout
+            ):
+                logger.warning(
+                    "Recurrent checkpoint lookup for request %s got no reply "
+                    "within %.0f s; recomputing its prompt",
+                    request_id,
+                    self._lookup_timeout,
+                )
+                state.done = True
+
     def take_tasks(self) -> list[CheckpointEngineTask]:
         """Return each admitted collective copy exactly once, without waiting on RPC."""
+        self._reap_stale_tasks()
         tasks = []
         for task_id, pending in tuple(self._tasks.items()):
             if pending.sent:

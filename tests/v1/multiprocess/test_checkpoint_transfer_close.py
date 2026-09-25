@@ -10,7 +10,9 @@ forever.
 # Standard
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+import os
 import threading
+import time
 import uuid
 
 # Third Party
@@ -109,3 +111,55 @@ def test_close_returns_when_copies_drain_in_time(
     assert started.wait(timeout=5)
     worker.close()
     assert completion.result(timeout=5) is True
+
+
+def test_drain_deadline_arms_a_force_exit_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the hard ceiling the worker force-exits instead of hanging teardown.
+
+    concurrent.futures' atexit hook joins the executor's non-daemon threads
+    in threading._shutdown, so a copy stuck past close()'s deadline can
+    block interpreter finalization forever. After the drain deadline is
+    crossed, a watchdog must os._exit(1) with a banner unless teardown
+    completes within the hard ceiling.
+    """
+    monkeypatch.setenv("LMCACHE_CHECKPOINT_CLOSE_TIMEOUT", "0.5")
+    monkeypatch.setenv("LMCACHE_CHECKPOINT_FORCE_EXIT_CEILING", "0.3")
+    gate = threading.Event()
+
+    def copy_pages(job: CheckpointTransferJob, lease: object) -> None:
+        assert gate.wait(timeout=30)
+
+    exits: list[int] = []
+    banners: list[bytes] = []
+    monkeypatch.setattr(os, "_exit", exits.append)
+    real_write = os.write
+
+    def fake_write(fd: int, data: object) -> int:
+        if fd == 2 and isinstance(data, bytes) and b"force-exit" in data:
+            banners.append(data)
+            return len(data)
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", fake_write)
+    worker = CheckpointTransferWorker(_ready_client(), copy_pages, workers=1)
+    completion = worker.submit(CheckpointTransferJob(_manifest(), 0, "STORE", ()))
+    assert completion is not None
+    outcome: dict[str, bool] = {}
+    closer = threading.Thread(
+        target=lambda: outcome.update(unsafe=_close_raises(worker)),
+        daemon=True,
+    )
+    closer.start()
+    closer.join(timeout=10)
+    assert outcome.get("unsafe"), "close() did not raise by the drain deadline"
+    deadline = time.monotonic() + 5
+    while not exits and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert exits == [1], (
+        "no force-exit fired within the hard ceiling after the drain "
+        f"deadline (exits={exits})"
+    )
+    assert any(b"drain deadline" in b for b in banners)
+    gate.set()
