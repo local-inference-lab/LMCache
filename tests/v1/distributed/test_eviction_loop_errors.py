@@ -48,7 +48,9 @@ class FlakyUsage(Generic[UsageT]):
 def test_l1_eviction_loop_survives_a_failed_pass() -> None:
     usage = FlakyUsage((0, 100))
     manager = SimpleNamespace(
-        register_listener=lambda listener: None, get_memory_usage=usage
+        register_listener=lambda listener: None,
+        get_memory_usage=usage,
+        reclaim_abandoned_writes=lambda: 0,
     )
     controller = L1EvictionController(
         cast(Any, manager), EvictionConfig(eviction_policy="LRU")
