@@ -2,6 +2,7 @@
 """Background, metadata-only checkpoint RPC with explicit copy-lease ownership."""
 
 # Standard
+import os
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -148,7 +149,22 @@ class CheckpointTransferWorker:
         """
         with self._lock:
             self._closing = True
-        self._executor.shutdown(wait=True, cancel_futures=False)
+        timeout = float(
+            os.getenv("LMCACHE_CHECKPOINT_CLOSE_TIMEOUT", "180.0")
+        )
+        drain = threading.Thread(
+            target=self._executor.shutdown,
+            kwargs={"wait": True, "cancel_futures": False},
+            daemon=True,
+        )
+        drain.start()
+        drain.join(timeout)
+        if drain.is_alive():
+            # The executor keeps draining in the background; the late
+            # case still surfaces via _unsafe or the process teardown.
+            raise UnsafeCheckpointCopyError(
+                f"Checkpoint copies did not drain within {timeout:.0f}s"
+            )
         if self._unsafe:
             raise UnsafeCheckpointCopyError("Checkpoint copies did not drain")
 

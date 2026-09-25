@@ -77,6 +77,7 @@ class RecurrentCheckpointMetadata(KVConnectorMetadata):
     """Collective copy commands; physical IDs are valid only in this engine."""
 
     tasks: list[CheckpointEngineTask] = field(default_factory=list)
+    need_flush: bool = False
 
 
 @dataclass
@@ -285,7 +286,10 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> KVConnectorMetadata:
         """Emit each admitted task once, including on connector-only scheduler steps."""
         assert self._scheduler is not None
-        return RecurrentCheckpointMetadata(self._scheduler.take_tasks())
+        return RecurrentCheckpointMetadata(
+            self._scheduler.take_tasks(),
+            need_flush=bool(scheduler_output.preempted_req_ids),
+        )
 
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
         """Submit both transfer directions for already immutable checkpoint pages."""
@@ -322,6 +326,41 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
                 self._rejected.add(task.task_id)
             else:
                 self._pending[task.task_id] = future
+
+    def handle_preemptions(
+        self, kv_connector_metadata: KVConnectorMetadata
+    ) -> None:
+        """Drain in-flight copies before preempted blocks are overwritten.
+
+        vLLM runs this hook before the worker zeroes or re-allocates the
+        preempted request's pages. Waiting here (without consuming the
+        futures — the normal drain still owns result accounting) closes
+        the overwrite race on in-flight checkpoint copies. A copy that
+        does not drain in time is fatal by the codebase's
+        ownership-retaining convention: fail loudly, never corrupt
+        silently.
+        """
+        if not getattr(kv_connector_metadata, "need_flush", False):
+            return
+        timeout = float(
+            os.getenv("LMCACHE_CHECKPOINT_PREEMPT_FLUSH_TIMEOUT", "180.0")
+        )
+        for task, future in tuple(self._pending.items()):
+            if future.done():
+                continue
+            try:
+                future.result(timeout=timeout)
+            except UnsafeCheckpointCopyError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Recurrent checkpoint copy %s did not drain before "
+                    "preemption; its pages are about to be overwritten",
+                    task,
+                )
+                raise UnsafeCheckpointCopyError(
+                    "Preempted request's checkpoint copy did not drain"
+                ) from None
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Live requests never read an unpublished import destination."""
