@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-93",
+  "category": "fix",
+  "summary": "Engines stop using a cache server's old shared memory after the server restarts",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "If the LMCache server restarts while vLLM keeps running, workers detect the recreated RAM pool and switch to it, instead of silently writing checkpoints the server never sees and reading stale ones.",
+    "The one transfer that spans the restart fails safely: its checkpoint is not stored, or the request recomputes."
+  ],
+  "pull_requests": [93]
+}
