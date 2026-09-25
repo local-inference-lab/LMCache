@@ -233,3 +233,81 @@ def test_reaper_retains_the_task_for_a_late_draining_copy(
             assert not bridge.has_pending
         finally:
             worker.close()
+
+
+def test_reaper_unregisters_a_never_draining_store_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wedged store must not leave its staged registration standing forever.
+
+    The store's CHECKPOINT_BEGIN stages the manifest before any page is
+    materialized. A store copy that never drains leaves that staged
+    generation in the server directory: it occupies the pending admission
+    budget and silently suppresses every identical re-store (begin returns
+    False for an already-pending generation, and the bridge aborts such a
+    task before delivering it). On the task deadline the reaper submits
+    CHECKPOINT_ABORT so the registration is unregistered and a re-store is
+    admitted again. The bridge task itself is still never deleted: a
+    late-draining copy keeps finishing through the normal path.
+    """
+    monkeypatch.setenv("LMCACHE_CHECKPOINT_TASK_TIMEOUT", "0.2")
+    with open_checkpoint_rpc() as (client, module, mapping, _name):
+        manager = make_manager()
+        bridge = make_bridge(client, manager, lookup_timeout=5.0)
+        producer = make_request("producer")
+        checkpoint = manager.reserve_external_boundary_checkpoint(
+            producer,
+            11,
+            manager.boundary_checkpoint_page_positions(11),
+            draft_prefix_len=11,
+            kind="prompt",
+            num_ranks=4,
+        )
+        assert checkpoint is not None
+        for rank in range(4):
+            manager.acknowledge_external_boundary_checkpoint(
+                checkpoint.checkpoint_id, rank
+            )
+        bridge.store(producer, checkpoint)
+        bridge.finish_request(producer.request_id)
+        store_tasks = bridge.take_tasks()
+        deadline = time.monotonic() + 5
+        while not store_tasks and time.monotonic() < deadline:
+            store_tasks = bridge.take_tasks()
+            time.sleep(0.001)
+        assert len(store_tasks) == 1
+
+        # The store copy wedges: the worker never executes it. The task
+        # deadline passes with only take_tasks running, so the reaper must
+        # unregister the staged registration.
+        time.sleep(0.4)
+        bridge.take_tasks()
+
+        # An identical re-store must be admitted again: same tokens, same
+        # content-derived generation, so without the abort the staged ghost
+        # suppresses it (begin returns False and the task is never delivered).
+        successor = make_request("producer-successor")
+        successor_checkpoint = manager.reserve_external_boundary_checkpoint(
+            successor,
+            11,
+            manager.boundary_checkpoint_page_positions(11),
+            draft_prefix_len=11,
+            kind="prompt",
+            num_ranks=4,
+        )
+        assert successor_checkpoint is not None
+        for rank in range(4):
+            manager.acknowledge_external_boundary_checkpoint(
+                successor_checkpoint.checkpoint_id, rank
+            )
+        bridge.store(successor, successor_checkpoint)
+        bridge.finish_request(successor.request_id)
+        restocked = bridge.take_tasks()
+        deadline = time.monotonic() + 5
+        while not restocked and time.monotonic() < deadline:
+            restocked = bridge.take_tasks()
+            time.sleep(0.001)
+        assert len(restocked) == 1, (
+            "the reaped store's staged registration still suppresses an "
+            "identical re-store"
+        )

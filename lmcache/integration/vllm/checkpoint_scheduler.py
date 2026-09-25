@@ -429,6 +429,18 @@ class CheckpointSchedulerBridge:
         pages are freed: a late-draining copy still writes into pinned
         destinations, so it must drain through the normal all-rank
         completion path; only the parked request is released.
+
+        A wedged STORE additionally gets its staged registration aborted:
+        CHECKPOINT_BEGIN stages the manifest before any page is
+        materialized, so a copy that never drains leaves a pending
+        generation standing in the server directory, occupying the pending
+        admission budget and silently suppressing every identical re-store.
+        CHECKPOINT_ABORT only discards an unpublished generation, and a
+        late-draining copy's acknowledgements then return False, so the
+        completion path stays consistent. RETRIEVE tasks are never aborted:
+        their generation is the source checkpoint others may still restore.
+        A begin reply that never arrived is left to the begin-timeout abort
+        in take_tasks, which owns that path.
         """
         now = time.monotonic()
         for task_id, pending in tuple(self._tasks.items()):
@@ -445,6 +457,26 @@ class CheckpointSchedulerBridge:
                 pending.request_id,
                 self._task_timeout,
             )
+            if (
+                pending.task.direction == "STORE"
+                and pending.begin is not None
+                and pending.begin.query()
+                and pending.begin.result()
+            ):
+                try:
+                    self._client.submit_request(
+                        RequestType.CHECKPOINT_ABORT,
+                        [pending.task.manifest.generation],
+                    )
+                except Exception:
+                    logger.exception("Recurrent checkpoint abort submission failed")
+                else:
+                    logger.warning(
+                        "Unregistered the staged store checkpoint of %d tokens "
+                        "for request %s; a wedged copy can no longer publish it",
+                        pending.task.manifest.prefix.num_tokens,
+                        pending.request_id,
+                    )
             state = self._lookups.get(pending.request_id)
             if state is not None and state.task_id == task_id:
                 state.done = True
