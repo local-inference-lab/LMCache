@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import json
 import math
+import os
 import time
 import uuid
 
@@ -32,6 +33,11 @@ _MAX_LOOKUP_ATTEMPTS = 4
 # Restores slower than this many seconds are logged even when they succeed;
 # the request waits in the scheduler, deferred, for the whole restore.
 _SLOW_RESTORE_SECONDS = 10.0
+
+# Settings that change encoder outputs, and so the KV of multimodal spans,
+# without changing the processor's content hash. They salt multimodal roots
+# only, so text namespaces are unaffected.
+_MULTIMODAL_ENVIRONMENT = ("VLLM_GLM53_VISION_MXFP8",)
 
 if TYPE_CHECKING:
     # Third Party
@@ -117,6 +123,10 @@ class CheckpointSchedulerBridge:
         self._cache = manager.boundary_checkpoints
         self._client = client
         self._identity = dict(identity)
+        self._multimodal_salt = json.dumps(
+            {name: os.environ.get(name) for name in _MULTIMODAL_ENVIRONMENT},
+            sort_keys=True,
+        ).encode()
         self._world_size = world_size
         self._max_tasks = max_tasks
         self._layouts: dict[int, dict[str, Any]] = {}
@@ -131,7 +141,7 @@ class CheckpointSchedulerBridge:
         return self._layout is None or bool(self._tasks)
 
     def handles(self, request: "Request") -> bool:
-        """Require a text request whose complete weight identity is authenticated.
+        """Require a supported request whose weight identity is authenticated.
 
         Per-request LoRA content revisions are not part of the manifest namespace;
         such requests may use GPU-local caching but never this external directory.
@@ -575,9 +585,16 @@ class CheckpointSchedulerBridge:
             self._cancelled.discard(request_id)
 
     def _roots(self, request: "Request") -> CheckpointTokenRoots:
+        tokens = request.all_token_ids
+        if request.mm_features:
+            # Placeholder IDs are equal for every image; name spans by content.
+            # Third Party
+            from vllm.v1.core.boundary_checkpoint import content_token_ids
+
+            tokens = content_token_ids(request, 0, len(tokens), self._multimodal_salt)
         return CheckpointTokenRoots.build(
             checkpoint_namespace(self._identity, request.cache_salt or ""),
-            request.all_token_ids,
+            tokens,
         )
 
     def _validate_manifest(

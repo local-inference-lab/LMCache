@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-98",
+  "category": "feature",
+  "summary": "Conversations with images restore from the external cache",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "Needs vllm #904. Text checkpoints keep their existing names.",
+  "details": [
+    "Checkpoint names were built from token IDs only, and every image has the same placeholder IDs, so conversations with images were never stored externally. After eviction from GPU memory or a restart, one image at the start of a chat made every turn compute the whole conversation again.",
+    "Placeholder spans are now named by the image's content hash and the vision precision setting. In our restart test, two conversations with the same 15K-token text and different images restored 15,410 and 15,429 tokens and both named their own image correctly; before, 0 tokens were restored."
+  ],
+  "pull_requests": [98],
+  "requires": ["vllm-904"]
+}
