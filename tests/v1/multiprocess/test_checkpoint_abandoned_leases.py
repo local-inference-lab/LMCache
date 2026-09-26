@@ -79,3 +79,16 @@ def test_abandoned_ready_retrieve_releases_its_read_locks() -> None:
         assert service.reclaim_abandoned() == 1
         assert service.report_status()["retrieve_leases"] == 0
         assert storage.delete_l1_keys(keys)[0] == len(keys)
+
+
+def test_zero_age_disables_automatic_reclaim() -> None:
+    with open_store() as (_service, index, _storage, _mapping):
+        service = CheckpointPayloadStore(_storage, index, abandoned_after_seconds=0)
+        first = replace(make_manifest(), world_size=1)
+        assert index.begin(first)
+        assert isinstance(service.prepare_store(first, 0), CheckpointSlots)
+        service._last_reclaim -= 3600  # as if the reclaim interval had passed
+        second = replace(make_manifest(), world_size=1)
+        assert index.begin(second)
+        assert isinstance(service.prepare_store(second, 0), CheckpointSlots)
+        assert service.report_status()["store_leases"] == 2

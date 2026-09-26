@@ -127,6 +127,8 @@ class ShmPoolMapping:
         self._shm_buffer: memoryview | None = None
         # (device, inode) of the mapped pool; empty when it cannot be checked.
         self._identity: tuple[int, ...] = ()
+        # Set while a remap has not succeeded, so the next lease retries it.
+        self._stale = False
         self._pinned = False
         self._pinned_ptr = 0
         self._pinned_size = 0
@@ -164,6 +166,8 @@ class ShmPoolMapping:
         size. A worker that kept the old mapping would copy into bytes the
         server no longer reads and read bytes it no longer writes.
         """
+        if self._stale:
+            return False
         if not self._identity:
             return True
         try:
@@ -181,9 +185,13 @@ class ShmPoolMapping:
         The caller must hold no views of the old mapping and have drained all
         DMA that used it.
         """
+        self._stale = True
         self.close()
         self._identity = ()
+        # A failed open (the new server has not created its pool yet) leaves
+        # the mapping stale; the next lease calls remap again.
         self._open()
+        self._stale = False
 
     def checkpoint_slot_views(
         self,

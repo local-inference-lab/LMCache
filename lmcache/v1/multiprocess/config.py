@@ -104,6 +104,14 @@ class MPServerConfig:
     for a RAM-only directory, whose manifests live in server memory and whose
     payloads live only in L1."""
 
+    checkpoint_abandoned_lease_seconds: float = 600.0
+    """Age after which a checkpoint lease or pending generation is treated as
+    abandoned by a dead worker and released. 0 disables reclaiming. Live
+    transfers finish within the worker RPC timeout (30 s), so this must stay
+    far above it; a copy that has not drained after this long means a hung
+    CUDA context whose worker should be restarted.
+    """
+
     script_allowed_imports: list[str] = field(default_factory=list)
     """Modules that /run_script endpoint is allowed to import."""
 
@@ -454,6 +462,14 @@ def add_mp_server_args(
         "directory.",
     )
     mp_group.add_argument(
+        "--checkpoint-abandoned-lease-seconds",
+        type=float,
+        default=600.0,
+        help="Release recurrent checkpoint leases and pending generations "
+        "older than this many seconds, left behind by a worker that died "
+        "mid-transfer. 0 disables reclaiming. Default: 600.",
+    )
+    mp_group.add_argument(
         "--enable",
         type=str,
         nargs="*",
@@ -507,6 +523,7 @@ def parse_args_to_mp_server_config(
         shm_name=args.shm_name,
         checkpoint_index_path=args.checkpoint_index_path,
         checkpoint_index_max_entries=args.checkpoint_index_max_entries,
+        checkpoint_abandoned_lease_seconds=args.checkpoint_abandoned_lease_seconds,
         script_allowed_imports=args.script_allowed_imports or [],
         worker_reap_timeout_seconds=args.worker_reap_timeout_seconds,
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,
