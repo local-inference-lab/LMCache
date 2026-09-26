@@ -288,6 +288,7 @@ def _build_modules(
                 if mp_config.checkpoint_index_path is not None
                 else None,
                 index_max_entries=mp_config.checkpoint_index_max_entries,
+                abandoned_lease_seconds=mp_config.checkpoint_abandoned_lease_seconds,
             )
         )
 

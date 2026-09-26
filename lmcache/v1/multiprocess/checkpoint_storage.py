@@ -244,8 +244,12 @@ class CheckpointPayloadStore:
         max_leases: Shared bound for pending stores and retrieves. Exhaustion
             rejects admission without recycling a worker's live SHM buffers.
         abandoned_after_seconds: Age after which a lease or pending generation
-            is treated as abandoned by a dead worker and released. It must be
-            far longer than any live transfer.
+            is treated as abandoned by a dead worker and released; 0 disables
+            reclaiming. It must be far longer than any live transfer. A worker
+            whose copy could not drain (UnsafeCheckpointCopyError) keeps its
+            lease on purpose because its DMA may still touch those pages;
+            reclaiming releases that lease too, which is safe only because a
+            copy still running after this long means a hung CUDA context.
 
     The caller stages a manifest with ``index.begin`` before rank stores. Each
     successful store acknowledgement follows a drained worker D2H transfer.
@@ -262,8 +266,8 @@ class CheckpointPayloadStore:
     ) -> None:
         if max_leases < 1:
             raise ValueError("checkpoint lease capacity must be positive")
-        if not abandoned_after_seconds > 0:
-            raise ValueError("abandoned lease age must be positive")
+        if abandoned_after_seconds < 0:
+            raise ValueError("abandoned lease age must not be negative")
         self._storage = storage
         self._index = index
         self._max_leases = max_leases
@@ -501,6 +505,8 @@ class CheckpointPayloadStore:
         )
 
     def _maybe_reclaim(self) -> None:
+        if not self._abandoned_after:
+            return
         now = time.monotonic()
         with self._lock:
             if now - self._last_reclaim < min(30.0, self._abandoned_after):

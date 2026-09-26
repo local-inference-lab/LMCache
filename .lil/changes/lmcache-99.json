@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-99",
+  "category": "fix",
+  "summary": "Checkpoint lease reclaim age is configurable, and a failed SHM remap is retried",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "--checkpoint-abandoned-lease-seconds (default 600, 0 disables) sets when checkpoint transfers left by a crashed engine are released.",
+    "If the cache server restarts and its new SHM pool is not ready at the first checkpoint copy, the next copy remaps again instead of checkpoints staying off until the engine restarts."
+  ],
+  "pull_requests": [99],
+  "requires": ["lmcache-92", "lmcache-93"]
+}
