@@ -415,64 +415,71 @@ class L1EvictionController(EvictionController):
         )
 
     def eviction_loop(self):
-        watermark = self._eviction_config.trigger_watermark
-        eviction_ratio = self._eviction_config.eviction_ratio
-        backup_interval = self._eviction_config.periodic_flush_interval
-
         while not self._stop_flag.is_set():
             immediate = self._immediate_request.wait(timeout=1.0)
             self._immediate_request.clear()
             if self._stop_flag.is_set():
                 break
-            self._l1_manager.reclaim_abandoned_writes()
-            used_bytes, total_bytes = self._l1_manager.get_memory_usage()
-            if self._eviction_config.extra_logging_enabled:
-                self._maybe_log_memory_usage(used_bytes, total_bytes)
-            usage = 0 if total_bytes == 0 else used_bytes / total_bytes
-            if usage < watermark:
-                now = time.monotonic()
-                if (
-                    backup_interval > 0
-                    and self._snapshot_periodic_flush_adapters()
-                    and now - self._last_backup_flush >= backup_interval
-                ):
-                    self._last_backup_flush = now
-                    self._backup_to_l2_no_delete(self._BACKUP_FLUSH_BATCH_SIZE)
-                logger.debug(
-                    "L1 memory usage %.2f below watermark %.2f; skipping eviction.",
-                    usage,
-                    watermark,
-                )
-                self._publish_skipped(usage, watermark)
-                continue
+            try:
+                self._run_eviction_pass(immediate)
+            except Exception:
+                # An exception must not end the loop: nothing would ever be
+                # evicted again and stores would fail once L1 is full.
+                logger.exception("L1 eviction pass failed; retrying next pass")
 
+    def _run_eviction_pass(self, immediate: bool) -> None:
+        self._l1_manager.reclaim_abandoned_writes()
+        watermark = self._eviction_config.trigger_watermark
+        eviction_ratio = self._eviction_config.eviction_ratio
+        backup_interval = self._eviction_config.periodic_flush_interval
+        used_bytes, total_bytes = self._l1_manager.get_memory_usage()
+        if self._eviction_config.extra_logging_enabled:
+            self._maybe_log_memory_usage(used_bytes, total_bytes)
+        usage = 0 if total_bytes == 0 else used_bytes / total_bytes
+        if usage < watermark:
+            now = time.monotonic()
             if (
-                self._write_back_enabled
-                and time.monotonic() < self._sync_flush_backoff_until
+                backup_interval > 0
+                and self._snapshot_periodic_flush_adapters()
+                and now - self._last_backup_flush >= backup_interval
             ):
-                self._publish_skipped(usage, watermark)
-                continue
-
-            logger.info(
-                "L1 memory usage %.2f above watermark %.2f; triggering eviction%s.",
+                self._last_backup_flush = now
+                self._backup_to_l2_no_delete(self._BACKUP_FLUSH_BATCH_SIZE)
+            logger.debug(
+                "L1 memory usage %.2f below watermark %.2f; skipping eviction.",
                 usage,
                 watermark,
-                " immediately" if immediate else "",
             )
-            if self._drop_superseded():
-                used_bytes, total_bytes = self._l1_manager.get_memory_usage()
-                if total_bytes and used_bytes / total_bytes < watermark:
-                    self._publish_triggered(usage, watermark)
-                    continue
-            to_persist: list[ObjectKey] = []
-            actions = self._eviction_policy.get_eviction_actions(
-                eviction_ratio,
-                key_eligible_filter=self._eligibility_filter(to_persist),
-            )
-            for action in actions:
-                self.execute_eviction_action(action)
-            self._request_persist(to_persist)
-            self._publish_triggered(usage, watermark)
+            self._publish_skipped(usage, watermark)
+            return
+
+        if (
+            self._write_back_enabled
+            and time.monotonic() < self._sync_flush_backoff_until
+        ):
+            self._publish_skipped(usage, watermark)
+            return
+
+        logger.info(
+            "L1 memory usage %.2f above watermark %.2f; triggering eviction%s.",
+            usage,
+            watermark,
+            " immediately" if immediate else "",
+        )
+        if self._drop_superseded():
+            used_bytes, total_bytes = self._l1_manager.get_memory_usage()
+            if total_bytes and used_bytes / total_bytes < watermark:
+                self._publish_triggered(usage, watermark)
+                return
+        to_persist: list[ObjectKey] = []
+        actions = self._eviction_policy.get_eviction_actions(
+            eviction_ratio,
+            key_eligible_filter=self._eligibility_filter(to_persist),
+        )
+        for action in actions:
+            self.execute_eviction_action(action)
+        self._request_persist(to_persist)
+        self._publish_triggered(usage, watermark)
 
     def execute_eviction_action(self, action: EvictionAction):
         if action.destination == EvictionDestination.L2_CACHE:
@@ -982,7 +989,15 @@ class L2EvictionController(StorageControllerInterface):
             # calling into it.
             with self._states_lock:
                 for state in self._adapter_states:
-                    self._check_and_evict(state)
+                    try:
+                        self._check_and_evict(state)
+                    except Exception:
+                        # One failing pass must not end eviction for every
+                        # adapter for the rest of the process.
+                        logger.exception(
+                            "L2 eviction pass failed for adapter %d; retrying",
+                            state.adapter_id,
+                        )
 
     def _check_and_evict(self, state: L2AdapterEvictionState):
         if state.eviction_policy.support_isolation and self._quota_manager is not None:

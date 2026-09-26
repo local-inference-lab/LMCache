@@ -1,0 +1,12 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-94",
+  "category": "fix",
+  "summary": "Cache eviction keeps running after an unexpected error",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "An exception during one RAM or disk eviction pass is logged and the pass is retried a second later; previously it stopped eviction until restart, after which RAM filled and cache writes failed, or the disk tier grew past its size limit."
+  ],
+  "pull_requests": [94]
+}
