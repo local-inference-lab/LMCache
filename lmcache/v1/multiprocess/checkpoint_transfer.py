@@ -22,6 +22,11 @@ from lmcache.v1.multiprocess.protocols.checkpoint import (
 
 logger = init_logger(__name__)
 
+# Seconds a cancelled lookup may take to drain before the worker stops waiting
+# for it. It exposed no slots, and the server releases a cancelled lookup
+# itself once storage answers, so its request need not wait any longer.
+_CANCELLED_LOOKUP_DRAIN_SECONDS = 1.0
+
 
 class UnsafeCheckpointCopyError(RuntimeError):
     """A copy or SHM lease could not drain; its resources must remain owned.
@@ -65,6 +70,10 @@ class CheckpointTransferWorker:
         rpc_timeout: Metadata reply deadline, in seconds. A timed-out lease
             acquisition or completion receives one additional deadline to reconcile
             ownership. Failure is fatal instead of abandoning its SHM reservation.
+            A retrieve lookup still pending after this long is cancelled and
+            misses. A cancelled lookup exposed no slots: if storage does not
+            answer within a second, the worker leaves it to the server, which
+            releases it once storage answers.
 
     Successful store completion acknowledges drained rank bytes, not all-rank
     manifest publication. The directory exclusively owns that publication.
@@ -194,8 +203,19 @@ class CheckpointTransferWorker:
 
     def _discard_uncopied_lease(
         self, lease: CheckpointLeaseResponse, *, store: bool
-    ) -> None:
-        """Release a lease whose slots never reached the GPU copy callback."""
+    ) -> bool:
+        """Release a lease whose slots never reached the GPU copy callback.
+
+        A pending lookup is cancelled. It exposed no slots, so if it does not
+        drain within a second, or the cancellation fails, it is left to the
+        server, which releases a cancelled lookup once storage answers.
+
+        Returns:
+            False if a pending lookup was left to the server, otherwise True.
+
+        Raises:
+            Exception: If a lease with exposed slots could not be finished.
+        """
 
         def call(request: RequestType, *payloads: object) -> Any:
             return self._client.submit_request(request, list(payloads)).result(
@@ -203,24 +223,49 @@ class CheckpointTransferWorker:
             )
 
         if lease.status in ("miss", "busy"):
-            return
+            return True
         if store:
             call(RequestType.CHECKPOINT_FINISH_STORE, lease.lease_id, False)
-            return
+            return True
         if lease.status == "ready":
             call(RequestType.CHECKPOINT_FINISH_RETRIEVE, lease.lease_id)
-            return
-        call(RequestType.CHECKPOINT_CANCEL_RETRIEVE, lease.lease_id)
-        deadline = time.monotonic() + self._rpc_timeout
-        while lease.status == "pending":
-            if time.monotonic() >= deadline:
-                raise LMCacheTimeoutError(
-                    "Cancelled checkpoint storage lookup did not drain"
-                )
-            time.sleep(0.001)
-            lease = call(RequestType.CHECKPOINT_POLL_RETRIEVE, lease.lease_id)
+            return True
+        try:
+            call(RequestType.CHECKPOINT_CANCEL_RETRIEVE, lease.lease_id)
+            deadline = time.monotonic() + min(
+                self._rpc_timeout, _CANCELLED_LOOKUP_DRAIN_SECONDS
+            )
+            while lease.status == "pending":
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.001)
+                lease = call(RequestType.CHECKPOINT_POLL_RETRIEVE, lease.lease_id)
+        except Exception:
+            logger.warning(
+                "Could not cancel a pending checkpoint lookup; the LMCache server "
+                "releases it once it is abandoned",
+                exc_info=True,
+            )
+            return False
         if lease.status == "ready":
             call(RequestType.CHECKPOINT_FINISH_RETRIEVE, lease.lease_id)
+        return True
+
+    def _discard_retrieve_lookup(self, lease: CheckpointLeaseResponse) -> bool:
+        """Discard an uncopied retrieve lease; see ``_discard_uncopied_lease``.
+
+        Raises:
+            UnsafeCheckpointCopyError: If a lease with exposed slots could not
+                be finished; transfer admission stops.
+        """
+        try:
+            return self._discard_uncopied_lease(lease, store=False)
+        except BaseException as drain_error:
+            with self._lock:
+                self._unsafe = True
+            raise UnsafeCheckpointCopyError(
+                "Cancelled checkpoint lease ownership could not drain"
+            ) from drain_error
 
     def _run(self, job: CheckpointTransferJob) -> bool:
         store = job.direction == "STORE"
@@ -245,30 +290,10 @@ class CheckpointTransferWorker:
             # requests. A pending lookup owns no worker-visible byte slots yet.
             started = time.monotonic()
             deadline = started + self._rpc_timeout
-            cancelled = False
             try:
-                while lease.status == "pending":
-                    if not cancelled and (
-                        self._closing or time.monotonic() >= deadline
-                    ):
-                        if not self._closing:
-                            logger.warning(
-                                "Checkpoint retrieve of %d tokens for rank %d is "
-                                "still waiting for storage after %.0f s; cancelling "
-                                "it, so the request recomputes its prompt",
-                                job.manifest.prefix.num_tokens,
-                                job.rank,
-                                time.monotonic() - started,
-                            )
-                        self._call(
-                            RequestType.CHECKPOINT_CANCEL_RETRIEVE, lease.lease_id
-                        )
-                        cancelled = True
-                        deadline = time.monotonic() + self._rpc_timeout
-                    if cancelled and time.monotonic() >= deadline:
-                        raise LMCacheTimeoutError(
-                            "Checkpoint lookup cancellation did not drain"
-                        )
+                while lease.status == "pending" and not (
+                    self._closing or time.monotonic() >= deadline
+                ):
                     time.sleep(0.001)
                     lease = self._call(
                         RequestType.CHECKPOINT_POLL_RETRIEVE, lease.lease_id
@@ -277,16 +302,28 @@ class CheckpointTransferWorker:
                 raise
             except BaseException:
                 # No slots have reached the copy callback. The server can
-                # safely cancel this lookup, but must drain its storage locks.
-                try:
-                    self._discard_uncopied_lease(lease, store=False)
-                except BaseException as drain_error:
-                    with self._lock:
-                        self._unsafe = True
-                    raise UnsafeCheckpointCopyError(
-                        "Cancelled checkpoint lease ownership could not drain"
-                    ) from drain_error
+                # safely cancel this lookup and release its storage locks.
+                self._discard_retrieve_lookup(lease)
                 raise
+            if lease.status == "pending":
+                if not self._closing:
+                    logger.warning(
+                        "Checkpoint retrieve of %d tokens for rank %d is still "
+                        "waiting for storage after %.0f s; cancelling it, so the "
+                        "request recomputes its prompt",
+                        job.manifest.prefix.num_tokens,
+                        job.rank,
+                        time.monotonic() - started,
+                    )
+                if not self._discard_retrieve_lookup(lease):
+                    logger.info(
+                        "Storage has not answered the cancelled checkpoint "
+                        "retrieve of %d tokens for rank %d; the LMCache server "
+                        "releases it once storage answers",
+                        job.manifest.prefix.num_tokens,
+                        job.rank,
+                    )
+                return False
         if lease.status == "miss":
             return False
         if lease.status != "ready":

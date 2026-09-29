@@ -7,6 +7,7 @@ Every lease remains pinned until its worker reports completion of the copy.
 """
 
 # Standard
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 import hashlib
@@ -48,6 +49,9 @@ logger = init_logger(__name__)
 # seconds, as store admission does: a pass frees nothing while its victims are
 # still pinned by other restores or L2 writes.
 _ROOM_REQUEST_INTERVAL_SECONDS = 0.5
+# Released cancelled lookups remembered so that a later poll from their worker
+# still gets the miss; a poll of an older one raises KeyError.
+_MAX_RELEASED_CANCELLED_LOOKUPS = 4096
 
 
 @dataclass(frozen=True)
@@ -254,6 +258,8 @@ class CheckpointPayloadStore:
     The caller stages a manifest with ``index.begin`` before rank stores. Each
     successful store acknowledgement follows a drained worker D2H transfer.
     Retrieval completion similarly follows H2D completion, not MQ delivery.
+    A cancelled lookup belongs to this store: its worker may stop polling it,
+    and the next call on this store after its storage lookup ends releases it.
     """
 
     def __init__(
@@ -277,6 +283,10 @@ class CheckpointPayloadStore:
         self._store_ranks: set[tuple[str, int]] = set()
         self._retrieves: dict[str, _RetrieveLease] = {}
         self._retrieve_admissions: set[str] = set()
+        # Cancelled lookups still waiting for storage, and the last ones
+        # released without a poll from their worker.
+        self._cancelled: set[str] = set()
+        self._released_cancelled: OrderedDict[str, None] = OrderedDict()
         self._lock = threading.Lock()
 
     def prepare_store(
@@ -298,6 +308,7 @@ class CheckpointPayloadStore:
             ValueError: For invalid layouts or a duplicate producer rank.
         """
         self._maybe_reclaim()
+        self._release_cancelled()
         groups = checkpoint_page_groups(manifest)
         key_groups = checkpoint_object_keys(manifest, rank)
         if not self._index.is_pending(manifest):
@@ -468,6 +479,7 @@ class CheckpointPayloadStore:
             ValueError: If the manifest layout or rank is invalid.
         """
         self._maybe_reclaim()
+        self._release_cancelled()
         keys = [
             key for group in checkpoint_object_keys(manifest, rank) for key in group
         ]
@@ -552,17 +564,14 @@ class CheckpointPayloadStore:
             ]
             for lease_id in lookups:
                 self._retrieves[lease_id].cancelled = True
+                self._cancelled.add(lease_id)
         for _lease_id, store_lease in stores:
             self._storage.abort_write(store_lease.keys)
             self._index.abort(store_lease.manifest.generation)
         for _lease_id, read_lease in ready:
             self._storage.finish_read_prefetched(read_lease.keys)
-        for lease_id in lookups:
-            try:
-                # A cancelled lookup releases its locks once its prefetch ends.
-                self.poll_retrieve(lease_id)
-            except KeyError:
-                pass
+        # A cancelled lookup releases its locks once its prefetch ends.
+        self._release_cancelled()
         stale = self._index.abort_stale(self._abandoned_after)
         reclaimed = len(stores) + len(ready) + len(lookups) + len(stale)
         if reclaimed:
@@ -582,13 +591,22 @@ class CheckpointPayloadStore:
 
         Store counts include reservations being prepared. Retrieve counts
         include prefetch submissions that have not yet returned their handle.
-        A shutdown coordinator must drain these leases before closing storage.
+        ``retrieve_lookups`` counts the retrieve leases that exposed no slots
+        to a worker, and ``cancelled_lookups`` those of them that were
+        cancelled and wait for storage. A shutdown coordinator must drain the
+        store leases and the retrieve leases with exposed slots before closing
+        storage.
         """
         with self._lock:
+            lookups = sum(
+                1 for lease in self._retrieves.values() if lease.slots is None
+            )
             return {
                 "store_leases": len(self._store_ranks),
                 "retrieve_leases": len(self._retrieves)
                 + len(self._retrieve_admissions),
+                "retrieve_lookups": lookups + len(self._retrieve_admissions),
+                "cancelled_lookups": len(self._cancelled),
                 "max_leases": self._max_leases,
             }
 
@@ -611,10 +629,51 @@ class CheckpointPayloadStore:
             at most the storage admission timeout; a lease that never gets
             room misses without invalidating its generation.
 
+            A cancelled lookup that this store already released returns False
+            once more.
+
         Raises:
             KeyError: If the lease is unknown or already finished.
             ValueError: If stored payload byte layouts do not match the manifest.
         """
+        try:
+            return self._poll(lease_id)
+        except KeyError:
+            with self._lock:
+                if lease_id not in self._released_cancelled:
+                    raise
+                del self._released_cancelled[lease_id]
+            return False
+        finally:
+            self._release_cancelled()
+
+    def _release_cancelled(self) -> None:
+        """Release the cancelled lookups whose storage lookup has ended.
+
+        A worker may stop polling a lookup once it cancelled it; this store
+        releases the lookup's locks instead, on its next call.
+        """
+        with self._lock:
+            if not self._cancelled:
+                return
+            lease_ids = list(self._cancelled)
+        for lease_id in lease_ids:
+            try:
+                self._poll(lease_id)
+            except KeyError:
+                pass
+            except Exception:
+                # reclaim_abandoned retries it once the lease is abandoned.
+                logger.exception("Could not release a cancelled checkpoint lookup")
+                with self._lock:
+                    self._cancelled.discard(lease_id)
+                continue
+            with self._lock:
+                if lease_id not in self._retrieves:
+                    self._cancelled.discard(lease_id)
+
+    def _poll(self, lease_id: str) -> CheckpointSlots | bool | None:
+        """Advance one lease as ``poll_retrieve`` describes."""
         with self._lock:
             lease = self._retrieves[lease_id]
             if lease.slots is not None:
@@ -708,8 +767,17 @@ class CheckpointPayloadStore:
         return None
 
     def _miss(self, lease_id: str, lease: _RetrieveLease, outcome: str) -> bool:
-        """Forget a lease whose read locks are released, and say why."""
+        """Forget a lease whose read locks are released, and say why.
+
+        A cancelled lookup is remembered, so a later poll from its worker
+        still gets the miss.
+        """
         del self._retrieves[lease_id]
+        if lease.cancelled:
+            self._cancelled.discard(lease_id)
+            self._released_cancelled[lease_id] = None
+            while len(self._released_cancelled) > _MAX_RELEASED_CANCELLED_LOOKUPS:
+                self._released_cancelled.popitem(last=False)
         logger.info(
             "Checkpoint retrieve of %d tokens for rank %d %s after %.1f s: "
             "%d of %d pages were readable",
@@ -744,20 +812,29 @@ class CheckpointPayloadStore:
         self._storage.finish_read_prefetched(lease.keys)
 
     def cancel_retrieve(self, lease_id: str) -> None:
-        """Mark a pending lookup for draining without exposing its SHM slots.
+        """Cancel a pending lookup without exposing its SHM slots.
+
+        The store owns the cancelled lookup from then on: it releases the
+        lookup's locks on its first call after the storage lookup ends, even
+        if the worker stops polling. A worker that keeps polling gets False
+        once it is released. Cancelling an unknown or released lease does
+        nothing.
 
         Args:
             lease_id: Lookup whose consumer was cancelled before H2D submission.
-                The caller must keep polling until False releases lookup locks.
 
         Raises:
             ValueError: If slots were already exposed; their GPU copy must first
                 drain and use ``finish_retrieve`` instead.
         """
         with self._lock:
-            lease = self._retrieves[lease_id]
+            lease = self._retrieves.get(lease_id)
+            if lease is None:
+                return
             if lease.slots is not None:
                 raise ValueError(
                     "prepared checkpoint retrieval requires copy completion"
                 )
             lease.cancelled = True
+            self._cancelled.add(lease_id)
+        self._release_cancelled()

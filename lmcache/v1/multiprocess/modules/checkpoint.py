@@ -102,8 +102,10 @@ class CheckpointModule:
 
     At shutdown, :meth:`drain_stores` gives workers a bounded time to finish
     or abort their copy leases while the message queue still serves them.
-    A lease left after that makes :meth:`close` raise; its buffers are never
-    recycled while a worker can still access their bytes.
+    A copy lease left after that makes :meth:`close` raise; its buffers are
+    never recycled while a worker can still access their bytes. A retrieve
+    whose lookup is still waiting for storage exposed no buffers to a worker
+    and does not count.
     """
 
     def __init__(
@@ -425,9 +427,11 @@ class CheckpointModule:
         return True
 
     def cancel_retrieve(self, lease_id: str) -> bool:
-        """Cancel unexposed lookup; callers must poll until its locks drain.
+        """Cancel an unexposed lookup; the server releases it once storage answers.
 
-        Once slots are exposed, use finish_retrieve after H2D completion instead.
+        The caller may keep polling until the lookup misses, or stop polling:
+        its locks are released either way. Once slots are exposed, use
+        finish_retrieve after H2D completion instead.
         """
         self._payloads.cancel_retrieve(lease_id)
         return True
@@ -518,14 +522,23 @@ class CheckpointModule:
         :meth:`drain_stores` gives workers a bounded time first, and
         ``MPCacheServer.close`` logs this error and still closes the storage
         manager, so its shutdown flush runs and its shared memory is released
-        without reusing a lease's buffers.
+        without reusing a lease's buffers. A retrieve whose lookup is still
+        waiting for storage exposed no buffer to a worker and does not block
+        closing; the storage manager ends its lookup.
         """
         status = self._payloads.report_status()
-        if status["store_leases"] or status["retrieve_leases"]:
+        exposed = status["retrieve_leases"] - status["retrieve_lookups"]
+        if status["store_leases"] or exposed:
             raise RuntimeError(
                 f"Checkpoint worker copy leases must drain before close "
-                f"({status['store_leases']} store, "
-                f"{status['retrieve_leases']} retrieve)"
+                f"({status['store_leases']} store, {exposed} retrieve)"
+            )
+        if status["retrieve_lookups"]:
+            logger.info(
+                "Closing with %d checkpoint lookups still waiting for storage "
+                "(%d cancelled); no worker received their pages",
+                status["retrieve_lookups"],
+                status["cancelled_lookups"],
             )
         self._ctx.storage_manager.checkpoint_retention.clear_retirement(
             self._retire_generations
