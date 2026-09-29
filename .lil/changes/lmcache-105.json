@@ -1,0 +1,23 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-105",
+  "category": "fix",
+  "summary": "A checkpoint restore that cannot get RAM no longer removes an intact disk checkpoint from the directory",
+  "models": [
+    "GLM-5.3-Flash",
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "A restore from disk loads a checkpoint's pages only into RAM reserved for all of them. When that reservation failed, the restore was repeated once, and if the repeat failed too while RAM looked free by the time the cache checked (RAM held briefly by other restores or writes, or free RAM split into pieces smaller than a page), the checkpoint was removed from the directory although every page was intact on disk. Later turns of that conversation then recomputed their prompts instead of restoring.",
+    "The cache now decides from the allocation result itself: a restore whose pages could not be reserved is repeated, 20 ms apart, until the store admission timeout (default 8 s), and then misses with its checkpoint still listed, so a later request restores it. Only a restore that got its RAM and still found pages unreadable retires the checkpoint, also when the first lookup answers after the timeout. A checkpoint larger than the whole RAM tier also stays listed, and the room a waiting restore asks eviction for now includes each page's 4 KiB alignment."
+  ],
+  "pull_requests": [
+    105
+  ],
+  "requires": [],
+  "authors": [
+    "ktsaou",
+    "voipmonitor"
+  ]
+}

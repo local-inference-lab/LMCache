@@ -49,6 +49,8 @@ logger = init_logger(__name__)
 # seconds, as store admission does: a pass frees nothing while its victims are
 # still pinned by other restores or L2 writes.
 _ROOM_REQUEST_INTERVAL_SECONDS = 0.5
+# Pause before repeating a lookup whose load buffers could not be reserved.
+_RESERVATION_RETRY_SECONDS = 0.02
 # Released cancelled lookups remembered so that a later poll from their worker
 # still gets the miss; a poll of an older one raises KeyError.
 _MAX_RELEASED_CANCELLED_LOOKUPS = 4096
@@ -237,6 +239,7 @@ class _RetrieveLease:
     readable: int = 0
     unread_bytes: int = 0
     eviction_requested: float = 0.0
+    resubmit_after: float = 0.0
 
 
 class CheckpointPayloadStore:
@@ -743,6 +746,13 @@ class CheckpointPayloadStore:
             return self._miss(
                 lease_id, lease, "cannot fit in RAM; its checkpoint stays listed"
             )
+        if reservation_failed:
+            now = time.monotonic()
+            if now - lease.started >= self._storage.store_admission_timeout_seconds:
+                return self._miss(
+                    lease_id, lease, "found no room in RAM; its checkpoint stays listed"
+                )
+            lease.resubmit_after = now + _RESERVATION_RETRY_SECONDS
         # Without L2, or with more pages than RAM can hold, no repeat loads them.
         if (
             self._storage.l2_adapters()
@@ -769,15 +779,15 @@ class CheckpointPayloadStore:
         if lease.cancelled:
             return self._miss(lease_id, lease, "was cancelled by the engine")
         now = time.monotonic()
+        used, total = self._storage.get_l1_usage()
+        if total - used >= lease.unread_bytes and now >= lease.resubmit_after:
+            lease.handle = self._lookup(lease_id, lease.manifest, lease.keys)
+            lease.lookups += 1
+            return None
         if now - lease.started >= self._storage.store_admission_timeout_seconds:
             return self._miss(
                 lease_id, lease, "found no room in RAM; its checkpoint stays listed"
             )
-        used, total = self._storage.get_l1_usage()
-        if total - used >= lease.unread_bytes:
-            lease.handle = self._lookup(lease_id, lease.manifest, lease.keys)
-            lease.lookups += 1
-            return None
         if now - lease.eviction_requested >= _ROOM_REQUEST_INTERVAL_SECONDS:
             lease.eviction_requested = now
             self._storage.request_immediate_eviction()
