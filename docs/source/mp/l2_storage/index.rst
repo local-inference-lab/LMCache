@@ -509,6 +509,14 @@ SIGKILL; with a shorter stop timeout the most valuable pages are written
 first, and the checkpoints left incomplete are retired by lookups after the
 restart.
 
+**Slow storage.**  A restore waits up to 30 s for its pages to be looked up
+and loaded, for example behind a burst of on-evict writes to a slow disk.
+Then the engine cancels it, and the request looks the checkpoint up again or
+recomputes its prompt; the engine keeps serving.  A lookup still waiting for
+the disk has handed no memory to the GPU, so the engine waits at most a
+second for the cancellation and the cache releases the lookup once the disk
+answers.  A clean shutdown does not wait for such lookups.
+
 **Sizing.**  With write-through (``default``) the L2 retention time is about::
 
     L2 capacity / (requests per minute x checkpoint bytes per request)
