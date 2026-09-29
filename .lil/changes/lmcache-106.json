@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-106",
+  "category": "fix",
+  "summary": "A checkpoint restore that waits too long for the disk tier no longer stops the model; the request recomputes its prompt",
+  "models": [
+    "GLM-5.3-Flash",
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "A restore that waited 30 s for the disk tier (for example behind a large burst of on-evict writes) was cancelled, and if the disk still had not answered 30 s later both ranks raised UnsafeCheckpointCopyError ('Checkpoint lookup cancellation did not drain', 'Cancelled checkpoint lease ownership could not drain'). The model stopped, and the cache logged 'Checkpoint worker copy leases must drain before close' at shutdown.",
+    "A restore still waiting for the disk has handed no memory to the GPU. The model now waits at most 1 s for the cancellation and treats the restore as a miss: the request looks its checkpoint up again or recomputes its prompt, other requests keep being served, and later restores and stores work. The cache releases the cancelled lookup once the disk answers, and shutdown no longer waits for it.",
+    "Copies that did receive cache memory keep the existing fail-safe behavior."
+  ],
+  "pull_requests": [
+    106
+  ],
+  "requires": []
+}
