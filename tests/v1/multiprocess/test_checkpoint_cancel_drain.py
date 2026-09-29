@@ -141,10 +141,10 @@ def test_failed_poll_of_a_pending_lookup_is_not_fatal() -> None:
 def _stall_lookups(monkeypatch: pytest.MonkeyPatch, storage: Any) -> threading.Event:
     """Keep every prefetch pending until the returned event is set."""
     answer = threading.Event()
-    query = storage.query_prefetch_status
+    query = storage.query_prefetch_status_detailed
     monkeypatch.setattr(
         storage,
-        "query_prefetch_status",
+        "query_prefetch_status_detailed",
         lambda handle: query(handle) if answer.is_set() else None,
     )
     return answer
