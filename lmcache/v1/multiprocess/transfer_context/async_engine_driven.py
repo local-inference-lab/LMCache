@@ -219,6 +219,19 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             full_block_ids = _single_group_block_ids(block_ids)
 
             def _prepare_gather_and_commit() -> None:
+                # Executor threads inherit CUDA device 0 (thread-local state), so
+                # phases that run outside the gather-phase stream context below
+                # (prepare/commit RPCs, staging) would otherwise touch cuda:0 and
+                # leak a context on another TP rank's GPU. Pin the task's thread
+                # to the device backing this worker's paged KV for the whole task.
+                _kv_dev = None
+                for _v in kv_caches.values():
+                    _t = _v if torch.is_tensor(_v) else (_v[0] if isinstance(_v, (list, tuple)) and _v and torch.is_tensor(_v[0]) else None)
+                    if _t is not None:
+                        _kv_dev = _t.device
+                        break
+                if _kv_dev is not None and getattr(_kv_dev, "type", "") == "cuda":
+                    torch.cuda.set_device(_kv_dev)
                 gather_done: Any | None = None
                 gather_may_be_inflight = False
                 ok = False
@@ -460,6 +473,19 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 self._pending_stores.add(gather_launched)
 
             def _prepare_gather_and_commit() -> None:
+                # Executor threads inherit CUDA device 0 (thread-local state), so
+                # phases that run outside the gather-phase stream context below
+                # (prepare/commit RPCs, staging) would otherwise touch cuda:0 and
+                # leak a context on another TP rank's GPU. Pin the task's thread
+                # to the device backing this worker's paged KV for the whole task.
+                _kv_dev = None
+                for _v in kv_caches.values():
+                    _t = _v if torch.is_tensor(_v) else (_v[0] if isinstance(_v, (list, tuple)) and _v and torch.is_tensor(_v[0]) else None)
+                    if _t is not None:
+                        _kv_dev = _t.device
+                        break
+                if _kv_dev is not None and getattr(_kv_dev, "type", "") == "cuda":
+                    torch.cuda.set_device(_kv_dev)
                 gather_done: Any | None = None
                 gather_may_be_inflight = False
                 ok = False
