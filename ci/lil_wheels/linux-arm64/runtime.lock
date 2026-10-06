@@ -9,4 +9,4 @@ python.version=3.12
 cuda.version=13.4.1
 pytorch.version=2.14.0a0+4fdf77b940.nv26.8.63802676
 pytorch.commit=4fdf77b940a7e61d854b9be527884e38f32d335a
-cuda.arch-list=12.0f
+cuda.arch-list=12.1a
