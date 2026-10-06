@@ -4,7 +4,16 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tool_dir="${repo_root}/ci/lil_wheels"
-lock_path="${tool_dir}/runtime.lock"
+# linux/amd64 uses the locks next to this script; another platform keeps its
+# own runtime and build-tool locks in a directory named after the platform.
+platform=${LIL_WHEEL_PLATFORM:-linux/amd64}
+case "${platform}" in
+  linux/amd64) lock_dir="${tool_dir}" ;;
+  linux/arm64) lock_dir="${tool_dir}/linux-arm64" ;;
+  *) printf 'Unsupported wheel platform: %s\n' "${platform}" >&2; exit 1 ;;
+esac
+lock_path="${lock_dir}/runtime.lock"
+build_requirements="${lock_dir#"${repo_root}/"}/build-requirements.lock"
 output_dir=${1:-"${repo_root}/dist/lil-lmcache-wheel"}
 
 lock_value() {
@@ -19,6 +28,14 @@ source_date_epoch=$(git -C "${repo_root}" show -s --format=%ct HEAD)
 repository=${GITHUB_REPOSITORY:-local-inference-lab/LMCache}
 release_tag=${LMCACHE_RELEASE_TAG:-"lmcache-cu134-sm120-beta-${source_commit}"}
 builder=$(lock_value buildx.builder)
+# Locks without a platform key predate arm64 and describe linux/amd64.
+test "$(lock_value platform 2>/dev/null || echo linux/amd64)" = "${platform}"
+cuda_arch_list=$(lock_value cuda.arch-list)
+# Separate platforms must never share native objects in BuildKit caches.
+cache_platform=
+if [[ ${platform} != linux/amd64 ]]; then
+  cache_platform="-${platform#linux/}-${cuda_arch_list//./}"
+fi
 test -z "$(git -C "${repo_root}" status --porcelain)"
 
 mkdir -p "$(dirname "${output_dir}")"
@@ -33,7 +50,12 @@ python3 "${tool_dir}/verify_community_source.py" --root "${repo_root}" \
 
 docker buildx build \
   --builder "${builder}" \
+  --platform "${platform}" \
   --file "${tool_dir}/Dockerfile" \
+  --build-arg "BUILD_REQUIREMENTS=${build_requirements}" \
+  --build-arg "TORCH_CUDA_ARCH_LIST=${cuda_arch_list}" \
+  --build-arg "CMAKE_CUDA_ARCHITECTURES=${cuda_arch_list//./}" \
+  --build-arg "CACHE_PLATFORM=${cache_platform}" \
   --build-arg "BUILDER_IMAGE=$(lock_value builder.image)" \
   --build-arg "UV_IMAGE=$(lock_value uv.image)" \
   --build-arg "UV_SHA256=$(lock_value uv.sha256)" \
