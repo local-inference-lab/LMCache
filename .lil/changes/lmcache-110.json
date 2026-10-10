@@ -1,0 +1,25 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-110",
+  "category": "fix",
+  "summary": "On hybrid models LMCache no longer fills its RAM tier with cached chunks it can never evict",
+  "models": [
+    "GLM-5.3-Flash",
+    "Qwen3.8-Flash-Next",
+    "DeepSeek-V4.1-Flash",
+    "DeepSeek-V4-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "LMCache stores each cached chunk of a hybrid model as several objects, one per TP rank and layer group. Since the August 31 eviction change, the RAM tier evicted a chunk only when all of its objects were present.",
+    "Many chunks never get every object. A prefix restored from disk brings back sliding-window layers only for its last window, and Mamba layers skip chunks that hold no state.",
+    "The memory of such chunks could not be freed. The RAM tier filled up, new prefixes were no longer cached, and the log kept repeating 'L1 memory usage ... above watermark; triggering eviction'.",
+    "A chunk with a missing object now becomes evictable 30 s after its last object arrived, and its objects are evicted together.",
+    "Complete chunks are evicted as before. The 30 s wait still prevents a chunk from being split while one rank is still storing it."
+  ],
+  "pull_requests": [
+    110
+  ],
+  "evidence": [],
+  "requires": []
+}
