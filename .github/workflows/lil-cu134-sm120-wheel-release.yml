@@ -16,6 +16,8 @@ on:
       - ci/lil_wheels/**
       - pyproject.toml
       - setup.py
+  # Rebuilds the current branch head when GitHub drops a push event.
+  workflow_dispatch:
 
 permissions:
   contents: write
