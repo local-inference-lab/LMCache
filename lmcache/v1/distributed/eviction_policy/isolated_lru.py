@@ -21,6 +21,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import cast
 import threading
+import time
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
@@ -33,7 +34,11 @@ from lmcache.v1.mp_coordinator.persistence.durable_component import PersistenceT
 from lmcache.v1.mp_coordinator.utils.encoding import decode_key, encode_key
 
 # Local
-from ._selection import ChunkFamilyTopology, select_chunk_coherent_victims
+from ._selection import (
+    INCOMPLETE_FAMILY_GRACE_SECONDS,
+    ChunkFamilyTopology,
+    select_chunk_coherent_victims,
+)
 
 
 class IsolatedLRUEvictionPolicy(EvictionPolicy):
@@ -55,11 +60,30 @@ class IsolatedLRUEvictionPolicy(EvictionPolicy):
     def __init__(
         self,
         default_destination: EvictionDestination = EvictionDestination.DISCARD,
+        incomplete_family_grace_seconds: float = INCOMPLETE_FAMILY_GRACE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ):
+        """Create an empty policy.
+
+        Args:
+            default_destination: Destination for evicted keys while no
+                destination is registered.
+            incomplete_family_grace_seconds: How long a chunk family missing
+                an expected rank/group sibling waits for it before its present
+                members become evictable together.
+            clock: Monotonic time source in seconds.
+
+        Raises:
+            ValueError: If ``incomplete_family_grace_seconds`` is negative.
+        """
         self._lock = threading.Lock()
         # cache_salt -> ordered {ObjectKey: None} (oldest first).
         self._per_salt_order: dict[str, OrderedDict[ObjectKey, None]] = {}
-        self._family_topology = ChunkFamilyTopology()
+        self._incomplete_family_grace_seconds = incomplete_family_grace_seconds
+        self._clock = clock
+        self._family_topology = ChunkFamilyTopology(
+            incomplete_family_grace_seconds, clock
+        )
         # Registered destinations (first one wins if any are registered,
         # matching LRUEvictionPolicy semantics).
         self._destinations: list[EvictionDestination] = []
@@ -242,7 +266,9 @@ class IsolatedLRUEvictionPolicy(EvictionPolicy):
                 )
                 for cache_salt, ordered in buckets.items()
             }
-            self._family_topology = ChunkFamilyTopology()
+            self._family_topology = ChunkFamilyTopology(
+                self._incomplete_family_grace_seconds, self._clock
+            )
             for order in self._per_salt_order.values():
                 self._family_topology.observe(order)
 
