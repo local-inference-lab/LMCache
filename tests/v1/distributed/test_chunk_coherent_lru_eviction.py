@@ -215,3 +215,132 @@ def test_isolated_lru_never_crosses_salt_boundaries() -> None:
 
     assert len(actions) == 1
     assert set(actions[0].keys) == _family(0, "tenant-a") | _family(1, "tenant-a")
+
+
+class _ManualClock:
+    """Monotonic clock that only moves when a test advances it."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _packed_rank(rank: int) -> int:
+    return ObjectKey.ComputeKVRank(
+        world_size=2,
+        global_rank=rank,
+        local_world_size=2,
+        local_rank=rank,
+    )
+
+
+def _victims(
+    policy: LRUEvictionPolicy | IsolatedLRUEvictionPolicy,
+    expected_ratio: float = 1.0,
+) -> set[ObjectKey]:
+    return {
+        key
+        for action in policy.get_eviction_actions(expected_ratio, cache_salt="")
+        for key in action.keys
+    }
+
+
+@pytest.mark.parametrize("policy_type", [LRUEvictionPolicy, IsolatedLRUEvictionPolicy])
+def test_family_reloaded_without_sliding_window_group_becomes_evictable(
+    policy_type: type[LRUEvictionPolicy] | type[IsolatedLRUEvictionPolicy],
+) -> None:
+    """A prefix reloaded from L2 restores the sliding-window group only for
+    its final window, so the earlier chunks come back as families that stay
+    partial for good. They must leave the cache once the grace has passed,
+    still as whole rank sets."""
+    clock = _ManualClock()
+    policy = policy_type(incomplete_family_grace_seconds=10.0, clock=clock)
+    ranks = [_packed_rank(rank) for rank in range(2)]
+    stored = {
+        _key(chunk_id, kv_rank, object_group_id)
+        for chunk_id in range(4)
+        for kv_rank in ranks
+        for object_group_id in range(2)
+    }
+    policy.on_keys_created(sorted(stored, key=lambda key: key.chunk_hash))
+    assert _victims(policy) == stored
+    policy.on_keys_removed(list(stored))
+
+    clock.now += 60.0
+    prefix = [_key(chunk_id, kv_rank, 0) for chunk_id in range(3) for kv_rank in ranks]
+    final_window = [
+        _key(3, kv_rank, object_group_id)
+        for kv_rank in ranks
+        for object_group_id in range(2)
+    ]
+    policy.on_keys_created(prefix + final_window)
+
+    # Within the grace a missing sibling may still be in flight, so only the
+    # complete final-window family can go.
+    assert _victims(policy) == set(final_window)
+    policy.on_keys_removed(final_window)
+
+    clock.now += 10.0
+    assert _victims(policy, expected_ratio=0.1) in [
+        {_key(chunk_id, kv_rank, 0) for kv_rank in ranks} for chunk_id in range(3)
+    ]
+    assert _victims(policy) == set(prefix)
+
+
+def test_incomplete_family_grace_counts_from_latest_arrival() -> None:
+    clock = _ManualClock()
+    policy = LRUEvictionPolicy(incomplete_family_grace_seconds=10.0, clock=clock)
+    ranks = [_packed_rank(rank) for rank in range(2)]
+    learned = [
+        _key(1, kv_rank, object_group_id)
+        for kv_rank in ranks
+        for object_group_id in range(2)
+    ]
+    policy.on_keys_created(learned)
+    policy.on_keys_removed(learned)
+
+    policy.on_keys_created([_key(0, ranks[0], 0)])
+    clock.now += 8.0
+    policy.on_keys_created([_key(0, ranks[1], 0)])
+    clock.now += 8.0
+    assert _victims(policy) == set()
+
+    clock.now += 2.0
+    assert _victims(policy) == {_key(0, kv_rank, 0) for kv_rank in ranks}
+
+
+def test_isolated_lru_restore_keeps_incomplete_family_grace() -> None:
+    clock = _ManualClock()
+    policy = IsolatedLRUEvictionPolicy(
+        incomplete_family_grace_seconds=10.0,
+        clock=clock,
+    )
+    ranks = [_packed_rank(rank) for rank in range(2)]
+    complete = {
+        _key(0, kv_rank, object_group_id)
+        for kv_rank in ranks
+        for object_group_id in range(2)
+    }
+    partial = {_key(1, kv_rank, 0) for kv_rank in ranks}
+    policy.on_keys_created(list(complete) + list(partial))
+    clock.now += 60.0
+
+    restored = IsolatedLRUEvictionPolicy(
+        incomplete_family_grace_seconds=10.0,
+        clock=clock,
+    )
+    restored.restore(policy.capture())
+
+    assert _victims(restored) == complete
+    clock.now += 10.0
+    assert _victims(restored) == complete | partial
+
+
+@pytest.mark.parametrize("policy_type", [LRUEvictionPolicy, IsolatedLRUEvictionPolicy])
+def test_negative_incomplete_family_grace_is_rejected(
+    policy_type: type[LRUEvictionPolicy] | type[IsolatedLRUEvictionPolicy],
+) -> None:
+    with pytest.raises(ValueError, match="incomplete_family_grace_seconds"):
+        policy_type(incomplete_family_grace_seconds=-1.0)

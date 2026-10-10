@@ -7,6 +7,7 @@ LRU (Least Recently Used) eviction policy implementation
 from collections import OrderedDict
 from collections.abc import Callable
 import threading
+import time
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
@@ -17,7 +18,11 @@ from lmcache.v1.distributed.internal_api import (
 )
 
 # Local
-from ._selection import ChunkFamilyTopology, select_chunk_coherent_victims
+from ._selection import (
+    INCOMPLETE_FAMILY_GRACE_SECONDS,
+    ChunkFamilyTopology,
+    select_chunk_coherent_victims,
+)
 
 
 class LRUEvictionPolicy(EvictionPolicy):
@@ -41,6 +46,8 @@ class LRUEvictionPolicy(EvictionPolicy):
     def __init__(
         self,
         default_destination: EvictionDestination = EvictionDestination.DISCARD,
+        incomplete_family_grace_seconds: float = INCOMPLETE_FAMILY_GRACE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ):
         """
         Initialize the LRU eviction policy.
@@ -48,13 +55,22 @@ class LRUEvictionPolicy(EvictionPolicy):
         Args:
             default_destination: The default destination for evicted objects.
                 Defaults to DISCARD.
+            incomplete_family_grace_seconds: How long a chunk family missing
+                an expected rank/group sibling waits for it before its present
+                members become evictable together.
+            clock: Monotonic time source in seconds.
+
+        Raises:
+            ValueError: If ``incomplete_family_grace_seconds`` is negative.
         """
         # Lock for thread-safe operations
         self._lock = threading.Lock()
 
         # OrderedDict to maintain LRU order - keys at the beginning are oldest
         self._order: OrderedDict[ObjectKey, None] = OrderedDict()
-        self._family_topology = ChunkFamilyTopology()
+        self._family_topology = ChunkFamilyTopology(
+            incomplete_family_grace_seconds, clock
+        )
 
         # List of registered eviction destinations
         self._destinations: list[EvictionDestination] = []
