@@ -1081,10 +1081,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connectivity issues or eviction), those tokens must not be taken
             into account.
         """
+        # A preempted request looks its prefix up again like a new one: its
+        # tracker restarts at token zero (_get_or_create_request_tracker), and
+        # handle_preemptions makes the workers finish in-flight stores before
+        # its freed blocks are reused.
         tracker = self._get_or_create_request_tracker(request)
-        # TODO: support loading KV for preempted requests in the future
-        if request.status == RequestStatus.PREEMPTED:
-            return 0, False
 
         # A failed asynchronous load is bypassed until vLLM admits the request
         # for local computation via update_state_after_alloc().  The scheduler
@@ -1155,8 +1156,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
 
-        # Update num stored tokens for the tracker
-        tracker.increase_num_stored_tokens(ret)
+        # The scheduler can poll a completed lookup again while it waits for
+        # free blocks, so assign rather than add the stored range.
+        tracker.num_stored_tokens = ret
 
         # Save the vllm and lmcache hit tokens. The vLLM hit count is
         # rounded down to a boundary aligned for every engine group (e.g.
@@ -1189,6 +1191,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
 
         need_to_load = max(0, ret - num_computed_tokens)
+
+        if request.status == RequestStatus.PREEMPTED:
+            logger.info(
+                "<resume-load> req=%s local=%d lmcache=%d load=%d",
+                request.request_id,
+                num_computed_tokens,
+                ret,
+                need_to_load,
+            )
 
         # In full-prompt-hit case, we need to recompute the last token.
         # Without this, num_computed_tokens would equal request.num_tokens,

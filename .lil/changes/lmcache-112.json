@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-112",
+  "category": "performance",
+  "summary": "A preempted request reloads its prefix from LMCache instead of recomputing it",
+  "models": [
+    "DeepSeek-V4.1-Flash",
+    "DeepSeek-V4-Flash",
+    "DeepSeek-V4-Flash-Vision-Exp"
+  ],
+  "compatibility": "No user action required. Applies to the regular LMCache path (CACHE_MODE=lmcache on the DeepSeek profiles, or RECURRENT_CHECKPOINT_POLICY=aligned); request-boundary checkpoints on GLM-5.3-Flash and Qwen3.8 are unchanged.",
+  "details": [
+    "When vLLM preempted a request under KV memory pressure, the request resumed by recomputing its whole prompt and output, even when LMCache held them. Long multi-turn sessions showed occasional large prefills.",
+    "A resumed request now loads the prefix LMCache holds, as upstream LMCache #5248 does. Stores still in flight finish before the preempted request's freed GPU blocks are reused, so no other request's KV can be written under its keys."
+  ],
+  "pull_requests": [
+    112
+  ],
+  "requires": []
+}
