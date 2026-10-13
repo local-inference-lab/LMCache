@@ -567,3 +567,45 @@ def test_odirect_falls_back_for_misaligned_buffer_address(tmp_path) -> None:
         assert bytes(dest) == bytes(source)
     finally:
         client.close()
+
+
+@pytest.mark.parametrize(
+    "per_op_workers", [None, {"lookup": 1, "retrieve": 1}], ids=["shared", "lanes"]
+)
+def test_reads_in_their_own_lanes_do_not_wait_behind_queued_writes(
+    tmp_path, per_op_workers: dict[str, int] | None
+) -> None:
+    """A lookup and a load submitted after a large write finish before it
+    with read lanes; one shared worker serves them only after the write."""
+    LMCacheFSClient = _import_fs_client()
+    existing = "model@00000000@0@aa"
+    payload = bytearray(b"restored-page")
+    client = LMCacheFSClient(str(tmp_path), 1, per_op_workers=per_op_workers)
+    try:
+        stored = _submit_and_wait(
+            client, "submit_batch_set", existing, memoryview(payload)
+        )
+        assert stored[1], stored[2]
+        page = bytearray(16 << 20)
+        backlog = [f"model@00000000@0@{i + 256:x}" for i in range(32)]
+        write = client.submit_batch_set(backlog, [memoryview(page)] * len(backlog))
+        lookup = client.submit_batch_exists([existing])
+        destination = bytearray(len(payload))
+        load = client.submit_batch_get([existing], [memoryview(destination)])
+        order: list[int] = []
+        deadline = time.monotonic() + 120
+        while len(order) < 3 and time.monotonic() < deadline:
+            order += [
+                completion[0]
+                for completion in client.drain_completions()
+                if completion[0] in (write, lookup, load)
+            ]
+            select.select([client.event_fd()], [], [], 0.1)
+        assert sorted(order) == sorted([write, lookup, load])
+        assert destination == payload
+        if per_op_workers:
+            assert order[-1] == write
+        else:
+            assert order == [write, lookup, load]
+    finally:
+        client.close()

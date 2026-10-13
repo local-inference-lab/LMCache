@@ -297,8 +297,9 @@ static bool try_enable_odirect(int& flags, const void* buf, size_t len,
 
 FSConnector::FSConnector(std::string base_path, int num_workers,
                          std::string relative_tmp_dir, bool use_odirect,
-                         size_t read_ahead_size)
-    : ConnectorBase(num_workers),
+                         size_t read_ahead_size,
+                         WorkerPoolConfig worker_pool_config)
+    : ConnectorBase(num_workers, std::move(worker_pool_config)),
       base_path_(std::move(base_path)),
       relative_tmp_dir_(std::move(relative_tmp_dir)),
       use_odirect_(use_odirect),
