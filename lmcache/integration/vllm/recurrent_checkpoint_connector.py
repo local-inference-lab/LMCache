@@ -57,6 +57,9 @@ from lmcache.v1.platform import torch_dev
 
 logger = init_logger(__name__)
 
+_CHECKPOINT_MAX_TASKS = 32
+_CHECKPOINT_COPY_WORKERS = 2
+
 # These precision overrides are outside VllmConfig's computation-graph hash.
 # Changing one must not reuse states produced by another numeric representation.
 _PRECISION_ENVIRONMENT = (
@@ -220,6 +223,7 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
             self._client,
             identity,
             parallel.world_size,
+            max_tasks=_CHECKPOINT_MAX_TASKS,
             lookup_timeout=self._mq_timeout,
         )
 
@@ -244,7 +248,14 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
                 mapping,
                 self._capabilities,
             )
-            self._worker = CheckpointTransferWorker(self._client, copier)
+            # A completed Future can be reported before its release callback runs.
+            # Each copy thread can retain one such untracked admission permit.
+            self._worker = CheckpointTransferWorker(
+                self._client,
+                copier,
+                workers=_CHECKPOINT_COPY_WORKERS,
+                max_pending=_CHECKPOINT_MAX_TASKS + _CHECKPOINT_COPY_WORKERS,
+            )
         except BaseException:
             mapping.close()
             raise
