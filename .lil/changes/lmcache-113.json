@@ -1,0 +1,23 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-113",
+  "category": "fix",
+  "summary": "Recurrent checkpoint restores no longer recompute a prompt because a rank's transfer worker rejected an admitted copy",
+  "models": [
+    "GLM-5.3-Flash",
+    "Qwen3.8-Flash-Next",
+    "DeepSeek-V4.1-Flash",
+    "DeepSeek-V4-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The recurrent checkpoint bridge admits up to 32 stores and restores at a time, but each TP rank's transfer worker was created with room for 16. Under copy pressure a healthy worker rejected a copy the scheduler had already admitted; the connector reported it as a miss, a restore spent another lookup attempt and could end up recomputing its prompt without reading the payload on that rank.",
+    "Each rank's worker now admits 34 copies (the 32 the scheduler can hand it plus one completed job per copy thread whose permit is released a moment after its result is visible), with two copy threads as before.",
+    "Six CPU regressions exercise admission of the full scheduler allowance on both ranks with delayed completion callbacks."
+  ],
+  "pull_requests": [
+    113
+  ],
+  "evidence": [],
+  "requires": []
+}
