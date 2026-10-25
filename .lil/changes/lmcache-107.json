@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-107",
+  "category": "fix",
+  "summary": "Checkpoint restores from the disk tier no longer wait behind a burst of on-evict disk writes",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. The fs_native disk tier now runs lookups (2 threads), loads (num_workers threads) and writes (max(2, num_workers / 4) threads) on separate workers. Set per_op_workers in the --l2-adapter JSON to choose other counts; per_op_workers {} restores the previous single pool.",
+  "details": [
+    "The disk tier served lookups, loads and writes from one queue. With on-evict writes, the first time RAM filled up it queued a write of every checkpoint page in RAM at once, and a restore that needed disk pages waited until all of them were written: 85-90 s for a 14 GiB burst on the test server, longer with a larger RAM tier. Such a restore now starts at once and no longer waits for the burst; in four runs of the same test it took 2, 18, 25 and 45 s on the test server's RAID5, whose reads still compete with the writes.",
+    "Fewer concurrent writes leave a busy disk room for restores; the same burst was written as fast as before."
+  ],
+  "pull_requests": [
+    107
+  ],
+  "requires": []
+}

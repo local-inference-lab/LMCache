@@ -1116,6 +1116,87 @@ class TestFSNativeAdapterFactory:
             _L2_ADAPTER_FACTORY_REGISTRY["fs_native"] = old
 
 
+class TestFSNativeLanes:
+    """Lookups and loads of the native FS connector get their own workers."""
+
+    def test_default_gives_reads_their_own_lanes(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+        )
+
+        cfg = FSNativeL2AdapterConfig.from_dict(
+            {"base_path": "/tmp/lanes", "num_workers": 8}
+        )
+        assert cfg.per_op_workers == {"lookup": 2, "retrieve": 8, "store": 2}
+        wide = FSNativeL2AdapterConfig.from_dict(
+            {"base_path": "/tmp/lanes", "num_workers": 32}
+        )
+        assert wide.per_op_workers == {"lookup": 2, "retrieve": 32, "store": 8}
+
+    def test_explicit_lanes_replace_the_default(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+        )
+
+        cfg = FSNativeL2AdapterConfig.from_dict(
+            {"base_path": "/tmp/lanes", "per_op_workers": {"store": 3}}
+        )
+        assert cfg.per_op_workers == {"store": 3}
+        shared = FSNativeL2AdapterConfig.from_dict(
+            {"base_path": "/tmp/lanes", "per_op_workers": {}}
+        )
+        assert shared.per_op_workers == {}
+
+    @pytest.mark.parametrize(
+        "per_op_workers",
+        [{"bogus": 1}, {"lookup": 0}, {"retrieve": True}, ["lookup"]],
+    )
+    def test_invalid_lanes_are_rejected(self, per_op_workers):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+        )
+
+        with pytest.raises(ValueError, match="per_op_workers"):
+            FSNativeL2AdapterConfig.from_dict(
+                {"base_path": "/tmp/lanes", "per_op_workers": per_op_workers}
+            )
+
+    def test_factory_forwards_lanes_to_the_native_client(self, monkeypatch, tmp_path):
+        # Standard
+        import sys
+        import types
+
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+            _create_fs_native_l2_adapter,
+        )
+
+        captured: dict = {}
+
+        class _LaneFSClient(_FakeLMCacheFSClient):
+            def __init__(self, *args, per_op_workers=None):
+                super().__init__(*args)
+                captured["per_op_workers"] = per_op_workers
+
+        module = types.ModuleType("lmcache.lmcache_fs")
+        module.LMCacheFSClient = _LaneFSClient
+        monkeypatch.setitem(sys.modules, "lmcache.lmcache_fs", module)
+        cfg = FSNativeL2AdapterConfig(base_path=str(tmp_path), num_workers=4)
+        adapter = _create_fs_native_l2_adapter(cfg)
+        try:
+            assert captured["per_op_workers"] == {
+                "lookup": 2,
+                "retrieve": 4,
+                "store": 2,
+            }
+        finally:
+            adapter.close()
+
+
 def _patched_fs_factory(config, l1_memory_desc=None):
     """Factory that uses _FakeLMCacheFSClient instead
     of the real C++ extension."""

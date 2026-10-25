@@ -27,6 +27,15 @@ I/O queue depth on a single Python thread.
 - ``max_capacity_gb`` (float, default ``0``): Maximum L2 capacity in GB
   for client-side usage enforcement and global eviction. Default ``0``
   leaves capacity unlimited; resident-byte accounting remains available.
+- ``per_op_workers`` (dict, default ``{"lookup": 2, "retrieve": num_workers,
+  "store": max(2, num_workers // 4)}``): Dedicated worker threads per
+  operation lane (``lookup``, ``retrieve``, ``store``, ``delete``);
+  operations without a lane share the ``num_workers`` pool.  By default
+  lookups and loads have their own workers, so a restore does not wait in
+  the queue behind every write submitted before it: a burst of pages written
+  when RAM evicts them (for example with ``checkpoint_on_evict``) can occupy
+  a slow disk for minutes.  Fewer concurrent stores also keep a saturated
+  disk responsive to loads.  ``{}`` runs every operation in the shared pool.
 
 Restart recovery
 ----------------

@@ -45,6 +45,11 @@ logger = init_logger(__name__)
 
 _FILE_EXT = ".data"
 _IGNORED_FILE_SAMPLE_LIMIT = 5
+# Operation lanes of the native connector, the default lookup workers (a
+# lookup only stats files) and the least default store workers.
+_LANES = frozenset({"lookup", "retrieve", "store", "delete"})
+_DEFAULT_LOOKUP_WORKERS = 2
+_MIN_STORE_WORKERS = 2
 
 
 def _scan_existing_key_sizes(base_path: str) -> dict[ObjectKey, int]:
@@ -205,6 +210,29 @@ def _scan_existing_key_sizes(base_path: str) -> dict[ObjectKey, int]:
     return key_sizes
 
 
+def default_fs_native_lanes(num_workers: int) -> dict[str, int]:
+    """Return the default dedicated worker lanes of the native FS connector.
+
+    Lookups and loads get their own workers, so a restore never waits in the
+    queue behind every write submitted before it (a write-on-evict burst can
+    take minutes on a slow disk). Stores get a quarter of ``num_workers``,
+    at least 2: on a disk that stores saturate, fewer concurrent writes keep
+    loads fast without writing more slowly. Deletes share the ``num_workers``
+    pool.
+
+    Args:
+        num_workers: Shared worker count of the connector.
+
+    Returns:
+        Lane key to dedicated worker count.
+    """
+    return {
+        "lookup": _DEFAULT_LOOKUP_WORKERS,
+        "retrieve": num_workers,
+        "store": max(_MIN_STORE_WORKERS, num_workers // 4),
+    }
+
+
 class FSNativeL2AdapterConfig(L2AdapterConfigBase):
     """
     Config for an L2 adapter backed by the native C++
@@ -217,6 +245,11 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
     - use_odirect: bypass page cache via O_DIRECT.
     - read_ahead_size: trigger filesystem readahead by
       reading this many bytes first (optional).
+    - per_op_workers: dedicated worker counts per operation lane
+      (``lookup``, ``retrieve``, ``store``, ``delete``); the other
+      operations share ``num_workers``. None selects
+      :func:`default_fs_native_lanes`; ``{}`` runs every operation in the
+      shared pool.
     """
 
     def __init__(
@@ -227,6 +260,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         use_odirect: bool = False,
         read_ahead_size: Optional[int] = None,
         max_capacity_gb: float = 0,
+        per_op_workers: dict[str, int] | None = None,
     ):
         self.base_path = base_path
         self.num_workers = num_workers
@@ -234,6 +268,17 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         self.use_odirect = use_odirect
         self.read_ahead_size = read_ahead_size
         self.max_capacity_gb = max_capacity_gb
+        per_op_workers = L2AdapterConfigBase._validate_per_op_workers(per_op_workers)
+        if per_op_workers is not None and not set(per_op_workers) <= _LANES:
+            raise ValueError(
+                f"per_op_workers keys must be among {sorted(_LANES)}, "
+                f"got {sorted(per_op_workers)}"
+            )
+        self.per_op_workers: dict[str, int] = (
+            default_fs_native_lanes(num_workers)
+            if per_op_workers is None
+            else dict(per_op_workers)
+        )
 
     @classmethod
     def from_dict(cls, d: dict) -> "FSNativeL2AdapterConfig":
@@ -269,6 +314,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             use_odirect=use_odirect,
             read_ahead_size=read_ahead_size,
             max_capacity_gb=float(max_capacity_gb),
+            per_op_workers=L2AdapterConfigBase._parse_per_op_workers_from_dict(d),
         )
 
     @classmethod
@@ -288,7 +334,14 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             "first (optional)\n"
             "- max_capacity_gb (float): max L2 capacity "
             "in GB for usage tracking / eviction "
-            "(default 0 = disabled)"
+            "(default 0 = disabled)\n"
+            "- per_op_workers (dict[str, int]): dedicated "
+            "worker counts per lane (lookup, retrieve, "
+            "store, delete); other ops share num_workers "
+            "(default: lookup 2, retrieve num_workers, "
+            "store max(2, num_workers // 4), so restores "
+            "never queue behind writes; {} = one shared "
+            "pool)"
         )
 
 
@@ -344,6 +397,7 @@ def _create_fs_native_l2_adapter(
         config.relative_tmp_dir,
         config.use_odirect,
         config.read_ahead_size or 0,
+        per_op_workers=config.per_op_workers,
     )
     try:
         adapter = NativeConnectorL2Adapter(
@@ -354,6 +408,7 @@ def _create_fs_native_l2_adapter(
                 "base_path": config.base_path,
                 "use_odirect": config.use_odirect,
                 "num_workers": config.num_workers,
+                "per_op_workers": dict(config.per_op_workers),
                 "read_ahead_size": config.read_ahead_size,
             },
             initial_key_sizes=initial_key_sizes,
@@ -363,10 +418,11 @@ def _create_fs_native_l2_adapter(
         native_client.close()
         raise
     logger.info(
-        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, "
+        "Created FS native L2 adapter: %s (workers=%d, lanes=%s, odirect=%s, "
         "read_ahead=%s, restored_keys=%d, restored_bytes=%d)",
         config.base_path,
         config.num_workers,
+        config.per_op_workers,
         config.use_odirect,
         config.read_ahead_size,
         len(initial_key_sizes),
