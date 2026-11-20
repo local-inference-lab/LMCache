@@ -109,6 +109,10 @@ class TokenDatabase(metaclass=abc.ABCMeta):
 
         logger.info("Using hash algorithm: %s", hash_algorithm)
         self.metadata = metadata
+        # Optional engine-level namespace tag; see cache_namespace in config.
+        self.cache_namespace: Optional[str] = (
+            config.cache_namespace if config is not None else None
+        )
         # Whether only the first rank should save cache. This flag is also used
         # to control the logical world_size embedded into CacheEngineKey.
         self.save_only_first_rank = False
@@ -235,6 +239,13 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         self, chunk_hash: int, request_configs: Optional[dict] = None
     ):
         assert self.metadata is not None
+        if self.cache_namespace:
+            # Engine-level namespace dominates any per-request "ns" tag: its
+            # purpose is isolation the request must not be able to undo.
+            request_configs = {
+                **(request_configs or {}),
+                "lmcache.tag.ns": self.cache_namespace,
+            }
         # When save_only_first_rank is enabled (for MLA), we deliberately
         # collapse the CacheEngineKey.world_size to 1 so that cache keys
         # become world-size agnostic across compatible deployments.

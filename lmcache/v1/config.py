@@ -33,6 +33,15 @@ from lmcache.v1.config_base import (
 
 logger = init_logger(__name__)
 
+# Maximum size, in UTF-8 bytes, of a cache_namespace value. The namespace is
+# serialized into every CacheEngineKey as the tag "@ns%<namespace>" (4 bytes
+# of overhead), and the legacy client/server protocol caps serialized keys at
+# 150 bytes (MAX_KEY_LENGTH in lmcache/v1/protocol.py). That budget must also
+# cover model_name, world_size, worker_id, the 16-hex-digit chunk hash, dtype,
+# and (for layer keys) the layer id, so the namespace itself is capped at 64
+# bytes to leave >= 82 bytes for the rest of the key.
+MAX_CACHE_NAMESPACE_BYTES = 64
+
 
 def _to_hidden_states_retrieve_mode(value: Any) -> str:
     """Normalize hidden_states_retrieve_mode from YAML/env."""
@@ -117,6 +126,19 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": str,
     },
     "remote_serde": {"type": Optional[str], "default": "naive", "env_converter": str},
+    # Optional engine-level cache namespace. Injected as a constant "ns" key
+    # tag on every CacheEngineKey this engine mints, so persistent or shared
+    # caches cannot replay KV chunks across incompatible runtime builds that
+    # share model_name/world_size/dtype (set it to e.g. a serving-image digest
+    # prefix). Validated at config load: must be non-empty and not
+    # whitespace-only, without leading/trailing whitespace, must not contain
+    # '@' (the serialized-key tag delimiter), and must fit
+    # MAX_CACHE_NAMESPACE_BYTES UTF-8 bytes.
+    "cache_namespace": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
     # Feature toggles
     "use_layerwise": {
         "type": bool,
@@ -687,6 +709,44 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
 }
 
 
+def _validate_cache_namespace(namespace: str) -> None:
+    """Validate a cache_namespace value at config-load time.
+
+    The namespace is serialized into every CacheEngineKey as the tag
+    ``@ns%<namespace>``, so it must not break
+    ``CacheEngineKey.from_string(key.to_string())`` round-tripping or the
+    legacy client/server wire path (which strips the serialized key before
+    parsing it).
+    """
+    if not namespace.strip():
+        raise ValueError(
+            "cache_namespace must be a non-empty, non-whitespace string; got "
+            f"{namespace!r}. Leave it unset (None) to disable namespacing."
+        )
+    if namespace != namespace.strip():
+        raise ValueError(
+            "cache_namespace must not have leading or trailing whitespace: "
+            "the serialized key is stripped on the legacy client/server wire "
+            f"path, so it would not round-trip. Got {namespace!r}."
+        )
+    if "@" in namespace:
+        raise ValueError(
+            "cache_namespace must not contain '@': it is the field/tag "
+            "delimiter of serialized CacheEngineKey strings, so "
+            "CacheEngineKey.from_string(key.to_string()) would not "
+            f"round-trip. Got {namespace!r}."
+        )
+    namespace_bytes = len(namespace.encode("utf-8"))
+    if namespace_bytes > MAX_CACHE_NAMESPACE_BYTES:
+        raise ValueError(
+            f"cache_namespace is {namespace_bytes} UTF-8 bytes, exceeding "
+            f"the {MAX_CACHE_NAMESPACE_BYTES}-byte limit: the namespace is "
+            'serialized into every cache key as the tag "@ns%<namespace>" '
+            "and the legacy client/server protocol caps serialized keys at "
+            "150 bytes (MAX_KEY_LENGTH in lmcache/v1/protocol.py)."
+        )
+
+
 # Specialized methods that are unique to LMCacheEngineConfig
 def _validate_config(self):
     """Validate configuration"""
@@ -705,6 +765,9 @@ def _validate_config(self):
         raise ValueError(
             "min_retrieve_tokens must be >= 0, got %d" % self.min_retrieve_tokens
         )
+
+    if self.cache_namespace is not None:
+        _validate_cache_namespace(self.cache_namespace)
 
     if self.enable_blending:
         if not self.save_unfull_chunk:

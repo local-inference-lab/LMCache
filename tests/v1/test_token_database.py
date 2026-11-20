@@ -8,7 +8,9 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.utils import CacheEngineKey
+from lmcache.v1.config import LMCacheEngineConfig, MAX_CACHE_NAMESPACE_BYTES
+from lmcache.v1.protocol import MAX_KEY_LENGTH
 from lmcache.v1.token_database import ChunkedTokenDatabase, SegmentTokenDatabase
 
 # Local
@@ -152,3 +154,117 @@ def test_process_tokens_returns_int_keys_for_bytes_hash_func() -> None:
         assert isinstance(hash_val, int), f"Expected int, got {type(hash_val)}"
         # Must fit in uint64 (msgpack range: 0 to 2**64 - 1)
         assert 0 <= hash_val <= 2**64 - 1
+
+
+def test_cache_namespace_tags_keys():
+    """Engine-level cache_namespace must become a constant "ns" key tag.
+
+    Without a namespace, keys are unchanged (backward compatible). With one,
+    every minted key carries the tag, keys differ across namespaces, and a
+    per-request "ns" tag cannot override the engine-level value.
+    """
+    metadata = dumb_metadata()
+    test_length = 512
+    tokens = generate_tokens(test_length, "cpu")
+    mask = torch.full([test_length], True, dtype=torch.bool, device="cpu")
+
+    def keys_for(namespace, request_configs=None):
+        cfg = LMCacheEngineConfig.from_legacy(
+            chunk_size=256, backend="cpu", cache_namespace=namespace
+        )
+        db = ChunkedTokenDatabase(cfg, metadata)
+        return [
+            key
+            for _, _, key in db.process_tokens(
+                tokens=tokens, mask=mask, request_configs=request_configs
+            )
+        ]
+
+    plain = keys_for(None)
+    assert all(key.tags is None for key in plain)
+
+    ns_a = keys_for("imgA")
+    assert len(ns_a) == len(plain)
+    for key in ns_a:
+        assert key.tags == (("ns", "imgA"),)
+
+    ns_b = keys_for("imgB")
+    assert all(a != b for a, b in zip(ns_a, ns_b))
+    assert all(a != p for a, p in zip(ns_a, plain))
+
+    # Same namespace reproduces identical keys.
+    assert keys_for("imgA") == ns_a
+
+    # A request-supplied "ns" tag must not defeat engine-level isolation.
+    hijack = keys_for("imgA", request_configs={"lmcache.tag.ns": "evil"})
+    assert hijack == ns_a
+
+    # Round-trips through the string codec preserve the namespace tag.
+    for key in ns_a[:2]:
+        assert key.__class__.from_string(key.to_string()) == key
+
+
+def test_cache_namespace_rejects_invalid_values():
+    """Invalid cache_namespace values must fail at config-load time.
+
+    The namespace is serialized into every cache key as the tag
+    "@ns%<namespace>": '@' is the serialized-key delimiter, oversized values
+    blow the legacy 150-byte serialized-key budget, and empty/whitespace or
+    padded values would not survive the wire path (which strips the key
+    before parsing it).
+    """
+
+    def config_with(namespace):
+        return LMCacheEngineConfig.from_legacy(
+            chunk_size=256, backend="cpu", cache_namespace=namespace
+        )
+
+    # '@' breaks CacheEngineKey.from_string(key.to_string()) round-tripping.
+    for invalid in ("img@A", "a@b@c"):
+        with pytest.raises(ValueError, match="cache_namespace"):
+            config_with(invalid)
+
+    # The limit is on UTF-8 bytes, not characters: 17 four-byte characters
+    # are only 17 characters but 68 UTF-8 bytes.
+    with pytest.raises(ValueError, match="UTF-8 bytes"):
+        config_with("\U0001f600" * (MAX_CACHE_NAMESPACE_BYTES // 4 + 1))
+
+    # MAX_CACHE_NAMESPACE_BYTES one-byte characters fit; one more does not.
+    config_with("a" * MAX_CACHE_NAMESPACE_BYTES)
+    with pytest.raises(ValueError, match="UTF-8 bytes"):
+        config_with("a" * (MAX_CACHE_NAMESPACE_BYTES + 1))
+
+    # Empty, whitespace-only, and padded namespaces are rejected.
+    for invalid in ("", "   ", " pad", "pad "):
+        with pytest.raises(ValueError, match="cache_namespace"):
+            config_with(invalid)
+
+
+def test_cache_namespace_boundary_value_round_trips_through_string_codec():
+    """A boundary-length multibyte cache_namespace must round-trip cleanly.
+
+    Also checks the budget claim the byte limit is derived from: even at the
+    limit, the serialized key fits the legacy protocol's MAX_KEY_LENGTH.
+    """
+    metadata = dumb_metadata()
+    test_length = 512
+    tokens = generate_tokens(test_length, "cpu")
+    mask = torch.full([test_length], True, dtype=torch.bool, device="cpu")
+
+    # Exactly MAX_CACHE_NAMESPACE_BYTES bytes, using two-byte characters.
+    namespace = "é" * (MAX_CACHE_NAMESPACE_BYTES // 2)
+    assert len(namespace.encode("utf-8")) == MAX_CACHE_NAMESPACE_BYTES
+
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=256, backend="cpu", cache_namespace=namespace
+    )
+    db = ChunkedTokenDatabase(cfg, metadata)
+    keys = [key for _, _, key in db.process_tokens(tokens=tokens, mask=mask)]
+    assert keys
+    for key in keys:
+        assert key.tags == (("ns", namespace),)
+        key_str = key.to_string()
+        assert len(key_str.encode("utf-8")) <= MAX_KEY_LENGTH
+        parsed = CacheEngineKey.from_string(key_str)
+        assert parsed == key
+        assert parsed.tags == (("ns", namespace),)
